@@ -208,3 +208,41 @@ export const calculateTimeElapsed = (dateString) => {
         return 'Unknown';
     }
 };
+
+/**
+ * Safely format an error into a human-readable message.
+ * Extracts message from Error objects, strings, or JSON-serialized backend errors.
+ * @param {any} err - The error caught from a Promise or try/catch.
+ * @returns {string} The formatted error message.
+ */
+export const formatErrorMessage = (err) => {
+    if (!err) return 'An unknown error occurred';
+    if (typeof err === 'string') {
+        try {
+            const parsed = JSON.parse(err);
+            if (parsed && (parsed.custom_message || parsed.message)) {
+                return parsed.custom_message || parsed.message;
+            }
+        } catch {
+            const jsonStart = err.indexOf('{"');
+            const jsonEnd = err.lastIndexOf('}');
+            if (jsonStart !== -1 && jsonEnd > jsonStart) {
+                try {
+                    const jsonStr = err.substring(jsonStart, jsonEnd + 1);
+                    const parsed = JSON.parse(jsonStr);
+                    if (parsed && (parsed.custom_message || parsed.message)) {
+                        const prefix = err.substring(0, jsonStart).trim();
+                        const msg = parsed.custom_message || parsed.message;
+                        return prefix ? `${prefix} ${msg}` : msg;
+                    }
+                } catch {
+                    // Ignore parse error and fall back to raw string
+                }
+            }
+            return err;
+        }
+    }
+    if (err.custom_message) return err.custom_message;
+    if (err.message) return err.message;
+    return String(err);
+};

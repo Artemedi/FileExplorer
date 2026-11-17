@@ -33,6 +33,7 @@ open = "5.3.2"
 rustc-hash = "2.1.1"
 ssh2 = { version = "0.9.5", features = ["vendored-openssl"] }
 anyhow = "1.0.98"
+thiserror = "2"
 base64 = "0.22.1"
 chardetng = "0.1.17"
 bumpalo = "3.14"  # Arena allocation for temporary objects

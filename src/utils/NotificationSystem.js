@@ -1,6 +1,7 @@
 /**
  * Simple notification system to replace browser alerts
  */
+import { formatErrorMessage } from './formatters.js';
 
 let notificationContainer = null;
 
@@ -111,7 +112,7 @@ const removeNotification = (notification) => {
 
 // Convenience methods
 export const showSuccess = (message, duration) => showNotification(message, 'success', duration);
-export const showError = (message, duration) => showNotification(message, 'error', duration);
+export const showError = (message, duration) => showNotification(formatErrorMessage(message), 'error', duration);
 export const showWarning = (message, duration) => showNotification(message, 'warning', duration);
 export const showInfo = (message, duration) => showNotification(message, 'info', duration);
 

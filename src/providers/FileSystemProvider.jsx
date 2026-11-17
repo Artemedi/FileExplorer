@@ -4,6 +4,7 @@ import { useHistory } from './HistoryProvider';
 import { useSettings } from './SettingsProvider';
 import { useSftp } from './SftpProvider';
 import { getDirectoryPath } from '../utils/pathUtils';
+import { formatErrorMessage } from '../utils/formatters';
 
 // Create file system context
 const FileSystemContext = createContext({
@@ -84,7 +85,7 @@ export default function FileSystemProvider({ children }) {
             return volumesData; // Zurückgeben zur weiteren Verwendung
         } catch (err) {
             console.error('Failed to load volumes:', err);
-            setError(`Failed to load volumes: ${err.message || err}`);
+            setError(`Failed to load volumes: ${formatErrorMessage(err)}`);
             // Fallback to mock data for development
             const mockVolumes = [
                 {
@@ -157,8 +158,8 @@ export default function FileSystemProvider({ children }) {
             console.error(`Failed to load directory: ${path}`, err);
             
             // Handle permission errors specifically for macOS user directories
-            const errorMessage = err.message || err.toString();
-            if (errorMessage.includes('permission denied') || errorMessage.includes('Permission denied')) {
+            const errorMessage = formatErrorMessage(err);
+            if (errorMessage.toLowerCase().includes('permission denied') || errorMessage.toLowerCase().includes('unauthorized')) {
                 const folderName = path.split('/').pop() || path;
                 const isUserDir = ['Desktop', 'Documents', 'Downloads', 'Pictures', 'Movies', 'Music'].some(dir => 
                     path.toLowerCase().includes(dir.toLowerCase())
@@ -306,7 +307,7 @@ export default function FileSystemProvider({ children }) {
             }
         } catch (err) {
             console.error(`Failed to open file: ${filePath}`, err);
-            setError(`Failed to open file: ${err.message || err}`);
+            setError(`Failed to open file: ${formatErrorMessage(err)}`);
         } finally {
             setIsLoading(false);
         }
@@ -332,7 +333,7 @@ export default function FileSystemProvider({ children }) {
             }
         } catch (err) {
             console.error(`Failed to create file: ${fileName}`, err);
-            setError(`Failed to create file: ${err.message || err}`);
+            setError(`Failed to create file: ${formatErrorMessage(err)}`);
         } finally {
             setIsLoading(false);
         }
@@ -358,7 +359,7 @@ export default function FileSystemProvider({ children }) {
             }
         } catch (err) {
             console.error(`Failed to create directory: ${directoryName}`, err);
-            setError(`Failed to create directory: ${err.message || err}`);
+            setError(`Failed to create directory: ${formatErrorMessage(err)}`);
         } finally {
             setIsLoading(false);
         }
@@ -391,7 +392,7 @@ export default function FileSystemProvider({ children }) {
             console.log('FileSystemProvider: Rename operation completed successfully');
         } catch (err) {
             console.error(`Failed to rename item: ${oldPath}`, err);
-            setError(`Failed to rename item: ${err.message || err}`);
+            setError(`Failed to rename item: ${formatErrorMessage(err)}`);
         } finally {
             setIsLoading(false);
         }
@@ -422,7 +423,7 @@ export default function FileSystemProvider({ children }) {
             }
         } catch (err) {
             console.error(`Failed to move item to trash: ${path}`, err);
-            setError(`Failed to move item to trash: ${err.message || err}`);
+            setError(`Failed to move item to trash: ${formatErrorMessage(err)}`);
         } finally {
             setIsLoading(false);
         }
@@ -445,7 +446,7 @@ export default function FileSystemProvider({ children }) {
             }
         } catch (err) {
             console.error('Failed to create zip:', err);
-            setError(`Failed to create zip: ${err.message || err}`);
+            setError(`Failed to create zip: ${formatErrorMessage(err)}`);
         } finally {
             setIsLoading(false);
         }
@@ -468,7 +469,7 @@ export default function FileSystemProvider({ children }) {
             }
         } catch (err) {
             console.error(`Failed to extract zip: ${zipPath}`, err);
-            setError(`Failed to extract zip: ${err.message || err}`);
+            setError(`Failed to extract zip: ${formatErrorMessage(err)}`);
         } finally {
             setIsLoading(false);
         }
