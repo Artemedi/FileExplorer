@@ -708,6 +708,7 @@ impl SearchCore {
         }
 
         // Ensure the cache is purged of any entries that might contain references to removed paths
+        let _ = removed_count;
         self.cache.purge_expired();
         
         #[cfg(feature = "index-progress-logging")]

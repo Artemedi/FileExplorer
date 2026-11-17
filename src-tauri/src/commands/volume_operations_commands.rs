@@ -68,7 +68,10 @@ pub fn get_system_volumes_information() -> Vec<VolumeInformation> {
 
     for disk in &disks {
         let mount_point = disk.mount_point().to_string_lossy().into_owned();
+        #[cfg(target_os = "windows")]
         let mut volume_name = disk.name().to_string_lossy().into_owned();
+        #[cfg(not(target_os = "windows"))]
+        let volume_name = disk.name().to_string_lossy().into_owned();
 
         // On Windows, if volume label is empty, provide a clean friendly name like "Local Disk (C:)"
         #[cfg(target_os = "windows")]

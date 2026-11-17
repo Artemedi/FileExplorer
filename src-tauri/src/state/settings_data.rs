@@ -1,4 +1,4 @@
-use crate::{constants, log_error};
+use crate::constants;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::File;
