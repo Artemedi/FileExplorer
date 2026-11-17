@@ -1,6 +1,6 @@
 [package]
-name = "src-tauri"
-version = "0.2.4"
+name = "explr"
+version = "0.2.5"
 description = "Explr - Modern File Explorer"
 authors = ["Conaticus", "ProtogenDelta", "Marco Brandt", "Lauritz Wiebusch", "Daniel Schatz", "Sören Panten"]
 license = ""

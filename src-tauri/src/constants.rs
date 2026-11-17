@@ -2,12 +2,54 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-pub static VERSION: &str = "0.2.3";
+pub static VERSION: &str = "0.2.5";
+
+/// Returns the base directory for application data (config, logs, templates).
+/// On Windows: %APPDATA%\Explr
+/// On macOS: ~/Library/Application Support/Explr
+/// On Linux: $XDG_CONFIG_HOME/explr or ~/.config/explr
+/// In local dev / portable mode: if EXPLR_DATA_DIR env is set, use that.
+pub fn get_app_base_dir() -> PathBuf {
+    if let Ok(custom_dir) = env::var("EXPLR_DATA_DIR") {
+        return PathBuf::from(custom_dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(app_data) = env::var("APPDATA") {
+            return PathBuf::from(app_data).join("Explr");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = home::home_dir() {
+            return home.join("Library").join("Application Support").join("Explr");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+            return PathBuf::from(xdg).join("explr");
+        }
+        if let Some(home) = home::home_dir() {
+            return home.join(".config").join("explr");
+        }
+    }
+
+    if let Some(home) = home::home_dir() {
+        home.join(".explr")
+    } else {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("explr_data")
+    }
+}
 
 pub static CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
-    env::current_dir()
-        .expect("Could not determine current path")
-        .join("config")
+    let base = get_app_base_dir();
+    let config_dir = base.join("config");
+    let _ = std::fs::create_dir_all(&config_dir);
+    config_dir
 });
 
 pub static META_DATA_CONFIG_ABS_PATH: LazyLock<PathBuf> =
@@ -15,9 +57,10 @@ pub static META_DATA_CONFIG_ABS_PATH: LazyLock<PathBuf> =
 
 
 pub static LOG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
-    env::current_dir()
-        .expect("Could not determine current path")
-        .join("logs")
+    let base = get_app_base_dir();
+    let logs_dir = base.join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    logs_dir
 });
 
 

@@ -624,7 +624,7 @@ impl SettingsState {
         let settings_state = Self(Arc::new(Mutex::new(defaults.clone())));
 
         if let Err(e) = settings_state.write_settings_to_file(&defaults) {
-            log_error!("Error writing settings to file: {}", e);
+            eprintln!("Error writing settings to file: {}", e);
         }
 
         defaults

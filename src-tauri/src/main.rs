@@ -106,7 +106,7 @@ async fn main() {
         .invoke_handler(all_commands())
         .setup(|app| {
             // Safely show/focus the main window if it exists
-            if let Some(window) = app.get_window("main") {
+            if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
