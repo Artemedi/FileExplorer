@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["count_subdirectories","count_subfiles","format_system_time","get_access_permission_number","get_access_permission_string"],"mod":["backend_settings","directory","directory_entries_helper","file","logging_config","logging_level","ranking_config","search_engine_config","volume"],"struct":["Directory","Entries","File","VolumeInformation"]};

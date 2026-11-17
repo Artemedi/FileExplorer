@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["art_v5","fast_fuzzy_v2","lru_cache_v2","path_cache_wrapper","search_core"]};

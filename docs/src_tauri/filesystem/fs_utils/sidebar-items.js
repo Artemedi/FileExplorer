@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["_get_mount_point"]};
