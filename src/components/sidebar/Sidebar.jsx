@@ -5,7 +5,6 @@ import {useContextMenu} from '../../providers/ContextMenuProvider';
 import {useSftp} from '../../providers/SftpProvider';
 import SidebarItem from './SidebarItem';
 import Favorites from './Favorites';
-//import QuickAccess from './QuickAccess';
 import Modal from '../common/Modal';
 import Button from '../common/Button';
 import AddSftpConnectionView from './AddSftpConnectionView';
