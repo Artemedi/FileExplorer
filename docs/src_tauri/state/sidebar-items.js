@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["setup_app_state"],"mod":["logging","meta_data","searchengine_data","settings_data"]};

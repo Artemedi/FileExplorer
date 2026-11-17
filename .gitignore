@@ -1,98 +1,55 @@
-/src-tauri/test-data*/
-
-# General Rust ignores
+# Build and binary artifacts
 /target/
-/Cargo.lock
-**/*.rs.bk
-
-# Ignore artifacts from `cargo check`
-/debug/
-**/*.rmeta
-
-# Ignore compiled binaries
-**/*.so
-**/*.dylib
-**/*.dll
-**/*.exe
-
-# Tauri-specific ignores
 /src-tauri/target/
 /src-tauri/.tauri-build
-/src-tauri/tauri.conf.json.bak
 /src-tauri/gen/
-
-# Prevent including generated bindings (if any)
-/src-tauri/bindings.json
-/src-tauri/bindings.ts
-
-# Ignore logs and runtime files
-/src-tauri/logs/
-/src-tauri/*.log
-
-# Ignore Webview-generated files
 /dist/
 /public/dist/
+/dist-builds/
+/docs/src_tauri/
 
-# Node.js & frontend (if using React, Vue, Svelte, etc.)
+# Compiled and packaged binaries
+*.so
+*.dylib
+*.dll
+*.exe
+*.deb
+*.rpm
+*.AppImage
+*.dmg
+*.msi
+
+# Node.js dependencies
 /node_modules/
-/pnpm-lock.yaml
-/package-lock.json
-/yarn.lock
-/vite.config.ts
-/vite.config.js
 /.turbo/
 
-# Ignore IDE/Editor files
+# Logs and runtime files
+/logs/
+/src-tauri/logs/
+*.log
+app.log
+
+# Test data & artifacts
+/src-tauri/test-data*/
+
+# Local config & state
+/config/meta_data.json
+/config/settings.json
+/src-tauri/config/
+/src-tauri/bindings.json
+/src-tauri/bindings.ts
+*.bak
+
+# IDE & Editor files
 /.vscode/
 /.idea/
-/*.iml
-**/.DS_Store
-/.env
-/.env.local
-/.env.*.local
-
-# Ignore Rover-specific files (if using Apollo GraphQL)
-.rover
-/.rover/tmp/
-/.rover/cache/
-/.graphqlrc.yml
-/.graphqlconfig
-
-# Ignore temporary and backup files
+*.iml
+.DS_Store
 *.swp
 *.swo
 *~
 
-
-# Ignore custom path for files
-/src-tauri/config
-/config
-app.log
-
-# Ignore test data
-/src-tauri/test-data*/
-
-# Ingnore meta_data and settings
-/config/meta_data.json
-/config/settings.json
-
-# Ignore logs
-/logs/*
-
-# for the latex stuff
-/FileExplorerAusarbeitung/*.acn
-/FileExplorerAusarbeitung/*.acr
-/FileExplorerAusarbeitung/*.alg
-/FileExplorerAusarbeitung/*.aux
-/FileExplorerAusarbeitung/*.bcf
-/FileExplorerAusarbeitung/*.fdb_latexmk
-/FileExplorerAusarbeitung/*.fls
-/FileExplorerAusarbeitung/*.glg
-/FileExplorerAusarbeitung/*.glo
-/FileExplorerAusarbeitung/*.gls
-/FileExplorerAusarbeitung/*.ist
-/FileExplorerAusarbeitung/*.lof
-/FileExplorerAusarbeitung/*.log
-/FileExplorerAusarbeitung/*.out
-/FileExplorerAusarbeitung/*.xml
-/FileExplorerAusarbeitung/*.toc
+# Environment variables
+.env
+.env.local
+.env.*.local

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["DefaultView","DoubleClick","FontSize","SortBy","SortDirection"],"struct":["Settings","SettingsState"]};
