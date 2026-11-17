@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:build:macos": "cargo tauri build --target aarch64-apple-darwin && cd src-tauri/scripts && ./post-build.sh",
@@ -22,7 +23,11 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^7.0.2",
     "vite": "^6.0.3"
   }
 }

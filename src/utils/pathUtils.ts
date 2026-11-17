@@ -4,10 +4,10 @@
 
 /**
  * Detect the path separator based on the given path or platform.
- * @param {string} path - A sample path to detect the separator from.
- * @returns {string} - The path separator ('/' or '\').
+ * @param path - A sample path to detect the separator from.
+ * @returns The path separator ('/' or '\\').
  */
-export const detectPathSeparator = (path) => {
+export const detectPathSeparator = (path?: string | null): string => {
     if (path && path.includes('\\')) {
         return '\\';
     }
@@ -16,10 +16,10 @@ export const detectPathSeparator = (path) => {
 
 /**
  * Get the directory path from a full file/directory path.
- * @param {string} fullPath - The full path.
- * @returns {string} - The directory path.
+ * @param fullPath - The full path.
+ * @returns The directory path.
  */
-export const getDirectoryPath = (fullPath) => {
+export const getDirectoryPath = (fullPath?: string | null): string => {
     if (!fullPath) return '';
 
     const separator = detectPathSeparator(fullPath);
@@ -42,10 +42,10 @@ export const getDirectoryPath = (fullPath) => {
 
 /**
  * Get the filename from a full path.
- * @param {string} fullPath - The full path.
- * @returns {string} - The filename.
+ * @param fullPath - The full path.
+ * @returns The filename.
  */
-export const getFileName = (fullPath) => {
+export const getFileName = (fullPath?: string | null): string => {
     if (!fullPath) return '';
 
     const separator = detectPathSeparator(fullPath);
@@ -60,11 +60,11 @@ export const getFileName = (fullPath) => {
 
 /**
  * Create a new path by replacing the filename in a full path.
- * @param {string} fullPath - The original full path.
- * @param {string} newFileName - The new filename.
- * @returns {string} - The new full path.
+ * @param fullPath - The original full path.
+ * @param newFileName - The new filename.
+ * @returns The new full path.
  */
-export const replaceFileName = (fullPath, newFileName) => {
+export const replaceFileName = (fullPath: string, newFileName: string): string => {
     if (!fullPath || !newFileName) return fullPath;
 
     const dirPath = getDirectoryPath(fullPath);
@@ -80,10 +80,10 @@ export const replaceFileName = (fullPath, newFileName) => {
 
 /**
  * Join path segments using the appropriate separator.
- * @param {...string} segments - Path segments to join.
- * @returns {string} - The joined path.
+ * @param segments - Path segments to join.
+ * @returns The joined path.
  */
-export const joinPath = (...segments) => {
+export const joinPath = (...segments: (string | undefined | null)[]): string => {
     if (segments.length === 0) return '';
 
     // Detect separator from the first segment that contains one
@@ -96,7 +96,7 @@ export const joinPath = (...segments) => {
     }
 
     return segments
-        .filter(segment => segment && typeof segment === 'string')
+        .filter((segment): segment is string => Boolean(segment && typeof segment === 'string'))
         .map((segment, index) => {
             // Remove leading/trailing separators except for the first segment
             if (index === 0) {
@@ -109,10 +109,10 @@ export const joinPath = (...segments) => {
 
 /**
  * Normalize a path by removing redundant separators and handling edge cases.
- * @param {string} path - The path to normalize.
- * @returns {string} - The normalized path.
+ * @param path - The path to normalize.
+ * @returns The normalized path.
  */
-export const normalizePath = (path) => {
+export const normalizePath = (path?: string | null): string => {
     if (!path) return '';
 
     const separator = detectPathSeparator(path);
@@ -134,10 +134,10 @@ export const normalizePath = (path) => {
 
 /**
  * Check if a path is a root path.
- * @param {string} path - The path to check.
- * @returns {boolean} - True if it's a root path.
+ * @param path - The path to check.
+ * @returns True if it's a root path.
  */
-export const isRootPath = (path) => {
+export const isRootPath = (path?: string | null): boolean => {
     if (!path) return false;
 
     // Unix root

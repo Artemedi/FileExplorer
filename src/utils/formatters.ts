@@ -1,10 +1,10 @@
 /**
  * Format a file size in bytes to a human-readable string.
- * @param {number} bytes - The file size in bytes.
- * @param {number} decimals - The number of decimal places to show.
- * @returns {string} The formatted file size.
+ * @param bytes - The file size in bytes.
+ * @param decimals - The number of decimal places to show.
+ * @returns The formatted file size.
  */
-export const formatFileSize = (bytes, decimals = 1) => {
+export const formatFileSize = (bytes: number, decimals: number = 1): string => {
     if (bytes === 0) return '0 Bytes';
 
     const k = 1024;
@@ -18,11 +18,11 @@ export const formatFileSize = (bytes, decimals = 1) => {
 
 /**
  * Format a date string to a human-readable format.
- * @param {string} dateString - The date string to format.
- * @param {boolean} includeTime - Whether to include the time.
- * @returns {string} The formatted date.
+ * @param dateString - The date string to format.
+ * @param includeTime - Whether to include the time.
+ * @returns The formatted date.
  */
-export const formatDate = (dateString, includeTime = false) => {
+export const formatDate = (dateString?: string | null, includeTime: boolean = false): string => {
     if (!dateString) return 'Unknown';
 
     try {
@@ -33,7 +33,7 @@ export const formatDate = (dateString, includeTime = false) => {
             return 'Invalid date';
         }
 
-        const options = {
+        const options: Intl.DateTimeFormatOptions = {
             year: 'numeric',
             month: 'short',
             day: 'numeric',
@@ -54,17 +54,17 @@ export const formatDate = (dateString, includeTime = false) => {
 
 /**
  * Get a human-readable file type based on the file extension.
- * @param {string} filename - The filename to extract the extension from.
- * @returns {string} The human-readable file type.
+ * @param filename - The filename to extract the extension from.
+ * @returns The human-readable file type.
  */
-export const getFileType = (filename) => {
+export const getFileType = (filename?: string | null): string => {
     if (!filename || !filename.includes('.')) {
         return 'File';
     }
 
-    const extension = filename.split('.').pop().toLowerCase();
+    const extension = filename.split('.').pop()?.toLowerCase() || '';
 
-    const fileTypes = {
+    const fileTypes: Record<string, string> = {
         // Documents
         'pdf': 'PDF Document',
         'doc': 'Word Document',
@@ -160,10 +160,10 @@ export const getFileType = (filename) => {
 
 /**
  * Calculate the time elapsed since a specific date.
- * @param {string} dateString - The date string to calculate from.
- * @returns {string} The elapsed time as a human-readable string.
+ * @param dateString - The date string to calculate from.
+ * @returns The elapsed time as a human-readable string.
  */
-export const calculateTimeElapsed = (dateString) => {
+export const calculateTimeElapsed = (dateString?: string | null): string => {
     if (!dateString) return 'Unknown';
 
     try {
@@ -175,7 +175,7 @@ export const calculateTimeElapsed = (dateString) => {
             return 'Invalid date';
         }
 
-        const seconds = Math.floor((now - date) / 1000);
+        const seconds = Math.floor((now.getTime() - date.getTime()) / 1000);
 
         if (seconds < 60) {
             return 'Just now';
@@ -212,10 +212,10 @@ export const calculateTimeElapsed = (dateString) => {
 /**
  * Safely format an error into a human-readable message.
  * Extracts message from Error objects, strings, or JSON-serialized backend errors.
- * @param {any} err - The error caught from a Promise or try/catch.
- * @returns {string} The formatted error message.
+ * @param err - The error caught from a Promise or try/catch.
+ * @returns The formatted error message.
  */
-export const formatErrorMessage = (err) => {
+export const formatErrorMessage = (err: unknown): string => {
     if (!err) return 'An unknown error occurred';
     if (typeof err === 'string') {
         try {
@@ -242,7 +242,10 @@ export const formatErrorMessage = (err) => {
             return err;
         }
     }
-    if (err.custom_message) return err.custom_message;
-    if (err.message) return err.message;
+    if (typeof err === 'object' && err !== null) {
+        const obj = err as Record<string, unknown>;
+        if (typeof obj.custom_message === 'string') return obj.custom_message;
+        if (typeof obj.message === 'string') return obj.message;
+    }
     return String(err);
 };
