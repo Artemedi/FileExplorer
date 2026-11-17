@@ -50,27 +50,54 @@ pub fn set_default_file_manager(enable: bool) -> Result<(), String> {
         if enable {
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
             let exe_str = exe.to_string_lossy();
-            let cmd = format!("\"{}\" \"%1\"", exe_str);
+            let cmd_with_param = format!("\"{}\" \"%1\"", exe_str);
+            let cmd_bare = format!("\"{}\"", exe_str);
 
-            for key in [
+            let folder_keys = [
                 "HKCU\\Software\\Classes\\Directory\\shell\\open\\command",
                 "HKCU\\Software\\Classes\\Folder\\shell\\open\\command",
+                "HKCU\\Software\\Classes\\Folder\\shell\\opennewwindow\\command",
                 "HKCU\\Software\\Classes\\Drive\\shell\\open\\command",
-            ] {
-                let out = run_reg(&["add", key, "/ve", "/t", "REG_SZ", "/d", &cmd, "/f"])?;
+            ];
+
+            for key in folder_keys {
+                let out = run_reg(&["add", key, "/ve", "/t", "REG_SZ", "/d", &cmd_with_param, "/f"])?;
                 if !out.status.success() {
                     let err = String::from_utf8_lossy(&out.stderr);
                     return Err(format!("Failed to register {}: {}", key, err));
                 }
+                // Blank out DelegateExecute so Windows does not delegate to native explorer COM handler
+                let _ = run_reg(&["add", key, "/v", "DelegateExecute", "/t", "REG_SZ", "/d", "", "/f"]);
             }
+
+            // Win+E and Windows Shell CLSID redirection ({52205a2e-433a-4467-b50a-81eb16016149})
+            let clsid_keys = [
+                "HKCU\\Software\\Classes\\CLSID\\{52205a2e-433a-4467-b50a-81eb16016149}\\shell\\opennewwindow\\command",
+                "HKCU\\Software\\Classes\\CLSID\\{52205a2e-433a-4467-b50a-81eb16016149}\\shell\\open\\command",
+            ];
+
+            for key in clsid_keys {
+                let _ = run_reg(&["add", key, "/ve", "/t", "REG_SZ", "/d", &cmd_bare, "/f"]);
+                let _ = run_reg(&["add", key, "/v", "DelegateExecute", "/t", "REG_SZ", "/d", "", "/f"]);
+            }
+
+            // Set default verbs
+            let _ = run_reg(&["add", "HKCU\\Software\\Classes\\Directory\\shell", "/ve", "/t", "REG_SZ", "/d", "open", "/f"]);
+            let _ = run_reg(&["add", "HKCU\\Software\\Classes\\Folder\\shell", "/ve", "/t", "REG_SZ", "/d", "open", "/f"]);
+            let _ = run_reg(&["add", "HKCU\\Software\\Classes\\Drive\\shell", "/ve", "/t", "REG_SZ", "/d", "open", "/f"]);
         } else {
             for key in [
                 "HKCU\\Software\\Classes\\Directory\\shell\\open",
                 "HKCU\\Software\\Classes\\Folder\\shell\\open",
+                "HKCU\\Software\\Classes\\Folder\\shell\\opennewwindow",
                 "HKCU\\Software\\Classes\\Drive\\shell\\open",
+                "HKCU\\Software\\Classes\\CLSID\\{52205a2e-433a-4467-b50a-81eb16016149}",
             ] {
                 let _ = run_reg(&["delete", key, "/f"]);
             }
+            let _ = run_reg(&["delete", "HKCU\\Software\\Classes\\Directory\\shell", "/ve", "/f"]);
+            let _ = run_reg(&["delete", "HKCU\\Software\\Classes\\Folder\\shell", "/ve", "/f"]);
+            let _ = run_reg(&["delete", "HKCU\\Software\\Classes\\Drive\\shell", "/ve", "/f"]);
         }
         Ok(())
     }

@@ -458,12 +458,25 @@ impl SearchCore {
                 .into_iter()
                 .filter_entry(|e| {
                     if let Some(name) = e.file_name().to_str() {
-                        if name == "AppData" || name == "node_modules" || name == ".git" || name == "target" || name == ".cache" || name == "$Recycle.Bin" || name == "System Volume Information" {
+                        let lower = name.to_lowercase();
+                        if lower == "appdata"
+                            || lower == "node_modules"
+                            || lower == ".git"
+                            || lower == "target"
+                            || lower == ".cache"
+                            || lower == ".cargo"
+                            || lower == ".rustup"
+                            || lower == ".vscode"
+                            || lower == "$recycle.bin"
+                            || lower == "system volume information"
+                            || lower == "temp"
+                        {
                             return false;
                         }
                     }
                     if let Some(path_str) = e.path().to_str() {
-                        if patterns_ref.iter().any(|p| path_str.contains(p.as_str())) {
+                        let path_lower = path_str.to_lowercase();
+                        if patterns_ref.iter().any(|p| path_lower.contains(&p.to_lowercase())) {
                             return false;
                         }
                     }

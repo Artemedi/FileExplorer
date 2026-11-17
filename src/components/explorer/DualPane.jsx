@@ -68,11 +68,13 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                 setLeftPath(path);
                 setLeftSelected([]);
                 localStorage.setItem('explr_dual_pane_left', path);
+                if (activePane === 'left') navigateTo(path);
             } else {
                 setRightDirData(filtered);
                 setRightPath(path);
                 setRightSelected([]);
                 localStorage.setItem('explr_dual_pane_right', path);
+                if (activePane === 'right') navigateTo(path);
             }
         } catch (err) {
             console.error(`Failed to load directory ${path} in ${pane} pane:`, err);
@@ -81,12 +83,13 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
             if (pane === 'left') setLeftLoading(false);
             else setRightLoading(false);
         }
-    }, [filterData]);
+    }, [filterData, activePane, navigateTo]);
 
     // Initial load for both panes
     useEffect(() => {
         loadPaneDirectory('left', leftPath);
         loadPaneDirectory('right', rightPath);
+        if (leftPath) navigateTo(leftPath);
     }, []);
 
     // Sync external navigation (e.g. breadcrumbs or sidebar clicks) with active pane
@@ -103,8 +106,64 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
     const handleActivate = (pane) => {
         setActivePane(pane);
         const path = pane === 'left' ? leftPath : rightPath;
-        if (path && path !== currentPath) {
+        if (path) {
             navigateTo(path);
+        }
+    };
+
+    // Drag and drop handler between panes or from external sources
+    const handlePaneDrop = async (targetPane, e) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        const targetDir = targetPane === 'left' ? leftPath : rightPath;
+        if (!targetDir) return;
+        const separator = targetDir.includes('/') ? '/' : '\\';
+
+        try {
+            const raw = e.dataTransfer.getData('application/json');
+            if (raw) {
+                const source = JSON.parse(raw);
+                if (source && source.path) {
+                    const dest = targetDir.endsWith(separator)
+                        ? `${targetDir}${source.name}`
+                        : `${targetDir}${separator}${source.name}`;
+                    if (source.path !== dest) {
+                        await invoke('copy_file_or_dir', {
+                            sourcePath: source.path,
+                            destinationPath: dest
+                        });
+                        showSuccess(`${t('common.success')}: ${source.name}`);
+                        loadPaneDirectory(targetPane, targetDir);
+                    }
+                    return;
+                }
+            }
+        } catch (_) {}
+
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            let count = 0;
+            for (let i = 0; i < e.dataTransfer.files.length; i++) {
+                const f = e.dataTransfer.files[i];
+                if (f.path) {
+                    const dest = targetDir.endsWith(separator)
+                        ? `${targetDir}${f.name}`
+                        : `${targetDir}${separator}${f.name}`;
+                    try {
+                        await invoke('copy_file_or_dir', {
+                            sourcePath: f.path,
+                            destinationPath: dest
+                        });
+                        count++;
+                    } catch (err) {
+                        console.error('File drop copy failed:', err);
+                    }
+                }
+            }
+            if (count > 0) {
+                showSuccess(`${t('common.success')}: ${count} ${t('common.items')}`);
+                loadPaneDirectory(targetPane, targetDir);
+            }
         }
     };
 
@@ -326,6 +385,8 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                 <div
                     className={`dual-pane-panel ${activePane === 'left' ? 'active' : ''}`}
                     onClick={() => handleActivate('left')}
+                    onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
+                    onDrop={(e) => handlePaneDrop('left', e)}
                 >
                     <div className="dual-pane-header">
                         <div className="dual-pane-title-area">
@@ -412,6 +473,8 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                 <div
                     className={`dual-pane-panel ${activePane === 'right' ? 'active' : ''}`}
                     onClick={() => handleActivate('right')}
+                    onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
+                    onDrop={(e) => handlePaneDrop('right', e)}
                 >
                     <div className="dual-pane-header">
                         <div className="dual-pane-title-area">

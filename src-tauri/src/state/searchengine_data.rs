@@ -528,21 +528,17 @@ impl SearchEngineState {
         let mut dir_queue = VecDeque::new();
         dir_queue.push_back((root_dir.clone(), 0));
         
-        const MAX_DEPTH: usize = 25;
-        const MAX_FILES: usize = 500000;
+        const MAX_DEPTH: usize = 12;
+        const MAX_FILES: usize = 100000;
         
         while let Some((current_dir, depth)) = dir_queue.pop_front() {
             // Depth limiting to prevent infinite loops and excessive memory usage
             if depth >= MAX_DEPTH {
-                #[cfg(feature = "index-progress-logging")]
-                log_info!("Skipping directory due to depth limit: {} (depth: {})", current_dir.display(), depth);
                 continue;
             }
 
             // File count limiting to prevent memory exhaustion
             if *discovered_files > MAX_FILES {
-                #[cfg(feature = "index-progress-logging")]
-                log_info!("Stopping indexing due to file count limit: {}", *discovered_files);
                 break;
             }
 
@@ -567,16 +563,32 @@ impl SearchEngineState {
 
                     let path = entry.path();
 
+                    // Hard skip heavy folders (case-insensitive) to prevent memory & disk thrashing
+                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                        let lower_name = file_name.to_lowercase();
+                        if lower_name == "appdata"
+                            || lower_name == ".cache"
+                            || lower_name == ".npm"
+                            || lower_name == ".cargo"
+                            || lower_name == ".rustup"
+                            || lower_name == ".vscode"
+                            || lower_name == "node_modules"
+                            || lower_name == ".git"
+                            || lower_name == "target"
+                            || lower_name == "$recycle.bin"
+                            || lower_name == "system volume information"
+                            || lower_name == "temp"
+                        {
+                            continue;
+                        }
+                    }
+
                     if let Some(path_str) = path.to_str() {
-                        // Check if path should be excluded
+                        let lower_path = path_str.to_lowercase();
+                        // Check if path should be excluded (case-insensitive)
                         let should_exclude = excluded_patterns.iter().any(|pattern| {
-                            path_str.contains(pattern)
-                                || path_str.ends_with(pattern)
-                                || path
-                                    .file_name()
-                                    .and_then(|name| name.to_str())
-                                    .map(|name| name.contains(pattern))
-                                    .unwrap_or(false)
+                            let p_lower = pattern.to_lowercase();
+                            lower_path.contains(&p_lower)
                         });
 
                         if !should_exclude {

@@ -48,6 +48,12 @@
     filter: grayscale(50%);
 }
 
+.file-item.drag-over {
+    outline: 2px dashed var(--accent);
+    outline-offset: -2px;
+    background-color: var(--accent-surface) !important;
+}
+
 .file-item.cut .file-name {
     color: var(--text-tertiary);
 }

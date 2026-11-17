@@ -6,6 +6,7 @@ import { useHistory } from '../providers/HistoryProvider';
 import { useSettings } from '../providers/SettingsProvider';
 import { useSftp } from '../providers/SftpProvider';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { showError, showConfirm, showSuccess } from '../utils/NotificationSystem';
 
 // Core Components
@@ -295,7 +296,6 @@ const MainLayout = () => {
                         });
                         
                         console.log('MainLayout: Auto-indexing initiated:', result);
-                        showSuccess('Background indexing started for your home directory');
                     } else {
                         console.log('MainLayout: Search engine already has indexed files, skipping auto-indexing');
                     }
@@ -451,9 +451,36 @@ const MainLayout = () => {
     document.addEventListener('sftp-file-opened', handleSftpFileOpened);
     document.addEventListener('force-explorer-view', () => setCurrentView('explorer'));
 
+    // Handle external files dragged and dropped into the app window
+    let unlistenTauriDrop = null;
+    listen('tauri://drag-drop', async (event) => {
+        const paths = event.payload?.paths;
+        if (paths && paths.length > 0 && currentPath) {
+            const separator = currentPath.includes('/') ? '/' : '\\';
+            let count = 0;
+            for (const p of paths) {
+                const name = p.split(/[\\/]/).pop();
+                const dest = currentPath.endsWith(separator)
+                    ? `${currentPath}${name}`
+                    : `${currentPath}${separator}${name}`;
+                try {
+                    await invoke('copy_file_or_dir', { sourcePath: p, destinationPath: dest });
+                    count++;
+                } catch (e) {
+                    console.error('Failed to copy dropped file:', e);
+                }
+            }
+            if (count > 0) {
+                showSuccess(`Copied ${count} item(s)`);
+                loadDirectory(currentPath);
+            }
+        }
+    }).then(unlisten => { unlistenTauriDrop = unlisten; }).catch(() => {});
+
         console.log('MainLayout: All event listeners registered');
 
         return () => {
+            if (unlistenTauriDrop) unlistenTauriDrop();
             document.removeEventListener('open-templates', handleOpenTemplates);
             document.removeEventListener('show-properties', handleShowProperties);
             document.removeEventListener('open-this-pc', handleOpenThisPC);

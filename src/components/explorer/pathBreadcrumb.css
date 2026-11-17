@@ -10,30 +10,26 @@
     flex: 1;
     height: 32px;
     padding: 0 var(--space-md);
-    border-radius: var(--radius-md);
-    background-color: var(--background-tertiary);
+    border-radius: var(--radius-md, 6px);
+    background-color: var(--background-secondary);
+    border: 1px solid var(--border);
     display: flex;
     align-items: center;
     overflow: hidden;
     cursor: text;
-    transition: background-color var(--transition-fast);
+    transition: background-color var(--transition-fast), border-color var(--transition-fast);
     min-width: 0;
-}
-
-.action-buttons {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-left: 12px;
-    flex-shrink: 0;
 }
 
 .path-breadcrumb:hover {
     background-color: var(--surface-hover);
+    border-color: var(--border);
 }
 
+.path-breadcrumb:focus-within,
 .path-breadcrumb.editing {
-    cursor: auto;
+    background-color: var(--surface);
+    border-color: var(--accent);
 }
 
 .breadcrumb-segments {
@@ -42,26 +38,27 @@
     flex: 1;
     overflow-x: auto;
     white-space: nowrap;
-    scrollbar-width: none; /* Hide scrollbar in Firefox */
+    scrollbar-width: none;
     min-width: 0;
 }
 
 .breadcrumb-segments::-webkit-scrollbar {
-    display: none; /* Hide scrollbar in Chrome/Safari/Edge */
+    display: none;
 }
 
-
 .segment-button {
-    padding: 0 8px;
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
     height: 24px;
-    border-radius: var(--radius-md);
-    font-size: var(--font-size-sm);
-    color: var(--text-on-accent, #fff);
-    background-color: var(--background-breadcrumb, rgba(80, 120, 255, 0.18));
+    border-radius: var(--radius-sm, 4px);
+    font-size: 13px;
+    color: var(--text-primary);
+    background-color: transparent;
     cursor: pointer;
-    border: none;
-    margin: 0 8px;
-    transition: color var(--transition-fast), background-color var(--transition-fast), box-shadow var(--transition-fast);
+    border: 1px solid transparent;
+    margin: 0 1px;
+    transition: background-color var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
     white-space: nowrap;
     flex-shrink: 0;
     box-shadow: none;
@@ -72,20 +69,25 @@
 }
 
 .segment-button:hover {
-    color: var(--text-on-accent, #fff);
-    background-color: var(--background-breadcrumb-hover, rgba(80, 120, 255, 0.32));
+    color: var(--text-primary);
+    background-color: var(--surface-hover);
+    border-color: var(--border);
 }
 
 .segment-button.current {
     color: var(--accent);
-    font-weight: var(--font-weight-medium);
-    background-color: var(--background-breadcrumb, rgba(80, 120, 255, 0.18));
+    font-weight: 600;
 }
 
 .segment-divider {
+    display: inline-flex;
+    align-items: center;
     color: var(--text-tertiary);
-    margin: 0 2px 0 0;
+    font-size: 14px;
+    font-weight: 400;
+    margin: 0 2px;
     flex-shrink: 0;
+    user-select: none;
 }
 
 .path-input {

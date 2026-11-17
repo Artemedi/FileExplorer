@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { getFileType } from '../../utils/formatters';
 import { useFileSystem } from '../../providers/FileSystemProvider';
+import { useHistory } from '../../providers/HistoryProvider';
 import { useContextMenu } from '../../providers/ContextMenuProvider';
-import { showError } from '../../utils/NotificationSystem';
+import { showError, showSuccess } from '../../utils/NotificationSystem';
+import { invoke } from '@tauri-apps/api/core';
 import FileItem from './FileItem';
 import EmptyState from './EmptyState';
 import './fileList.css';
@@ -44,6 +46,7 @@ const FileList = ({
     const setFocusedItem = customSetFocusedItem || fs.setFocusedItem;
     const openFile = customOpenFile || fs.openFile;
     const { openContextMenu } = useContextMenu();
+    const { currentPath } = useHistory();
     const [sortConfig, setSortConfig] = useState({ key: 'name', direction: 'asc' });
     const [isShiftKeyPressed, setIsShiftKeyPressed] = useState(false);
     const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
@@ -219,6 +222,65 @@ const FileList = ({
         if (e.target === e.currentTarget && e.detail !== 0) {
             clearSelection();
             setLastSelectedIndex(-1);
+        }
+    };
+
+    /**
+     * Handles dropping files/folders onto the container (current directory)
+     */
+    const handleContainerDrop = async (e) => {
+        if (e.target.closest('[data-path]')) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        const targetDir = currentPath;
+        if (!targetDir) return;
+        const separator = targetDir.includes('/') ? '/' : '\\';
+
+        try {
+            const raw = e.dataTransfer.getData('application/json');
+            if (raw) {
+                const source = JSON.parse(raw);
+                if (source && source.path) {
+                    const dest = targetDir.endsWith(separator)
+                        ? `${targetDir}${source.name}`
+                        : `${targetDir}${separator}${source.name}`;
+                    if (source.path !== dest) {
+                        await invoke('copy_file_or_dir', {
+                            sourcePath: source.path,
+                            destinationPath: dest
+                        });
+                        showSuccess(`Copied ${source.name}`);
+                        loadDirectory(targetDir);
+                    }
+                    return;
+                }
+            }
+        } catch (_) {}
+
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            let count = 0;
+            for (let i = 0; i < e.dataTransfer.files.length; i++) {
+                const f = e.dataTransfer.files[i];
+                if (f.path) {
+                    const dest = targetDir.endsWith(separator)
+                        ? `${targetDir}${f.name}`
+                        : `${targetDir}${separator}${f.name}`;
+                    try {
+                        await invoke('copy_file_or_dir', {
+                            sourcePath: f.path,
+                            destinationPath: dest
+                        });
+                        count++;
+                    } catch (err) {
+                        console.error('File copy failed:', err);
+                    }
+                }
+            }
+            if (count > 0) {
+                showSuccess(`Copied ${count} item(s)`);
+                loadDirectory(targetDir);
+            }
         }
     };
 
@@ -598,6 +660,8 @@ const FileList = ({
                 className={`file-list-container view-mode-${viewMode.toLowerCase()} scrollable-content`}
                 onClick={handleContainerClick}
                 onContextMenu={handleContextMenu}
+                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
+                onDrop={handleContainerDrop}
             >
                 {/* Details view header with sortable columns */}
                 {viewMode === 'details' && (

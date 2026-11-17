@@ -63,25 +63,29 @@ const PathBreadcrumb = ({ onCopyPath, isVisible = true, onSearch }) => {
                 }
             }
         }
-        // Handle Windows paths (C:\path\to\folder)
-        else if (currentPath.includes(':\\')) {
-            const parts = currentPath.split('\\');
+        // Handle Windows paths (e.g., C:\path\to\folder or C:/path/to/folder or C:)
+        else if (/^[a-zA-Z]:/.test(currentPath)) {
+            const normalized = currentPath.replace(/\//g, '\\');
+            const driveLetter = normalized.substring(0, 2); // e.g. "C:"
+            const rest = normalized.substring(2).replace(/^\\+/, '');
 
-            // Add the drive letter (e.g., C:)
+            // Add the drive letter
             segments.push({
-                name: parts[0],
-                path: parts[0] + '\\',
+                name: driveLetter,
+                path: driveLetter + '\\',
             });
 
-            // Add the rest of the path
-            for (let i = 1; i < parts.length; i++) {
-                if (!parts[i]) continue;
-
-                currentSegment += '\\' + parts[i];
-                segments.push({
-                    name: parts[i],
-                    path: parts[0] + currentSegment,
-                });
+            // Add each subsequent path part
+            if (rest) {
+                const parts = rest.split('\\').filter(Boolean);
+                let accum = driveLetter + '\\';
+                for (let i = 0; i < parts.length; i++) {
+                    accum += (i === 0 ? '' : '\\') + parts[i];
+                    segments.push({
+                        name: parts[i],
+                        path: accum,
+                    });
+                }
             }
         }
         // Handle Unix paths (/path/to/folder)
@@ -325,7 +329,7 @@ const PathBreadcrumb = ({ onCopyPath, isVisible = true, onSearch }) => {
                     <div className="breadcrumb-segments">
                         {pathSegments.map((segment, index) => (
                             <React.Fragment key={segment.path}>
-                                {index > 0 && <span className="segment-divider">/</span>}
+                                {index > 0 && <span className="segment-divider">›</span>}
                                 <button
                                     className={`segment-button ${index === pathSegments.length - 1 ? 'current' : ''}`}
                                     onClick={(e) => {

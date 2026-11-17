@@ -33,6 +33,7 @@ const FileItem = ({
     const { loadDirectory } = useFileSystem();
     const { currentPath } = useHistory();
     const { clipboard } = useContextMenu();
+    const [isDragOver, setIsDragOver] = useState(false);
 
     const isDirectory = item.isDirectory || 'sub_file_count' in item;
     const fileType = isDirectory ? 'Folder' : getFileType(item.name);
@@ -89,6 +90,59 @@ const FileItem = ({
         }
     };
 
+    const handleDragStart = (e) => {
+        e.dataTransfer.effectAllowed = 'copyMove';
+        e.dataTransfer.setData('application/json', JSON.stringify({
+            path: item.path,
+            name: item.name,
+            isDirectory
+        }));
+        e.dataTransfer.setData('text/plain', item.path);
+    };
+
+    const handleDragOver = (e) => {
+        if (isDirectory) {
+            e.preventDefault();
+            e.stopPropagation();
+            e.dataTransfer.dropEffect = 'copy';
+            setIsDragOver(true);
+        }
+    };
+
+    const handleDragLeave = (e) => {
+        if (isDirectory) {
+            setIsDragOver(false);
+        }
+    };
+
+    const handleDrop = async (e) => {
+        if (!isDirectory) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragOver(false);
+
+        try {
+            const raw = e.dataTransfer.getData('application/json');
+            if (raw) {
+                const source = JSON.parse(raw);
+                if (source && source.path && source.path !== item.path) {
+                    const separator = item.path.includes('/') ? '/' : '\\';
+                    const dest = item.path.endsWith(separator)
+                        ? `${item.path}${source.name}`
+                        : `${item.path}${separator}${source.name}`;
+                    await invoke('copy_file_or_dir', {
+                        sourcePath: source.path,
+                        destinationPath: dest
+                    });
+                    showSuccess(`Copied into ${item.name}`);
+                    if (currentPath) loadDirectory(currentPath);
+                }
+            }
+        } catch (err) {
+            console.error('Drop on folder failed:', err);
+        }
+    };
+
     /**
      * Handles click events on the file item
      * @param {React.MouseEvent} e - The click event
@@ -98,22 +152,22 @@ const FileItem = ({
     };
 
     /**
-     * Handles mouse down events to prevent text selection
+     * Handles mouse down events
      * @param {React.MouseEvent} e - The mouse down event
      */
-    const handleMouseDown = (e) => {
-        // Prevent text selection on mouse down
-        e.preventDefault();
+    const handleMouseDown = (_e) => {
+        // Allow drag and drop without blocking
     };
 
     /**
-     * Handles selectstart events to prevent text selection
+     * Handles selectstart events
      * @param {React.SyntheticEvent} e - The selectstart event
      */
     const handleSelectStart = (e) => {
-        // Prevent any text selection
-        e.preventDefault();
-        return false;
+        // Only prevent text selection if not dragging
+        if (!e.target.closest('.file-item')) {
+            e.preventDefault();
+        }
     };
 
     /**
@@ -144,7 +198,12 @@ const FileItem = ({
     return (
         <>
             <div
-                className={`file-item view-mode-${viewMode.toLowerCase()} ${isSelected ? 'selected' : ''} ${isFocused ? 'focused' : ''} ${isDirectory ? 'directory' : 'file'} ${isCut ? 'cut' : ''}`}
+                className={`file-item view-mode-${viewMode.toLowerCase()} ${isSelected ? 'selected' : ''} ${isFocused ? 'focused' : ''} ${isDirectory ? 'directory' : 'file'} ${isCut ? 'cut' : ''} ${isDragOver ? 'drag-over' : ''}`}
+                draggable
+                onDragStart={handleDragStart}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
                 onClick={handleClick}
                 onDoubleClick={handleDoubleClick}
                 onMouseDown={handleMouseDown}
