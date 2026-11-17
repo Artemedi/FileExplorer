@@ -10,10 +10,11 @@ mod state;
 
 use crate::commands::{
     command_exec_commands, file_system_operation_commands, hash_commands, meta_data_commands,
-    search_engine_commands, settings_commands, template_commands, volume_operations_commands, sftp_file_system_operation_commands, preview_commands, permission_commands, watcher_commands
+    search_engine_commands, settings_commands, template_commands, volume_operations_commands, sftp_file_system_operation_commands, preview_commands, permission_commands, watcher_commands,
+    system_integration_commands
 };
 use tauri::ipc::Invoke;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 fn all_commands() -> fn(Invoke) -> bool {
     tauri::generate_handler![
@@ -95,14 +96,65 @@ fn all_commands() -> fn(Invoke) -> bool {
         // Watcher commands
         watcher_commands::watch_directory,
         watcher_commands::unwatch_directory,
+
+        // System integration commands
+        system_integration_commands::get_initial_cli_path,
+        system_integration_commands::is_default_file_manager,
+        system_integration_commands::set_default_file_manager,
+        system_integration_commands::is_context_menu_enabled,
+        system_integration_commands::set_context_menu_enabled,
     ]
 }
 
 #[tokio::main]
 async fn main() {
+    // Parse startup CLI arguments (e.g. explr.exe "C:\Path")
+    let raw_args: Vec<String> = std::env::args().collect();
+    for arg in raw_args.iter().skip(1) {
+        if !arg.starts_with('-') {
+            let path = std::path::Path::new(arg);
+            if path.exists() {
+                let target = if path.is_file() {
+                    path.parent().map(|p| p.to_string_lossy().into_owned())
+                } else {
+                    Some(path.to_string_lossy().into_owned())
+                };
+                if let Some(t) = target {
+                    let _ = commands::system_integration_commands::INITIAL_CLI_PATH.set(t);
+                    break;
+                }
+            }
+        }
+    }
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // Focus the running window when a second instance is launched
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            // Check if second instance was called with a path to open
+            for arg in args.iter().skip(1) {
+                if !arg.starts_with('-') {
+                    let path = std::path::Path::new(arg);
+                    if path.exists() {
+                        let target = if path.is_file() {
+                            path.parent().map(|p| p.to_string_lossy().into_owned())
+                        } else {
+                            Some(path.to_string_lossy().into_owned())
+                        };
+                        if let Some(t) = target {
+                            let _ = app.emit("open-path-requested", t);
+                            break;
+                        }
+                    }
+                }
+            }
+        }))
         .invoke_handler(all_commands())
         .setup(|app| {
             // Safely show/focus the main window if it exists

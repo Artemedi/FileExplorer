@@ -190,6 +190,17 @@ export default function FileSystemProvider({ children }) {
         setIsLoading(true);
 
         try {
+            // 0. Check if a folder was passed via CLI argument (e.g. explr.exe "C:\Folder")
+            try {
+                const initialCliPath = await invoke('get_initial_cli_path');
+                if (initialCliPath) {
+                    console.log(`Using initial CLI path: ${initialCliPath}`);
+                    return initialCliPath;
+                }
+            } catch (cliErr) {
+                console.warn('Could not retrieve CLI path:', cliErr);
+            }
+
             // 1. Versuche zuerst, die Volumes zu laden
             console.log("Attempting to load volumes...");
             const volumesList = await loadVolumes();
@@ -558,6 +569,22 @@ export default function FileSystemProvider({ children }) {
     useEffect(() => {
         loadVolumes();
     }, [loadVolumes]);
+
+    // Listen for open-path requests from single-instance launches (e.g. user opens a folder from Windows)
+    useEffect(() => {
+        let unlisten = null;
+        listen('open-path-requested', (event) => {
+            if (event.payload) {
+                console.log('Received open-path-requested:', event.payload);
+                loadDirectory(event.payload);
+                window.dispatchEvent(new CustomEvent('force-explorer-view'));
+            }
+        }).then(fn => { unlisten = fn; });
+
+        return () => {
+            if (unlisten) unlisten();
+        };
+    }, [loadDirectory]);
 
     // Reload current directory when navigating back/forward
     useEffect(() => {

@@ -59,3 +59,12 @@ export interface SearchResult {
     path: string;
     score: number;
 }
+
+export interface SystemIntegrationCommands {
+    get_initial_cli_path: () => Promise<string | null>;
+    is_default_file_manager: () => Promise<boolean>;
+    set_default_file_manager: (args: { enable: boolean }) => Promise<void>;
+    is_context_menu_enabled: () => Promise<boolean>;
+    set_context_menu_enabled: (args: { enable: boolean }) => Promise<void>;
+}
+

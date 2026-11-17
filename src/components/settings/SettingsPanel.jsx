@@ -17,6 +17,48 @@ const SettingsPanel = ({ isOpen, onClose }) => {
     const [isResetting, setIsResetting] = useState(false);
     const [activeTab, setActiveTab] = useState('appearance');
     const [localError, setLocalError] = useState(null);
+    const [isDefaultFileManager, setIsDefaultFileManager] = useState(false);
+    const [isContextMenuEnabled, setIsContextMenuEnabled] = useState(false);
+    const [isIntegrationLoading, setIsIntegrationLoading] = useState(false);
+
+    useEffect(() => {
+        if (isOpen) {
+            invoke('is_default_file_manager')
+                .then(val => setIsDefaultFileManager(Boolean(val)))
+                .catch(() => {});
+            invoke('is_context_menu_enabled')
+                .then(val => setIsContextMenuEnabled(Boolean(val)))
+                .catch(() => {});
+        }
+    }, [isOpen]);
+
+    const handleToggleDefaultFileManager = async (e) => {
+        const nextState = e.target.checked;
+        setIsIntegrationLoading(true);
+        try {
+            await invoke('set_default_file_manager', { enable: nextState });
+            setIsDefaultFileManager(nextState);
+        } catch (err) {
+            console.error('Failed to update default file manager setting:', err);
+            setLocalError(`System integration error: ${err}`);
+        } finally {
+            setIsIntegrationLoading(false);
+        }
+    };
+
+    const handleToggleContextMenu = async (e) => {
+        const nextState = e.target.checked;
+        setIsIntegrationLoading(true);
+        try {
+            await invoke('set_context_menu_enabled', { enable: nextState });
+            setIsContextMenuEnabled(nextState);
+        } catch (err) {
+            console.error('Failed to update context menu setting:', err);
+            setLocalError(`System integration error: ${err}`);
+        } finally {
+            setIsIntegrationLoading(false);
+        }
+    };
 
     /**
      * Available tabs configuration
@@ -320,6 +362,35 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                             <span>{option.label}</span>
                         </label>
                     ))}
+                </div>
+            </div>
+
+            <div className="settings-section">
+                <h3>System Integration (Windows)</h3>
+                <label className="checkbox-option">
+                    <input
+                        type="checkbox"
+                        checked={isDefaultFileManager}
+                        onChange={handleToggleDefaultFileManager}
+                        disabled={isIntegrationLoading}
+                    />
+                    <span>Set as default file manager for folders</span>
+                </label>
+                <div className="input-hint">
+                    Opens Explr automatically when opening folders from Desktop or other applications.
+                </div>
+
+                <label className="checkbox-option" style={{ marginTop: '12px' }}>
+                    <input
+                        type="checkbox"
+                        checked={isContextMenuEnabled}
+                        onChange={handleToggleContextMenu}
+                        disabled={isIntegrationLoading}
+                    />
+                    <span>Add &quot;Open in Explr&quot; to Windows context menu</span>
+                </label>
+                <div className="input-hint">
+                    Adds an &quot;Open in Explr&quot; option when right-clicking folders and directory backgrounds.
                 </div>
             </div>
         </div>
