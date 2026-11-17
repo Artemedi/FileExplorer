@@ -1,7 +1,7 @@
 use crate::error_handling::{Error, ErrorCode};
 use crate::log_info;
 use serde::{Deserialize, Serialize};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::env;
 use std::path::Path;
 use std::time::Duration;
@@ -80,7 +80,7 @@ pub async fn execute_command(command: String, working_directory: Option<String>)
         "-c"
     };
 
-    let mut cmd = Command::new(&shell_path);
+    let mut cmd = TokioCommand::new(&shell_path);
     cmd.arg(shell_arg).arg(&command);
     
     // Set working directory if provided, with validation
@@ -113,6 +113,7 @@ pub async fn execute_command(command: String, working_directory: Option<String>)
 
     let output = cmd
         .output()
+        .await
         .map_err(|e| {
             let error_msg = match e.kind() {
                 std::io::ErrorKind::NotFound => format!("Command '{}' not found. Make sure it's installed and in your PATH.", program.unwrap_or("unknown")),
@@ -210,7 +211,7 @@ pub async fn execute_command_improved(
         "-c"
     };
 
-    let mut cmd = Command::new(&shell_path);
+    let mut cmd = TokioCommand::new(&shell_path);
     cmd.arg(shell_arg).arg(&command);
     
     // Set working directory with validation
@@ -248,6 +249,7 @@ pub async fn execute_command_improved(
 
     let output = cmd
         .output()
+        .await
         .map_err(|e| {
             let error_msg = match e.kind() {
                 std::io::ErrorKind::NotFound => {

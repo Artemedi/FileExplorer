@@ -54,13 +54,12 @@ use crate::error_handling::{Error, ErrorCode};
 use crate::models::LoggingLevel;
 use crate::state::SettingsState;
 use chrono::Local;
-use once_cell::sync::{Lazy, OnceCell};
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use serde_json::json;
 
 #[macro_export]
@@ -151,7 +150,7 @@ macro_rules! log_critical {
     };
 }
 
-static WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LogLevel {
@@ -178,8 +177,8 @@ pub struct Logger {
     state: Arc<Mutex<SettingsState>>,
 }
 
-// Replace Lazy with OnceCell for more flexible initialization
-static LOGGER: OnceCell<Logger> = OnceCell::new();
+// Global logger instance using std::sync::OnceLock
+static LOGGER: OnceLock<Logger> = OnceLock::new();
 
 impl Logger {
     pub fn new(state: Arc<Mutex<SettingsState>>) -> Self {

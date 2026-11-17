@@ -52,12 +52,19 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{smallvec, SmallVec};
-use std::sync::Once;
 
 type TrigramMap = FxHashMap<u32, SmallVec<[u32; 4]>>;
 
-static CHAR_MAPPING_INIT: Once = Once::new();
-static mut CHAR_MAPPING: [u8; 256] = [0; 256];
+/// Compile-time lookup table for fast ASCII lowercase conversion without unsafe or runtime init.
+const CHAR_MAPPING: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = (i as u8).to_ascii_lowercase();
+        i += 1;
+    }
+    table
+};
 
 /// A fast fuzzy path matching engine that uses trigram indexing for efficient searches.
 /// The PathMatcher enables rapid searching through large collections of file paths
@@ -90,8 +97,6 @@ impl PathMatcher {
     /// # Time Complexity
     /// * O(1) - Constant time initialization
     pub fn new() -> Self {
-        Self::init_char_mapping();
-
         PathMatcher {
             paths: Vec::new(),
             // Better capacity estimation: ~20 trigrams per path on average
@@ -100,22 +105,7 @@ impl PathMatcher {
         }
     }
 
-    /// Initializes the static character mapping table for fast case-insensitive comparisons.
-    /// This is called once during the first instantiation of a PathMatcher.
-    ///
-    /// The mapping table is used for efficient lowercase conversion without
-    /// having to use the more expensive Unicode-aware to_lowercase() function.
-    fn init_char_mapping() {
-        CHAR_MAPPING_INIT.call_once(|| unsafe {
-            for i in 0..256 {
-                let c = i as u8 as char;
-                let lower = c.to_lowercase().next().unwrap_or(c) as u8;
-                CHAR_MAPPING[i] = lower;
-            }
-        });
-    }
-
-    /// Converts a single byte character to lowercase using the pre-computed mapping table.
+    /// Converts a single byte character to lowercase using the pre-computed compile-time mapping table.
     /// This is much faster than using the standard to_lowercase() function for ASCII characters.
     ///
     /// # Arguments
@@ -131,8 +121,7 @@ impl PathMatcher {
     /// ```
     #[inline(always)]
     fn fast_lowercase(c: u8) -> u8 {
-        Self::init_char_mapping();
-        unsafe { CHAR_MAPPING[c as usize] }
+        CHAR_MAPPING[c as usize]
     }
 
     /// Adds a path to the matcher, indexing it for fast retrieval during searches.
