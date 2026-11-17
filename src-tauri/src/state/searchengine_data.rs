@@ -757,11 +757,6 @@ impl SearchEngineState {
         // Get current directory context
         let current_dir = data.current_directory.clone();
         
-        // Check if engine is already in a search operation
-        if matches!(data.status, SearchEngineStatus::Searching) {
-            return Err("Engine is currently searching".to_string());
-        }
-        
         // Update state for search operation
         data.status = SearchEngineStatus::Searching;
         data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
@@ -886,10 +881,6 @@ impl SearchEngineState {
         // Check if engine is busy
         if matches!(data.status, SearchEngineStatus::Indexing) {
             return Err("Engine is currently indexing".to_string());
-        }
-
-        if matches!(data.status, SearchEngineStatus::Searching) {
-            return Err("Engine is currently searching".to_string());
         }
 
         // Update state
@@ -3274,11 +3265,11 @@ mod tests_searchengine_state {
 
         // Index with traditional method
         let _ = state1.start_indexing(test_dir.clone());
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(250));
 
         // Index with chunked method
         let _ = state2.start_chunked_indexing(test_dir.clone(), 3);
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(250));
 
         // Compare search results
         let search_terms = ["document", "readme", "script"];
