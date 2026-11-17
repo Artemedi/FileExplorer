@@ -19,8 +19,30 @@ import './fileList.css';
  * @param {Function} [props.onColumnsChange] - Callback when columns per row changes
  * @returns {React.ReactElement} File list component
  */
-const FileList = ({ data, isLoading, viewMode = 'grid', isSearching = false, searchTerm = '', disableArrowKeys = false, onColumnsChange }) => {
-    const { selectedItems, selectItem, loadDirectory, clearSelection, focusedItem, setFocusedItem, openFile } = useFileSystem();
+const FileList = ({ 
+    data, 
+    isLoading, 
+    viewMode = 'grid', 
+    isSearching = false, 
+    searchTerm = '', 
+    disableArrowKeys = false, 
+    onColumnsChange,
+    selectedItems: customSelectedItems,
+    onSelectItem: customSelectItem,
+    onClearSelection: customClearSelection,
+    onLoadDirectory: customLoadDirectory,
+    onOpenFile: customOpenFile,
+    focusedItem: customFocusedItem,
+    onSetFocusedItem: customSetFocusedItem,
+}) => {
+    const fs = useFileSystem();
+    const selectedItems = customSelectedItems !== undefined ? customSelectedItems : fs.selectedItems;
+    const selectItem = customSelectItem || fs.selectItem;
+    const loadDirectory = customLoadDirectory || fs.loadDirectory;
+    const clearSelection = customClearSelection || fs.clearSelection;
+    const focusedItem = customFocusedItem !== undefined ? customFocusedItem : fs.focusedItem;
+    const setFocusedItem = customSetFocusedItem || fs.setFocusedItem;
+    const openFile = customOpenFile || fs.openFile;
     const { openContextMenu } = useContextMenu();
     const [sortConfig, setSortConfig] = useState({ key: 'name', direction: 'asc' });
     const [isShiftKeyPressed, setIsShiftKeyPressed] = useState(false);

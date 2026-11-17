@@ -13,6 +13,7 @@ import PermissionHelper from '../common/PermissionHelper';
 import {open} from '@tauri-apps/plugin-dialog';
 import './sidebar.css';
 import {showConfirm, showError, showSuccess} from "../../utils/NotificationSystem.js";
+import {useTranslation} from '../../i18n';
 
 /**
  * Sidebar component - Provides navigation, favorites, and quick access
@@ -28,6 +29,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
     const { currentPath, navigateTo } = useHistory();
     const { removeFromFavorites } = useContextMenu();
     const { navigateToSftpConnection, createSftpUrl, isSftpPath, parseSftpPath, createSftpPath } = useSftp();
+    const { t } = useTranslation();
 
     const [systemInfo, setSystemInfo] = useState(null);
     const [isAddSourceModalOpen, setIsAddSourceModalOpen] = useState(false);
@@ -407,7 +409,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                     {/* This PC section */}
                     <section className="sidebar-section">
                         <div className="sidebar-section-header">
-                            <h3 className="sidebar-section-title">This PC</h3>
+                            <h3 className="sidebar-section-title">{t('nav.thisPc')}</h3>
                             <button
                                 className="section-collapse-button"
                                 onClick={() => toggleSectionCollapse('thisPC')}
@@ -420,7 +422,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                             <ul className="sidebar-list">
                                 <SidebarItem
                                     icon="computer"
-                                    name="This PC"
+                                    name={t('nav.thisPc')}
                                     path="this-pc"
                                     isActive={currentView === 'this-pc'}
                                     onClick={() => {
@@ -467,7 +469,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                     {/* Favorites section */}
                     <section className="sidebar-section">
                         <div className="sidebar-section-header">
-                            <h3 className="sidebar-section-title">Favorites</h3>
+                            <h3 className="sidebar-section-title">{t('nav.quickAccess')}</h3>
                             <div className="sidebar-section-actions">
                                 <button
                                     className="section-add-button"
@@ -499,7 +501,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                     {/* Drives/Volumes section */}
                     <section className="sidebar-section">
                         <div className="sidebar-section-header">
-                            <h3 className="sidebar-section-title">Drives</h3>
+                            <h3 className="sidebar-section-title">{t('nav.drives')}</h3>
                             <button
                                 className="section-collapse-button"
                                 onClick={() => toggleSectionCollapse('drives')}
@@ -581,7 +583,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                     {/* Network section */}
                     <section>
                         <div className="sidebar-section-header">
-                            <h3 className="sidebar-section-title">Network</h3>
+                            <h3 className="sidebar-section-title">{t('nav.network')}</h3>
                             <div className="sidebar-section-actions">
                                 <button
                                     className="section-add-button"
@@ -675,7 +677,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                         title="Toggle Terminal (Ctrl+`)"
                     >
                         <span className="icon icon-terminal"></span>
-                        <span>Terminal</span>
+                        <span>{t('nav.terminal')}</span>
                     </button>
 
                     <button
@@ -685,10 +687,10 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                             document.dispatchEvent(new CustomEvent('open-settings'));
                         }}
                         aria-label="Settings"
-                        title="Settings"
+                        title={t('nav.settings')}
                     >
                         <span className="icon icon-settings"></span>
-                        <span>Settings</span>
+                        <span>{t('nav.settings')}</span>
                     </button>
 
                     <button
@@ -698,10 +700,10 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                             document.dispatchEvent(new CustomEvent('open-templates'));
                         }}
                         aria-label="Templates"
-                        title="Templates"
+                        title={t('nav.templates')}
                     >
                         <span className="icon icon-template"></span>
-                        <span>Templates</span>
+                        <span>{t('nav.templates')}</span>
                     </button>
 
                     <button

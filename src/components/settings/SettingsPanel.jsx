@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useSettings } from '../../providers/SettingsProvider';
+import { useTranslation } from '../../i18n';
 import Modal from '../common/Modal';
 import Button from '../common/Button';
 import './settings.css';
@@ -14,6 +15,7 @@ import './settings.css';
  */
 const SettingsPanel = ({ isOpen, onClose }) => {
     const { settings, error, updateSetting, resetSettings, reloadSettings } = useSettings();
+    const { t, language, setLanguage } = useTranslation();
     const [isResetting, setIsResetting] = useState(false);
     const [activeTab, setActiveTab] = useState('appearance');
     const [localError, setLocalError] = useState(null);
@@ -65,10 +67,10 @@ const SettingsPanel = ({ isOpen, onClose }) => {
      * @type {Array<{id: string, label: string, icon: string}>}
      */
     const tabs = [
-        { id: 'appearance', label: 'Appearance', icon: 'palette' },
-        { id: 'behavior', label: 'Behavior', icon: 'settings' },
-        { id: 'search', label: 'Search', icon: 'search' },
-        { id: 'advanced', label: 'Advanced', icon: 'cog' }
+        { id: 'appearance', label: t('settings.appearance'), icon: 'palette' },
+        { id: 'behavior', label: t('settings.behavior'), icon: 'settings' },
+        { id: 'search', label: t('settings.search'), icon: 'search' },
+        { id: 'advanced', label: t('settings.advanced'), icon: 'cog' }
     ];
 
     /**
@@ -76,8 +78,8 @@ const SettingsPanel = ({ isOpen, onClose }) => {
      * @type {Array<{id: boolean, label: string}>}
      */
     const themes = [
-        { id: false, label: 'Light' },
-        { id: true, label: 'Dark' }
+        { id: false, label: t('settings.light') },
+        { id: true, label: t('settings.dark') }
     ];
 
     /**
@@ -85,9 +87,9 @@ const SettingsPanel = ({ isOpen, onClose }) => {
      * @type {Array<{id: string, label: string}>}
      */
     const viewModes = [
-        { id: 'grid', label: 'Grid View' },
-        { id: 'list', label: 'List View' },
-        { id: 'details', label: 'Details View' }
+        { id: 'grid', label: t('settings.grid') },
+        { id: 'list', label: t('settings.list') },
+        { id: 'details', label: t('settings.details') }
     ];
 
     /**
@@ -195,7 +197,33 @@ const SettingsPanel = ({ isOpen, onClose }) => {
     const renderAppearanceTab = () => (
         <div className="settings-tab-content">
             <div className="settings-section">
-                <h3>Theme</h3>
+                <h3>{t('settings.language')}</h3>
+                <div className="radio-group">
+                    <label className="radio-option">
+                        <input
+                            type="radio"
+                            name="language"
+                            value="en"
+                            checked={language === 'en'}
+                            onChange={() => setLanguage('en')}
+                        />
+                        <span>English</span>
+                    </label>
+                    <label className="radio-option">
+                        <input
+                            type="radio"
+                            name="language"
+                            value="ru"
+                            checked={language === 'ru'}
+                            onChange={() => setLanguage('ru')}
+                        />
+                        <span>Русский</span>
+                    </label>
+                </div>
+            </div>
+
+            <div className="settings-section">
+                <h3>{t('settings.theme')}</h3>
                 <div className="radio-group">
                     {themes.map(theme => (
                         <label key={theme.id.toString()} className="radio-option">
@@ -366,7 +394,7 @@ const SettingsPanel = ({ isOpen, onClose }) => {
             </div>
 
             <div className="settings-section">
-                <h3>System Integration (Windows)</h3>
+                <h3>{t('settings.windowsIntegration')}</h3>
                 <label className="checkbox-option">
                     <input
                         type="checkbox"
@@ -374,10 +402,10 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                         onChange={handleToggleDefaultFileManager}
                         disabled={isIntegrationLoading}
                     />
-                    <span>Set as default file manager for folders</span>
+                    <span>{t('settings.defaultFileManager')}</span>
                 </label>
                 <div className="input-hint">
-                    Opens Explr automatically when opening folders from Desktop or other applications.
+                    {t('settings.defaultFileManagerDesc')}
                 </div>
 
                 <label className="checkbox-option" style={{ marginTop: '12px' }}>
@@ -387,10 +415,10 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                         onChange={handleToggleContextMenu}
                         disabled={isIntegrationLoading}
                     />
-                    <span>Add &quot;Open in Explr&quot; to Windows context menu</span>
+                    <span>{t('settings.contextMenu')}</span>
                 </label>
                 <div className="input-hint">
-                    Adds an &quot;Open in Explr&quot; option when right-clicking folders and directory backgrounds.
+                    {t('settings.contextMenuDesc')}
                 </div>
             </div>
         </div>
@@ -580,7 +608,7 @@ const SettingsPanel = ({ isOpen, onClose }) => {
         <Modal
             isOpen={isOpen}
             onClose={onClose}
-            title="Settings"
+            title={t('settings.title')}
             size="lg"
             footer={
                 <div className="settings-footer">
@@ -592,10 +620,10 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                     )}
                     <div className="settings-footer-buttons">
                         <Button variant="primary" onClick={reloadSettings}>
-                            Save & Apply
+                            {t('common.save')}
                         </Button>
                         <Button variant="ghost" onClick={onClose}>
-                            Close
+                            {t('common.close')}
                         </Button>
                     </div>
                 </div>

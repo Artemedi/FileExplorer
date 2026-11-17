@@ -1,4 +1,5 @@
 import React from 'react';
+import I18nProvider from './i18n';
 import SettingsProvider from './providers/SettingsProvider';
 import ThemeProvider from './providers/ThemeProvider';
 import AppStateProvider from './providers/AppStateProvider';
@@ -76,21 +77,23 @@ class App extends React.Component {
         // 7. ContextMenuProvider should come after FileSystemProvider to access selected items
         return (
             <div className="app-container">
-                <SettingsProvider>
-                    <ThemeProvider>
-                        <AppStateProvider>
-                            <HistoryProvider>
-                                <SftpProvider>
-                                    <FileSystemProvider>
-                                        <ContextMenuProvider>
-                                            <MainLayout />
-                                        </ContextMenuProvider>
-                                    </FileSystemProvider>
-                                </SftpProvider>
-                            </HistoryProvider>
-                        </AppStateProvider>
-                    </ThemeProvider>
-                </SettingsProvider>
+                <I18nProvider>
+                    <SettingsProvider>
+                        <ThemeProvider>
+                            <AppStateProvider>
+                                <HistoryProvider>
+                                    <SftpProvider>
+                                        <FileSystemProvider>
+                                            <ContextMenuProvider>
+                                                <MainLayout />
+                                            </ContextMenuProvider>
+                                        </FileSystemProvider>
+                                    </SftpProvider>
+                                </HistoryProvider>
+                            </AppStateProvider>
+                        </ThemeProvider>
+                    </SettingsProvider>
+                </I18nProvider>
             </div>
         );
     }

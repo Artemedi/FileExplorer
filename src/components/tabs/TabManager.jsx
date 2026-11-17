@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useSftp } from '../../providers/SftpProvider';
+import { useTranslation } from '../../i18n';
 import IconButton from '../common/IconButton';
 import './tabs.css';
 
@@ -13,11 +14,82 @@ import './tabs.css';
  * @returns {React.ReactElement} TabManager component
  */
 const TabManager = ({ children }) => {
-    const [tabs, setTabs] = useState([]);
-    const [activeTabId, setActiveTabId] = useState(null);
+    const [tabs, setTabs] = useState(() => {
+        try {
+            const saved = localStorage.getItem('explr_saved_tabs');
+            if (saved) {
+                const parsed = JSON.parse(saved);
+                if (Array.isArray(parsed) && parsed.length > 0) {
+                    return parsed;
+                }
+            }
+        } catch (e) {
+            console.error('Failed to parse saved tabs:', e);
+        }
+        return [];
+    });
+    const [activeTabId, setActiveTabId] = useState(() => {
+        try {
+            const savedId = localStorage.getItem('explr_active_tab_id');
+            if (savedId) return savedId;
+        } catch (_) {}
+        return null;
+    });
     const { currentPath } = useHistory();
     const { loadDirectory } = useFileSystem();
     const { isSftpPath, parseSftpPath } = useSftp();
+    const { t } = useTranslation();
+    const [contextMenu, setContextMenu] = useState(null);
+
+    useEffect(() => {
+        const hideMenu = () => setContextMenu(null);
+        window.addEventListener('click', hideMenu);
+        return () => window.removeEventListener('click', hideMenu);
+    }, []);
+
+    const closeOtherTabs = (tabId) => {
+        setTabs(prev => prev.filter(t => t.id === tabId));
+        switchToTab(tabId);
+        setContextMenu(null);
+    };
+
+    const handleCopyPath = (path) => {
+        if (path) {
+            navigator.clipboard.writeText(path).catch(() => {});
+        }
+        setContextMenu(null);
+    };
+
+    // Persist tabs to localStorage
+    useEffect(() => {
+        if (tabs.length > 0) {
+            try {
+                localStorage.setItem('explr_saved_tabs', JSON.stringify(tabs));
+            } catch (e) {
+                console.error('Failed to save tabs:', e);
+            }
+        }
+    }, [tabs]);
+
+    // Persist active tab ID
+    useEffect(() => {
+        if (activeTabId) {
+            try {
+                localStorage.setItem('explr_active_tab_id', activeTabId);
+            } catch (_) {}
+        }
+    }, [activeTabId]);
+
+    // Restore active tab on mount
+    useEffect(() => {
+        if (tabs.length > 0) {
+            const active = tabs.find(t => t.id === activeTabId) || tabs[0];
+            setActiveTabId(active.id);
+            if (active.path && active.path !== currentPath) {
+                loadDirectory(active.path).catch(() => {});
+            }
+        }
+    }, []);
 
     /**
      * Initialize with current path
@@ -278,7 +350,13 @@ const TabManager = ({ children }) => {
                             onSelectStart={handleSelectStart}
                             onContextMenu={(e) => {
                                 e.preventDefault();
-                                // Show context menu with options: duplicate, close, close others, etc.
+                                e.stopPropagation();
+                                setContextMenu({
+                                    x: e.clientX,
+                                    y: e.clientY,
+                                    tabId: tab.id,
+                                    path: tab.path
+                                });
                             }}
                             draggable
                             onDragStart={(e) => {
@@ -332,6 +410,32 @@ const TabManager = ({ children }) => {
             <div className="tab-content-area">
                 {children}
             </div>
+
+            {contextMenu && (
+                <div
+                    className="tab-context-menu"
+                    style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
+                    onClick={(e) => e.stopPropagation()}
+                >
+                    <div className="tab-context-menu-item" onClick={() => { duplicateTab(contextMenu.tabId); setContextMenu(null); }}>
+                        {t('tabs.duplicateTab')}
+                    </div>
+                    <div className="tab-context-menu-item" onClick={() => handleCopyPath(contextMenu.path)}>
+                        {t('tabs.copyPath')}
+                    </div>
+                    <div className="tab-context-menu-divider" />
+                    {tabs.length > 1 && (
+                        <>
+                            <div className="tab-context-menu-item" onClick={() => { closeTab(contextMenu.tabId); setContextMenu(null); }}>
+                                {t('tabs.closeTab')}
+                            </div>
+                            <div className="tab-context-menu-item" onClick={() => closeOtherTabs(contextMenu.tabId)}>
+                                {t('tabs.closeOtherTabs')}
+                            </div>
+                        </>
+                    )}
+                </div>
+            )}
         </div>
     );
 };

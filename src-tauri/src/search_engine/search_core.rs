@@ -450,11 +450,25 @@ impl SearchCore {
         let collected_paths_clone = Arc::clone(&collected_paths);
 
         let result = task::spawn_blocking(move || {
+            let patterns_ref = excluded.clone().unwrap_or_default();
             let mut file_count = 0;
             for entry in WalkDir::new(&root_path)
                 .follow_links(false)
-                .max_depth(20) // Reasonable depth limit
+                .max_depth(15)
                 .into_iter()
+                .filter_entry(|e| {
+                    if let Some(name) = e.file_name().to_str() {
+                        if name == "AppData" || name == "node_modules" || name == ".git" || name == "target" || name == ".cache" || name == "$Recycle.Bin" || name == "System Volume Information" {
+                            return false;
+                        }
+                    }
+                    if let Some(path_str) = e.path().to_str() {
+                        if patterns_ref.iter().any(|p| path_str.contains(p.as_str())) {
+                            return false;
+                        }
+                    }
+                    true
+                })
                 .filter_map(Result::ok)
             {
                 // More conservative file limit to prevent memory issues

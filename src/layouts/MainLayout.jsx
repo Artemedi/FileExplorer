@@ -16,6 +16,8 @@ import FileList from '../components/explorer/FileList';
 import DetailsPanel from '../components/explorer/DetailsPanel';
 import ContextMenu from '../components/contextMenu/ContextMenu';
 import ViewModes from '../components/explorer/ViewModes';
+import DualPane from '../components/explorer/DualPane';
+import { useTranslation } from '../i18n';
 
 // Additional Components
 import CreateFileButton from '../components/explorer/CreateFileButton';
@@ -68,9 +70,13 @@ const MainLayout = () => {
     } = useContextMenu();
     const { currentPath, navigateTo } = useHistory();
     const { settings, updateSetting } = useSettings();
+    const { t } = useTranslation();
 
     // UI State - Initialize from settings
     const [isDetailsPanelOpen, setIsDetailsPanelOpen] = useState(settings.show_details_panel || false);
+    const [isDualPane, setIsDualPane] = useState(() => {
+        return localStorage.getItem('explr_dual_pane') === 'true';
+    });
     const [isTerminalOpen, setIsTerminalOpen] = useState(false);
     const [viewMode, setViewMode] = useState(settings.default_view || 'grid');
     const [searchValue, setSearchValue] = useState('');
@@ -777,7 +783,7 @@ const MainLayout = () => {
                                     className="icon-button"
                                     onClick={handleCut}
                                     disabled={selectedItems.length === 0}
-                                    title="Cut (Ctrl+X)"
+                                    title={t('toolbar.cut')}
                                     aria-label="Cut selected items"
                                 >
                                     <span className="icon icon-cut"></span>
@@ -787,7 +793,7 @@ const MainLayout = () => {
                                     className="icon-button"
                                     onClick={handleCopy}
                                     disabled={selectedItems.length === 0}
-                                    title="Copy (Ctrl+C)"
+                                    title={t('toolbar.copy')}
                                     aria-label="Copy selected items"
                                 >
                                     <span className="icon icon-copy"></span>
@@ -797,7 +803,7 @@ const MainLayout = () => {
                                     className="icon-button"
                                     onClick={handlePaste}
                                     disabled={!clipboard.items || clipboard.items.length === 0}
-                                    title="Paste (Ctrl+V)"
+                                    title={t('toolbar.paste')}
                                     aria-label="Paste items"
                                 >
                                     <span className="icon icon-paste"></span>
@@ -807,7 +813,7 @@ const MainLayout = () => {
                                     className="icon-button"
                                     onClick={handleRenameToolbar}
                                     disabled={selectedItems.length !== 1}
-                                    title="Rename (F2)"
+                                    title={t('toolbar.rename')}
                                     aria-label="Rename selected item"
                                 >
                                     <span className="icon icon-rename"></span>
@@ -817,7 +823,7 @@ const MainLayout = () => {
                                     className="icon-button"
                                     onClick={handleDelete}
                                     disabled={selectedItems.length === 0}
-                                    title="Delete (Del)"
+                                    title={t('toolbar.delete')}
                                     aria-label="Delete selected items"
                                 >
                                     <span className="icon icon-trash"></span>
@@ -827,7 +833,7 @@ const MainLayout = () => {
                                     className="icon-button"
                                     onClick={handleProperties}
                                     disabled={selectedItems.length === 0}
-                                    title="Properties (Alt+Enter)"
+                                    title={t('toolbar.properties')}
                                     aria-label="Show properties"
                                 >
                                     <span className="icon icon-properties"></span>
@@ -841,11 +847,26 @@ const MainLayout = () => {
                                         onChange={handleViewModeChange}
                                     />
                                 )}
+
+                                <button
+                                    className={`icon-button ${isDualPane ? 'active' : ''}`}
+                                    onClick={() => {
+                                        setIsDualPane(prev => {
+                                            const next = !prev;
+                                            localStorage.setItem('explr_dual_pane', next.toString());
+                                            return next;
+                                        });
+                                    }}
+                                    title={t('dualPane.toggleDualPane')}
+                                    aria-label="Toggle dual pane view"
+                                >
+                                    <span className="icon icon-split-view"></span>
+                                </button>
                                 
                                 <button
                                     className="icon-button"
                                     onClick={toggleTheme}
-                                    title={theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme'}
+                                    title={t('toolbar.switchTheme')}
                                     aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} theme`}
                                 >
                                     <span className={`icon ${theme === 'light' ? 'icon-moon' : 'icon-sun'}`}></span>
@@ -854,7 +875,7 @@ const MainLayout = () => {
                                 <button
                                     className="icon-button toggle-hidden-files"
                                     onClick={handleHiddenFilesToggle}
-                                    title={`${settings.show_hidden_files_and_folders ? 'Hide' : 'Show'} hidden files and folders`}
+                                    title={t('toolbar.toggleHidden')}
                                     aria-label="Toggle hidden files visibility"
                                 >
                                     <span className={`icon ${settings.show_hidden_files_and_folders ? 'icon-eye' : 'icon-eye-off'}`}></span>
@@ -863,7 +884,7 @@ const MainLayout = () => {
                                 <button
                                     className={`icon-button ${isDetailsPanelOpen ? 'active' : ''}`}
                                     onClick={handleDetailsPanelToggle}
-                                    title="Details Panel"
+                                    title={t('toolbar.detailsPanel')}
                                     aria-label="Toggle details panel"
                                 >
                                     <span className="icon icon-panel-right"></span>
@@ -871,15 +892,27 @@ const MainLayout = () => {
                             </div>
                         </div>
 
-                        <FileList
-                            data={displayData}
-                            isLoading={isLoading}
-                            viewMode={viewMode}
-                            isSearching={!!searchValue}
-                            searchTerm={searchValue}
-                            disableArrowKeys={isPreviewOpen}
-                            onColumnsChange={setColumnsPerRow}
-                        />
+                        {isDualPane ? (
+                            <DualPane
+                                viewMode={viewMode}
+                                isPreviewOpen={isPreviewOpen}
+                                onColumnsChange={setColumnsPerRow}
+                                onClose={() => {
+                                    setIsDualPane(false);
+                                    localStorage.setItem('explr_dual_pane', 'false');
+                                }}
+                            />
+                        ) : (
+                            <FileList
+                                data={displayData}
+                                isLoading={isLoading}
+                                viewMode={viewMode}
+                                isSearching={!!searchValue}
+                                searchTerm={searchValue}
+                                disableArrowKeys={isPreviewOpen}
+                                onColumnsChange={setColumnsPerRow}
+                            />
+                        )}
                     </div>
                 );
         }
@@ -912,7 +945,7 @@ const MainLayout = () => {
                             <button
                                 className="icon-button"
                                 onClick={() => setIsGlobalSearchOpen(true)}
-                                title="Global Search (Ctrl+Shift+F)"
+                                title={t('toolbar.globalSearch')}
                                 aria-label="Global Search"
                             >
                                 <span className="icon icon-search-global"></span>
