@@ -30,7 +30,7 @@ use sysinfo::Disks;
 #[tauri::command]
 pub fn get_system_volumes_information_as_json() -> String {
     let volume_information_vec = get_system_volumes_information();
-    serde_json::to_string(&volume_information_vec).unwrap()
+    serde_json::to_string(&volume_information_vec).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Gets information about all system volumes/disks.

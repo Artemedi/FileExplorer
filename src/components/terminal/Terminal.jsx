@@ -1,7 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useHistory } from '../../providers/HistoryProvider';
-import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useSettings } from '../../providers/SettingsProvider';
 import Icon from '../common/Icon';
 import './terminal.css';
@@ -29,7 +28,6 @@ const Terminal = ({ isOpen, onToggle }) => {
     const inputRef = useRef(null);
     const terminalRef = useRef(null);
     const { currentPath, navigateTo } = useHistory();
-    const { setCurrentPath } = useFileSystem();
     const { settings } = useSettings();
 
     /**

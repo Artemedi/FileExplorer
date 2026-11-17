@@ -98,6 +98,48 @@ fn calculate_crc32(data: &[u8]) -> String {
     format!("{:08x}", checksum)
 }
 
+async fn calculate_file_hash(method: ChecksumMethod, path: &Path) -> Result<String, HashError> {
+    if !path.exists() || path.is_dir() {
+        return Err(HashError::FileOperationError);
+    }
+    let mut file = File::open(path)
+        .await
+        .map_err(|_| HashError::FileOperationError)?;
+
+    let mut md5_hasher = (method == ChecksumMethod::MD5).then(Md5Hasher::new);
+    let mut sha256_hasher = (method == ChecksumMethod::SHA256).then(Sha256::new);
+    let mut sha384_hasher = (method == ChecksumMethod::SHA384).then(Sha384::new);
+    let mut sha512_hasher = (method == ChecksumMethod::SHA512).then(Sha512::new);
+    let mut crc32_hasher = (method == ChecksumMethod::CRC32).then(Hasher::new);
+
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buffer)
+            .await
+            .map_err(|_| HashError::FileOperationError)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buffer[..n];
+        if let Some(h) = &mut md5_hasher { h.update(chunk); }
+        if let Some(h) = &mut sha256_hasher { h.update(chunk); }
+        if let Some(h) = &mut sha384_hasher { h.update(chunk); }
+        if let Some(h) = &mut sha512_hasher { h.update(chunk); }
+        if let Some(h) = &mut crc32_hasher { h.update(chunk); }
+    }
+
+    let result = match method {
+        ChecksumMethod::MD5 => hex::encode(md5_hasher.unwrap().finalize()),
+        ChecksumMethod::SHA256 => format!("{:x}", sha256_hasher.unwrap().finalize()),
+        ChecksumMethod::SHA384 => format!("{:x}", sha384_hasher.unwrap().finalize()),
+        ChecksumMethod::SHA512 => format!("{:x}", sha512_hasher.unwrap().finalize()),
+        ChecksumMethod::CRC32 => format!("{:08x}", crc32_hasher.unwrap().finalize()),
+    };
+    Ok(result)
+}
+
+#[allow(dead_code)]
 async fn calculate_hash(method: ChecksumMethod, data: &[u8]) -> Result<String, HashError> {
     let result = match method {
         ChecksumMethod::MD5 => calculate_md5(data),
@@ -109,8 +151,9 @@ async fn calculate_hash(method: ChecksumMethod, data: &[u8]) -> Result<String, H
     Ok(result)
 }
 
+#[allow(dead_code)]
 async fn read_file(path: &Path) -> Result<Vec<u8>, HashError> {
-    if !path.exists() && path.is_dir() {
+    if !path.exists() || path.is_dir() {
         return Err(HashError::FileOperationError);
     }
     let mut file = File::open(path)
@@ -157,14 +200,9 @@ pub async fn gen_hash_and_return_string_impl(
     let checksum_method = get_checksum_method(state)
         .await
         .map_err(|e| e.to_string())?;
-    let data = read_file(Path::new(&path))
+    calculate_file_hash(checksum_method, Path::new(&path))
         .await
-        .map_err(|e| e.to_string())?;
-    let hash = calculate_hash(checksum_method, &data)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(hash)
+        .map_err(|e| e.to_string())
 }
 
 /// Generates a hash for the given file and saves it to a specified output file.
@@ -204,10 +242,7 @@ pub async fn gen_hash_and_save_to_file_impl(
     let checksum_method = get_checksum_method(state)
         .await
         .map_err(|e| e.to_string())?;
-    let data = read_file(Path::new(&source_path))
-        .await
-        .map_err(|e| e.to_string())?;
-    let hash = calculate_hash(checksum_method, &data)
+    let hash = calculate_file_hash(checksum_method, Path::new(&source_path))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -255,10 +290,7 @@ pub async fn compare_file_or_dir_with_hash_impl(
     let checksum_method = get_checksum_method(state)
         .await
         .map_err(|e| e.to_string())?;
-    let data = read_file(Path::new(&path))
-        .await
-        .map_err(|e| e.to_string())?;
-    let calculated_hash = calculate_hash(checksum_method, &data)
+    let calculated_hash = calculate_file_hash(checksum_method, Path::new(&path))
         .await
         .map_err(|e| e.to_string())?;
 

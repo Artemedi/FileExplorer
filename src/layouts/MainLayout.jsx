@@ -449,7 +449,9 @@ const MainLayout = () => {
     document.addEventListener('open-hash-compare-modal', handleOpenHashCompareModal);
     document.addEventListener('open-hash-display-modal', handleOpenHashDisplayModal);
     document.addEventListener('sftp-file-opened', handleSftpFileOpened);
-    document.addEventListener('force-explorer-view', () => setCurrentView('explorer'));
+    const handleForceExplorerView = () => setCurrentView('explorer');
+    document.addEventListener('force-explorer-view', handleForceExplorerView);
+    window.addEventListener('force-explorer-view', handleForceExplorerView);
 
     // Handle external files dragged and dropped into the app window
     let unlistenTauriDrop = null;
@@ -492,7 +494,8 @@ const MainLayout = () => {
             document.removeEventListener('open-hash-compare-modal', handleOpenHashCompareModal);
             document.removeEventListener('open-hash-display-modal', handleOpenHashDisplayModal);
             document.removeEventListener('sftp-file-opened', handleSftpFileOpened);
-            document.removeEventListener('force-explorer-view', () => setCurrentView('explorer'));
+            document.removeEventListener('force-explorer-view', handleForceExplorerView);
+            window.removeEventListener('force-explorer-view', handleForceExplorerView);
             console.log('MainLayout: All event listeners removed');
         };
     }, []);
