@@ -67,14 +67,26 @@ pub fn get_system_volumes_information() -> Vec<VolumeInformation> {
     let disks = Disks::new_with_refreshed_list();
 
     for disk in &disks {
+        let mount_point = disk.mount_point().to_string_lossy().into_owned();
+        let mut volume_name = disk.name().to_string_lossy().into_owned();
+
+        // On Windows, if volume label is empty, provide a clean friendly name like "Local Disk (C:)"
+        #[cfg(target_os = "windows")]
+        if volume_name.is_empty() && !mount_point.is_empty() {
+            let drive_letter = mount_point.trim_end_matches('\\');
+            volume_name = format!("Local Disk ({})", drive_letter);
+        }
+
+        let file_system = disk
+            .file_system()
+            .to_str()
+            .unwrap_or("Unknown")
+            .to_owned();
+
         volume_information_vec.push(VolumeInformation {
-            volume_name: disk.name().to_string_lossy().into_owned(), // Convert OsStr to String
-            mount_point: disk.mount_point().to_string_lossy().into_owned(), // Convert mount point
-            file_system: disk
-                .file_system()
-                .to_str()
-                .expect("Error during parsing the given string from file_system")
-                .to_owned(), // Convert file system
+            volume_name,
+            mount_point,
+            file_system,
             size: disk.total_space(),
             available_space: disk.available_space(),
             is_removable: disk.is_removable(),
@@ -83,53 +95,43 @@ pub fn get_system_volumes_information() -> Vec<VolumeInformation> {
         });
     }
 
-    // Create a new vector to store non-duplicate items
-    let mut result = Vec::new();
-    let mut skip_indices = std::collections::HashSet::new();
+    // Filter out duplicate mount points and internal virtual mounts
+    let mut result: Vec<VolumeInformation> = Vec::new();
+    let mut seen_mount_points = std::collections::HashSet::new();
 
-    // First pass: identify duplicates
-    for i in 0..volume_information_vec.len() {
-        if skip_indices.contains(&i) {
+    for volume in volume_information_vec {
+        // Normalize mount point for case-insensitive duplicate check on Windows
+        let norm_mount = if cfg!(target_os = "windows") {
+            volume.mount_point.to_uppercase()
+        } else {
+            volume.mount_point.clone()
+        };
+
+        if !seen_mount_points.insert(norm_mount) {
             continue;
         }
 
-        for j in i + 1..volume_information_vec.len() {
-            // Check if the two volumes have the same name
-            if volume_information_vec[i].volume_name == volume_information_vec[j].volume_name {
-                // Mark the one with longer mount_point to be skipped
-                if volume_information_vec[i].mount_point.len()
-                    > volume_information_vec[j].mount_point.len()
-                {
-                    skip_indices.insert(i);
-                } else {
-                    skip_indices.insert(j);
-                }
-            }
-
-            // Check if the two volumes have the same mount point
-            if volume_information_vec[i].mount_point == volume_information_vec[j].mount_point {
-                // Mark the one with longer volume_name to be skipped
-                if volume_information_vec[i].volume_name.len()
-                    > volume_information_vec[j].volume_name.len()
-                {
-                    skip_indices.insert(i);
-                } else {
-                    skip_indices.insert(j);
-                }
-            }
+        // On macOS, skip internal APFS firmlinks / system containers (/System/Volumes/...)
+        #[cfg(target_os = "macos")]
+        if volume.mount_point.starts_with("/System/Volumes") {
+            continue;
         }
+
+        // On Linux, filter out efi/boot mounts
+        #[cfg(target_os = "linux")]
+        if volume.mount_point == "/boot"
+            || volume.mount_point.starts_with("/boot/")
+            || volume.mount_point == "/efi"
+            || volume.mount_point.starts_with("/efi/")
+        {
+            continue;
+        }
+
+        result.push(volume);
     }
 
-    // Second pass: collect non-skipped items and remove boot volumes
-    for (index, volume) in volume_information_vec.into_iter().enumerate() {
-        if !skip_indices.contains(&index) {
-            //filter boot volumes out on second pass
-            if volume.mount_point == "efi" || volume.mount_point.contains("boot") {
-                continue;
-            }
-            result.push(volume);
-        }
-    }
+    // Sort volumes: on Windows by drive letter (C:\, D:\, ...), on other platforms by mount point
+    result.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
 
     result
 }
