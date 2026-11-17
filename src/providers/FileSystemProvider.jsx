@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useHistory } from './HistoryProvider';
 import { useSettings } from './SettingsProvider';
 import { useSftp } from './SftpProvider';
@@ -125,6 +126,7 @@ export default function FileSystemProvider({ children }) {
                     const filteredData = filterDirectoryData(sftpData);
                     setCurrentDirData(filteredData);
                     navigateTo(path);
+                    invoke('unwatch_directory').catch(() => {});
                     console.log(`Successfully loaded SFTP directory: ${path}`);
                     return true;
                 } else {
@@ -149,6 +151,9 @@ export default function FileSystemProvider({ children }) {
                 const filteredData = filterDirectoryData(dirData);
                 setCurrentDirData(filteredData);
                 navigateTo(path);
+                invoke('watch_directory', { path }).catch((err) => {
+                    console.warn(`Failed to watch directory: ${path}`, err);
+                });
                 console.log(`Successfully loaded directory: ${path}`);
                 return true;
             } catch (parseError) {
@@ -291,6 +296,44 @@ export default function FileSystemProvider({ children }) {
             loadDirectory(currentPath);
         }
     }, [currentPath, loadDirectory]);
+
+    const currentPathRef = useRef(currentPath);
+    useEffect(() => {
+        currentPathRef.current = currentPath;
+    }, [currentPath]);
+
+    // Live directory update via file watcher
+    useEffect(() => {
+        let unlisten = null;
+        let debounceTimer = null;
+
+        const setupWatcher = async () => {
+            try {
+                unlisten = await listen('fs-change', (event) => {
+                    if (debounceTimer) {
+                        clearTimeout(debounceTimer);
+                    }
+                    debounceTimer = setTimeout(() => {
+                        const targetPath = currentPathRef.current;
+                        if (targetPath && !isSftpPath(targetPath)) {
+                            console.log(`Auto-refreshing directory after fs-change: ${targetPath}`);
+                            loadDirectory(targetPath);
+                        }
+                    }, 250);
+                });
+            } catch (err) {
+                console.warn('Failed to listen to fs-change events:', err);
+            }
+        };
+
+        setupWatcher();
+
+        return () => {
+            if (debounceTimer) clearTimeout(debounceTimer);
+            if (unlisten) unlisten();
+            invoke('unwatch_directory').catch(() => {});
+        };
+    }, [loadDirectory, isSftpPath]);
 
     // Open a file - enhanced with SFTP support
     const openFile = useCallback(async (filePath) => {
