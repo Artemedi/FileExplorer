@@ -29,41 +29,40 @@
 - **💾 Volume Operations**: Drive management and volume operations
 - **⚙️ Customizable Settings**: Extensive configuration options
 - **🎨 Modern UI**: React-based interface with context menus and responsive design
+- **⚡ Real-Time File Watching**: Automatic live directory updates powered by the Rust `notify` engine
+- **🛡️ Modernized Rust Core**: Memory-safe zero-unsafe ASCII mapping, `std::sync::{LazyLock, OnceLock}`, and `thiserror` structured error handling
 
 ## 🔍 Current Status
 
-Cross platform compatibility is given and it supports all common Linux distros, macOS, and Windows
-which are supported by Tauri. If there is an interest in contributing feel free to join the
-[discord channel](https://discord.com/invite/dnVJQtNXjr) from Connaticus or message me or my team.
+Cross platform compatibility is supported across Linux distros, macOS, and Windows. Automated CI/CD tests all pull requests and builds release installers for Windows (`.msi`, `.exe`), macOS (`.dmg`), and Linux (`.deb`, `.rpm`, `.AppImage`).
 
 ## 🏗️ Architecture
 
-This is a Tauri-based application with a **Rust backend** and **React frontend**:
+This is a Tauri v2 application with a **Rust backend** and **React + TypeScript frontend**:
 
 ### Backend (Rust)
-- **Search Engine**: Multiple algorithms with LRU caching
-- **File System Operations**: Local and SFTP file operations
+- **Search Engine**: Multiple algorithms (Fast Fuzzy + ART Adaptive Radix Tree) with LRU caching
+- **File System Operations**: Local file operations with real-time `notify` directory watcher
+- **SFTP Integration**: Remote file system operations, background uploads/downloads
 - **Command System**: Modular command handlers for different operations
-- **Error Handling**: Centralized error management with standardized codes (401-500)
-- **Feature Flags**: Extensive Cargo features for different build configurations
+- **Error Handling**: Centralized error management with `thiserror = "2"` and standardized error codes
 
-### Frontend (React)
+### Frontend (React + TypeScript)
+- **TypeScript Integration**: Strong contract types mirroring backend Rust structs
 - **Provider Pattern**: Hierarchical context providers for state management
-- **Modern UI**: Component-based architecture with custom hooks
-- **Responsive Design**: Adaptive layouts for different screen sizes
+- **Real-Time Synchronization**: Live Tauri event listeners with debounced auto-reload
+- **Modern UI**: Component-based architecture with custom hooks and dark mode support
 
-## Coming Soon
+## 🛠️ Installation
 
-- Real-time file watching with caching service
-- Search/caching progress indicators
-- Enhanced terminal integration
+### Download Prebuilt Binaries
 
-# 🛠️ Installation
+Pre-compiled, signed packages are available for download from the [Releases page](https://github.com/Artemedi/FileExplorer/releases):
+- **Windows**: `.msi` (Windows Installer) and `.exe` (NSIS setup)
+- **macOS**: `.dmg` disk image
+- **Linux**: `.deb`, `.rpm`, and `.AppImage`
 
-Our plan is to provide installers for the supported operating systems or common package installers.
-Unfortunately we have serious Problems with Tauri and creating installers. There are some installers
-for linux under `dist-builds`. In the future there will be ready to go packages for macOS, Linux and
-Windows until then please refer to the compilation from source for your computer.
+---
 
 ## Installation from source
 
