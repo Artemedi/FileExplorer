@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { useTheme } from '../providers/ThemeProvider';
 import { useFileSystem } from '../providers/FileSystemProvider';
 import { useContextMenu } from '../providers/ContextMenuProvider';
@@ -54,7 +54,7 @@ import {replaceFileName} from "../utils/pathUtils.js";
  */
 const MainLayout = () => {
     const { theme, toggleTheme } = useTheme();
-    const { isLoading, currentDirData, selectedItems, loadDirectory, volumes, focusedItem, setFocusedItem, renameItem: fsRenameItem } = useFileSystem();
+    const { isLoading, currentDirData, selectedItems, loadDirectory, loadVolumes, volumes, focusedItem, setFocusedItem, renameItem: fsRenameItem, selectMultiple, clearSelection } = useFileSystem();
     const { isSftpPath, parseSftpPath, createSftpUrl } = useSftp();
     const { 
         isOpen: isContextMenuOpen, 
@@ -69,7 +69,7 @@ const MainLayout = () => {
         renameItem,
         showProperties
     } = useContextMenu();
-    const { currentPath, navigateTo } = useHistory();
+    const { currentPath, navigateTo, goBack, goForward, canGoBack, canGoForward } = useHistory();
     const { settings, updateSetting } = useSettings();
     const { t } = useTranslation();
 
@@ -103,6 +103,28 @@ const MainLayout = () => {
     const [hashModalItem, setHashModalItem] = useState(null);
     const [hashDisplayData, setHashDisplayData] = useState({ hash: '', fileName: '' });
     const [columnsPerRow, setColumnsPerRow] = useState(4); // Track columns for preview navigation
+
+    // Refs for keyboard shortcuts to always access fresh state without stale closures
+    const selectedItemsRef = useRef(selectedItems);
+    selectedItemsRef.current = selectedItems;
+
+    const focusedItemRef = useRef(focusedItem);
+    focusedItemRef.current = focusedItem;
+
+    const currentPathRef = useRef(currentPath);
+    currentPathRef.current = currentPath;
+
+    const canGoBackRef = useRef(canGoBack);
+    canGoBackRef.current = canGoBack;
+
+    const canGoForwardRef = useRef(canGoForward);
+    canGoForwardRef.current = canGoForward;
+
+    const isDualPaneRef = useRef(isDualPane);
+    isDualPaneRef.current = isDualPane;
+
+    const clipboardRef = useRef(clipboard);
+    clipboardRef.current = clipboard;
 
     // Get terminal height for padding calculations
     const terminalHeight = settings.terminal_height || 240;
@@ -539,61 +561,260 @@ const MainLayout = () => {
     }, [currentDirData]);
 
     /**
+     * Navigates up to the parent directory
+     * Handles local paths (Windows / Unix) and SFTP paths
+     */
+    const handleGoUp = useCallback(() => {
+        const path = currentPathRef.current;
+        if (!path) return;
+
+        if (isSftpPath(path)) {
+            const parsed = parseSftpPath(path);
+            if (parsed && parsed.connection && parsed.remotePath && parsed.remotePath !== '.' && parsed.remotePath !== '/') {
+                const parts = parsed.remotePath.replace(/\/+$/, '').split('/').filter(Boolean);
+                if (parts.length > 1) {
+                    parts.pop();
+                    const parentRemote = parts.join('/');
+                    navigateTo(`sftp:${parsed.connectionName}:${parentRemote}`);
+                } else {
+                    navigateTo(`sftp:${parsed.connectionName}:.`);
+                }
+            }
+            return;
+        }
+
+        const normalized = path.replace(/\//g, '\\');
+        // Check Windows root drive (e.g. "C:\" or "C:")
+        if (/^[a-zA-Z]:\\?$/.test(normalized)) {
+            // Already at drive root
+            return;
+        }
+
+        if (/^[a-zA-Z]:/.test(normalized)) {
+            const parts = normalized.replace(/\\+$/, '').split('\\');
+            if (parts.length > 1) {
+                parts.pop();
+                let parent = parts.join('\\');
+                if (/^[a-zA-Z]:$/.test(parent)) {
+                    parent += '\\';
+                }
+                navigateTo(parent);
+            }
+            return;
+        }
+
+        // Unix path
+        const parts = path.replace(/\/+$/, '').split('/').filter(Boolean);
+        if (parts.length > 0) {
+            parts.pop();
+            const parent = '/' + parts.join('/');
+            navigateTo(parent);
+        }
+    }, [isSftpPath, parseSftpPath, navigateTo]);
+
+    /**
      * Effect to handle keyboard shortcuts
      */
     useEffect(() => {
+        const isEditingText = (target) => {
+            if (!target) return false;
+            if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) {
+                return true;
+            }
+            if (target.isContentEditable) {
+                return true;
+            }
+            if (target.closest && target.closest('input, textarea, select, [contenteditable="true"], .terminal-input, .xterm')) {
+                return true;
+            }
+            return false;
+        };
+
         /**
          * Keyboard event handler for shortcuts
          * @param {KeyboardEvent} e - The keyboard event
          */
         const handleKeyDown = (e) => {
             // Global search: Ctrl+Shift+F
-            if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'F') {
+            if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
                 e.preventDefault();
                 setIsGlobalSearchOpen(true);
+                return;
             }
 
             // Settings: Ctrl+,
             if ((e.ctrlKey || e.metaKey) && e.key === ',') {
                 e.preventDefault();
                 setIsSettingsOpen(true);
-            }
-
-            // New folder: Ctrl+Shift+N
-            if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'N') {
-                e.preventDefault();
-                document.dispatchEvent(new CustomEvent('create-folder'));
-            }
-
-            // New file: Ctrl+N
-            if ((e.ctrlKey || e.metaKey) && e.key === 'n' && !e.shiftKey) {
-                e.preventDefault();
-                document.dispatchEvent(new CustomEvent('create-file'));
-            }
-
-            // Rename: F2
-            if (e.key === 'F2' && selectedItems.length === 1) {
-                e.preventDefault();
-                document.dispatchEvent(new CustomEvent('open-rename-modal', {
-                    detail: { item: selectedItems[0] }
-                }));
+                return;
             }
 
             // Toggle terminal: Ctrl+`
             if ((e.ctrlKey || e.metaKey) && e.key === '`') {
                 e.preventDefault();
                 setIsTerminalOpen(prev => !prev);
+                return;
             }
 
-            // Escape to clear selection
+            // If user is currently typing in an input/textarea/terminal, DO NOT intercept editing keys
+            if (isEditingText(e.target)) {
+                return;
+            }
+
+            // New folder: Ctrl+Shift+N
+            if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'N' || e.key === 'n')) {
+                e.preventDefault();
+                document.dispatchEvent(new CustomEvent('create-folder'));
+                return;
+            }
+
+            // New file: Ctrl+N
+            if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'n' || e.key === 'N')) {
+                e.preventDefault();
+                document.dispatchEvent(new CustomEvent('create-file'));
+                return;
+            }
+
+            // F6: Toggle Dual Pane view
+            if (e.key === 'F6' && !isDualPaneRef.current) {
+                e.preventDefault();
+                setIsDualPane(true);
+                localStorage.setItem('explr_dual_pane', 'true');
+                return;
+            }
+
+            // If DualPane is active, let DualPane handle pane-specific navigation/actions
+            if (isDualPaneRef.current) {
+                return;
+            }
+
+            // Delete: Move selected/focused item(s) to trash
+            if (e.key === 'Delete') {
+                const targetItems = selectedItemsRef.current.length > 0
+                    ? selectedItemsRef.current
+                    : (focusedItemRef.current ? [focusedItemRef.current] : []);
+                if (targetItems.length > 0) {
+                    e.preventDefault();
+                    deleteItems(targetItems);
+                }
+                return;
+            }
+
+            // Backspace or Alt+ArrowUp: Go to parent folder
+            if (e.key === 'Backspace' || (e.altKey && e.key === 'ArrowUp')) {
+                e.preventDefault();
+                handleGoUp();
+                return;
+            }
+
+            // Navigation history: Alt+ArrowLeft (Back)
+            if (e.altKey && e.key === 'ArrowLeft') {
+                if (canGoBackRef.current) {
+                    e.preventDefault();
+                    goBack();
+                }
+                return;
+            }
+
+            // Navigation history: Alt+ArrowRight (Forward)
+            if (e.altKey && e.key === 'ArrowRight') {
+                if (canGoForwardRef.current) {
+                    e.preventDefault();
+                    goForward();
+                }
+                return;
+            }
+
+            // Select all: Ctrl+A
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+                e.preventDefault();
+                const allItems = getSortedData();
+                if (allItems && allItems.length > 0) {
+                    selectMultiple(allItems);
+                }
+                return;
+            }
+
+            // Copy: Ctrl+C
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
+                const targetItems = selectedItemsRef.current.length > 0
+                    ? selectedItemsRef.current
+                    : (focusedItemRef.current ? [focusedItemRef.current] : []);
+                if (targetItems.length > 0) {
+                    e.preventDefault();
+                    copyToClipboard(targetItems);
+                }
+                return;
+            }
+
+            // Cut: Ctrl+X
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'x' || e.key === 'X')) {
+                const targetItems = selectedItemsRef.current.length > 0
+                    ? selectedItemsRef.current
+                    : (focusedItemRef.current ? [focusedItemRef.current] : []);
+                if (targetItems.length > 0) {
+                    e.preventDefault();
+                    cutToClipboard(targetItems);
+                }
+                return;
+            }
+
+            // Paste: Ctrl+V
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V')) {
+                if (clipboardRef.current?.items?.length > 0) {
+                    e.preventDefault();
+                    pasteFromClipboard();
+                }
+                return;
+            }
+
+            // Refresh: F5 or Ctrl+R
+            if (e.key === 'F5' || ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R'))) {
+                e.preventDefault();
+                if (currentPathRef.current) {
+                    loadDirectory(currentPathRef.current);
+                }
+                loadVolumes();
+                return;
+            }
+
+            // Rename: F2
+            if (e.key === 'F2') {
+                const target = selectedItemsRef.current.length === 1
+                    ? selectedItemsRef.current[0]
+                    : (selectedItemsRef.current.length === 0 && focusedItemRef.current ? focusedItemRef.current : null);
+                if (target) {
+                    e.preventDefault();
+                    document.dispatchEvent(new CustomEvent('open-rename-modal', {
+                        detail: { item: target }
+                    }));
+                }
+                return;
+            }
+
+            // Properties: Alt+Enter
+            if (e.altKey && e.key === 'Enter') {
+                const target = selectedItemsRef.current.length > 0
+                    ? selectedItemsRef.current[0]
+                    : focusedItemRef.current;
+                if (target) {
+                    e.preventDefault();
+                    setIsDetailsPanelOpen(prev => !prev);
+                }
+                return;
+            }
+
+            // Escape: Clear selection
             if (e.key === 'Escape') {
+                clearSelection();
                 document.dispatchEvent(new CustomEvent('clear-selection'));
+                return;
             }
         };
 
         document.addEventListener('keydown', handleKeyDown);
         return () => document.removeEventListener('keydown', handleKeyDown);
-    }, [selectedItems]);
+    }, [handleGoUp, getSortedData, selectMultiple, clearSelection, copyToClipboard, cutToClipboard, pasteFromClipboard, deleteItems, loadDirectory, loadVolumes, goBack, goForward]);
 
     /**
      * Copies current path to clipboard

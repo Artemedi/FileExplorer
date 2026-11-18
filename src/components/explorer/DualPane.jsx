@@ -4,7 +4,7 @@ import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useSettings } from '../../providers/SettingsProvider';
 import { useTranslation } from '../../i18n';
-import { showSuccess, showError } from '../../utils/NotificationSystem';
+import { showSuccess, showError, showConfirm } from '../../utils/NotificationSystem';
 import FileList from './FileList';
 import './dualPane.css';
 
@@ -271,7 +271,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                     await invoke('rename', { oldPath: item.path, newPath: dest });
                 } catch (_) {
                     await invoke('copy_file_or_dir', { sourcePath: item.path, destinationPath: dest });
-                    await invoke('delete_file_or_dir', { path: item.path });
+                    await invoke('move_to_trash', { path: item.path });
                 }
                 moved++;
             } catch (e) {
@@ -287,10 +287,45 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
         }
     };
 
-    // Keyboard shortcuts (F5: copy, F6: move, Tab: switch pane)
+    // Delete selected items in active pane
+    const handleDeleteSelected = async () => {
+        const isLeft = activePane === 'left';
+        const sourceItems = isLeft ? leftSelected : rightSelected;
+        const currentDir = isLeft ? leftPath : rightPath;
+
+        if (!sourceItems || sourceItems.length === 0) return;
+
+        const itemNames = sourceItems.map(item => item.name).join(', ');
+        const confirmMessage = `Are you sure you want to move ${sourceItems.length === 1 ? itemNames : `${sourceItems.length} items`} to trash?`;
+        const shouldDelete = await showConfirm(confirmMessage, 'Move to Trash');
+        if (!shouldDelete) return;
+
+        let deleted = 0;
+        for (const item of sourceItems) {
+            try {
+                await invoke('move_to_trash', { path: item.path });
+                deleted++;
+            } catch (err) {
+                console.error('Failed to move to trash:', err);
+                showError(`${t('common.error')}: ${item.name}`);
+            }
+        }
+
+        if (deleted > 0) {
+            showSuccess(`${t('common.success')}: ${deleted} ${t('common.items')}`);
+            if (isLeft) {
+                setLeftSelected([]);
+            } else {
+                setRightSelected([]);
+            }
+            loadPaneDirectory(activePane, currentDir);
+        }
+    };
+
+    // Keyboard shortcuts (F5: copy, F6: move, Tab: switch pane, Delete: delete, Backspace: up, Ctrl+A: select all)
     useEffect(() => {
         const handleKeyDown = (e) => {
-            if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+            if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target.isContentEditable) return;
 
             if (e.key === 'F5') {
                 e.preventDefault();
@@ -301,12 +336,39 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
             } else if (e.key === 'Tab') {
                 e.preventDefault();
                 handleActivate(activePane === 'left' ? 'right' : 'left');
+            } else if (e.key === 'Delete') {
+                e.preventDefault();
+                handleDeleteSelected();
+            } else if (e.key === 'Backspace' || (e.altKey && e.key === 'ArrowUp')) {
+                e.preventDefault();
+                handleGoUp(activePane);
+            } else if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+                e.preventDefault();
+                const activeData = activePane === 'left' ? leftDirData : rightDirData;
+                if (activeData) {
+                    const allItems = [
+                        ...(activeData.directories || []).map(d => ({ ...d, isDirectory: true })),
+                        ...(activeData.files || []).map(f => ({ ...f, isDirectory: false }))
+                    ];
+                    if (activePane === 'left') {
+                        setLeftSelected(allItems);
+                    } else {
+                        setRightSelected(allItems);
+                    }
+                }
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                if (activePane === 'left') {
+                    setLeftSelected([]);
+                } else {
+                    setRightSelected([]);
+                }
             }
         };
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [activePane, leftSelected, rightSelected, leftPath, rightPath]);
+    }, [activePane, leftSelected, rightSelected, leftPath, rightPath, leftDirData, rightDirData, handleCopyToOpposite, handleMoveToOpposite, handleGoUp, handleDeleteSelected]);
 
     // Selection handlers for left pane
     const handleLeftSelect = (item, multi) => {

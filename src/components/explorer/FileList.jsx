@@ -420,16 +420,18 @@ const FileList = ({
                             moved = true;
                         }
                         break;
-                    case 'Enter':
-                        if (focusedItem) {
+                    case 'Enter': {
+                        const targetItem = focusedItem || (selectedItems && selectedItems.length === 1 ? selectedItems[0] : null);
+                        if (targetItem) {
                             e.preventDefault();
-                            if (focusedItem.isDirectory) {
-                                loadDirectory(focusedItem.path);
+                            if (targetItem.isDirectory) {
+                                loadDirectory(targetItem.path);
                             } else {
-                                openFile(focusedItem.path);
+                                openFile(targetItem.path);
                             }
                         }
                         break;
+                    }
                 }
 
                 const item = sortedItems[newFocusedIndex];
