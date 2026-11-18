@@ -1,6 +1,6 @@
 [package]
 name = "explr"
-version = "0.2.9"
+version = "0.2.10"
 description = "Explr - Modern File Explorer"
 authors = ["Conaticus", "ProtogenDelta", "Marco Brandt", "Lauritz Wiebusch", "Daniel Schatz", "Sören Panten"]
 license = ""
