@@ -512,6 +512,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                             onColumnsChange={onColumnsChange}
                             selectedItems={leftSelected}
                             onSelectItem={handleLeftSelect}
+                            onSelectMultiple={setLeftSelected}
                             onClearSelection={() => setLeftSelected([])}
                             onLoadDirectory={(p) => {
                                 loadPaneDirectory('left', p);
@@ -600,6 +601,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                             onColumnsChange={onColumnsChange}
                             selectedItems={rightSelected}
                             onSelectItem={handleRightSelect}
+                            onSelectMultiple={setRightSelected}
                             onClearSelection={() => setRightSelected([])}
                             onLoadDirectory={(p) => {
                                 loadPaneDirectory('right', p);

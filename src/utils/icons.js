@@ -28,11 +28,32 @@ export const getFileIconType = (filename) => {
         return 'video';
     }
 
+    // Microsoft Office & Documents
+    if (['doc', 'docx', 'odt'].includes(extension)) {
+        return 'doc';
+    }
+    if (['xls', 'xlsx', 'ods', 'csv'].includes(extension)) {
+        return 'sheet';
+    }
+    if (['ppt', 'pptx', 'odp'].includes(extension)) {
+        return 'presentation';
+    }
+
+    // Executable files
+    if (['exe', 'msi', 'bat', 'cmd', 'ps1', 'sh', 'apk'].includes(extension)) {
+        return 'executable';
+    }
+
+    // Config files
+    if (['json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'env', 'conf'].includes(extension)) {
+        return 'config';
+    }
+
     // Code files
     const codeExtensions = [
-        'html', 'css', 'js', 'jsx', 'ts', 'tsx', 'json', 'xml', 'yaml', 'toml',
+        'html', 'css', 'js', 'jsx', 'ts', 'tsx',
         'py', 'java', 'c', 'cpp', 'h', 'cs', 'php', 'rb', 'go', 'rs', 'swift',
-        'kt', 'sql', 'sh', 'bat', 'ps1'
+        'kt', 'sql'
     ];
     if (codeExtensions.includes(extension)) {
         return 'code';
@@ -49,11 +70,8 @@ export const getFileIconType = (filename) => {
         return 'pdf';
     }
 
-    // Text and document files
-    const textExtensions = [
-        'txt', 'md', 'rtf', 'doc', 'docx', 'odt', 'xls', 'xlsx', 'ods',
-        'ppt', 'pptx', 'odp', 'csv'
-    ];
+    // Text and plain document files
+    const textExtensions = ['txt', 'md', 'rtf', 'log'];
     if (textExtensions.includes(extension)) {
         return 'text';
     }

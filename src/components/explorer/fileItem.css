@@ -207,8 +207,9 @@
     color: var(--text-secondary);
 }
 
+.file-icon-folder,
 .file-item.directory .file-icon {
-    color: var(--accent);
+    color: var(--folder-color, #f59e0b);
 }
 
 /* Custom icons for different file types */
@@ -221,11 +222,11 @@
 }
 
 .file-icon-audio {
-    color: #8b5cf6; /* purple */
+    color: #a855f7; /* purple */
 }
 
 .file-icon-code {
-    color: #3b82f6; /* blue */
+    color: #38bdf8; /* sky blue */
 }
 
 .file-icon-archive {
@@ -237,7 +238,27 @@
 }
 
 .file-icon-text {
-    color: #6b7280; /* gray */
+    color: #94a3b8; /* slate gray, high contrast */
+}
+
+.file-icon-doc {
+    color: #3b82f6; /* doc blue */
+}
+
+.file-icon-sheet {
+    color: #10b981; /* excel green */
+}
+
+.file-icon-presentation {
+    color: #f97316; /* ppt orange */
+}
+
+.file-icon-executable {
+    color: #06b6d4; /* cyan */
+}
+
+.file-icon-config {
+    color: #c084fc; /* purple */
 }
 
 /* Responsive adjustments */

@@ -129,7 +129,7 @@ impl Default for Settings {
             font_size: FontSize::Medium,
             show_hidden_files_and_folders: false,
             show_details_panel: false,
-            accent_color: "#000000".to_string(),
+            accent_color: "#0672ef".to_string(),
             confirm_delete: true,
             auto_refresh_dir: true,
             sort_direction: SortDirection::Acscending,

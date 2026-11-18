@@ -23,39 +23,55 @@ const SettingsApplier = () => {
         }
 
         // Apply accent color
-        if (settings.accent_color) {
-            // Convert hex to RGB for CSS variables that need RGB values
-            const hexToRgb = (hex) => {
-                const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-                return result ? {
-                    r: parseInt(result[1], 16),
-                    g: parseInt(result[2], 16),
-                    b: parseInt(result[3], 16)
-                } : null;
-            };
+        let effectiveAccent = settings.accent_color;
+        // Never allow pure black (#000000) as accent color as it destroys visibility in dark theme
+        if (!effectiveAccent || effectiveAccent.toLowerCase() === '#000000' || effectiveAccent.toLowerCase() === '#000') {
+            effectiveAccent = '#0672ef';
+        }
 
-            const rgb = hexToRgb(settings.accent_color);
-            if (rgb) {
-                // Create hover and surface variants
-                const darkerAccent = `color-mix(in srgb, ${settings.accent_color} 85%, black)`;
-                const lighterAccent = `color-mix(in srgb, ${settings.accent_color} 15%, transparent)`;
+        // Convert hex to RGB for CSS variables that need RGB values
+        const hexToRgb = (hex) => {
+            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return result ? {
+                r: parseInt(result[1], 16),
+                g: parseInt(result[2], 16),
+                b: parseInt(result[3], 16)
+            } : null;
+        };
 
-                // Apply accent color variables
-                document.documentElement.style.setProperty('--light-accent', settings.accent_color);
-                document.documentElement.style.setProperty('--dark-accent', settings.accent_color);
-                document.documentElement.style.setProperty('--light-accent-hover', darkerAccent);
-                document.documentElement.style.setProperty('--dark-accent-hover', darkerAccent);
-                document.documentElement.style.setProperty('--light-accent-surface', lighterAccent);
-                document.documentElement.style.setProperty('--dark-accent-surface', lighterAccent);
+        const rgb = hexToRgb(effectiveAccent);
+        if (rgb) {
+            // Check luminance to ensure dark mode visibility
+            const luminance = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+            // If the color is too dark for dark mode, brighten it for dark mode
+            const darkAccent = luminance < 60 ? '#3b82f6' : effectiveAccent;
 
-                // Update RGB values for transparency effects
-                document.documentElement.style.setProperty('--accent-rgb', `${rgb.r}, ${rgb.g}, ${rgb.b}`);
+            const darkerAccent = `color-mix(in srgb, ${effectiveAccent} 85%, black)`;
+            const lighterAccent = `color-mix(in srgb, ${effectiveAccent} 15%, transparent)`;
+            const darkAccentSurface = `color-mix(in srgb, ${darkAccent} 20%, transparent)`;
+            const darkAccentHover = `color-mix(in srgb, ${darkAccent} 85%, white)`;
 
-                // Apply to current theme
-                document.documentElement.style.setProperty('--accent', settings.accent_color);
-                document.documentElement.style.setProperty('--accent-hover', darkerAccent);
-                document.documentElement.style.setProperty('--accent-surface', lighterAccent);
-            }
+            // Apply accent color variables
+            document.documentElement.style.setProperty('--light-accent', effectiveAccent);
+            document.documentElement.style.setProperty('--dark-accent', darkAccent);
+            document.documentElement.style.setProperty('--light-accent-hover', darkerAccent);
+            document.documentElement.style.setProperty('--dark-accent-hover', darkAccentHover);
+            document.documentElement.style.setProperty('--light-accent-surface', lighterAccent);
+            document.documentElement.style.setProperty('--dark-accent-surface', darkAccentSurface);
+
+            // Update RGB values for transparency effects
+            document.documentElement.style.setProperty('--accent-rgb', `${rgb.r}, ${rgb.g}, ${rgb.b}`);
+
+            // Apply to current theme
+            const isDark = document.documentElement.classList.contains('theme-dark') || 
+                           (!document.documentElement.classList.contains('theme-light') && window.matchMedia('(prefers-color-scheme: dark)').matches);
+            const currentAccent = isDark ? darkAccent : effectiveAccent;
+            const currentHover = isDark ? darkAccentHover : darkerAccent;
+            const currentSurface = isDark ? darkAccentSurface : lighterAccent;
+
+            document.documentElement.style.setProperty('--accent', currentAccent);
+            document.documentElement.style.setProperty('--accent-hover', currentHover);
+            document.documentElement.style.setProperty('--accent-surface', currentSurface);
         }
 
         // Apply animation settings

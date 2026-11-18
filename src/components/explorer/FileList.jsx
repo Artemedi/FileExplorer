@@ -31,6 +31,7 @@ const FileList = ({
     onColumnsChange,
     selectedItems: customSelectedItems,
     onSelectItem: customSelectItem,
+    onSelectMultiple: customSelectMultiple,
     onClearSelection: customClearSelection,
     onLoadDirectory: customLoadDirectory,
     onOpenFile: customOpenFile,
@@ -40,6 +41,7 @@ const FileList = ({
     const fs = useFileSystem();
     const selectedItems = customSelectedItems !== undefined ? customSelectedItems : fs.selectedItems;
     const selectItem = customSelectItem || fs.selectItem;
+    const selectMultiple = customSelectMultiple || fs.selectMultiple;
     const loadDirectory = customLoadDirectory || fs.loadDirectory;
     const clearSelection = customClearSelection || fs.clearSelection;
     const focusedItem = customFocusedItem !== undefined ? customFocusedItem : fs.focusedItem;
@@ -441,27 +443,20 @@ const FileList = ({
                         const start = Math.min(lastSelectedIndex, newFocusedIndex);
                         const end = Math.max(lastSelectedIndex, newFocusedIndex);
                         const itemsToSelect = sortedItems.slice(start, end + 1);
-                        clearSelection();
-                        itemsToSelect.forEach(rangeItem => {
-                            selectItem(rangeItem, true);
-                        });
+                        selectMultiple(itemsToSelect);
                     } else if (e.ctrlKey || e.metaKey) {
                         // Cmd/Ctrl+Arrow: add/remove focused item to selection
                         const isAlreadySelected = selectedItems.some(selected => selected.path === item.path);
                         if (isAlreadySelected) {
-                            // Deselect by clearing and re-selecting others
                             const otherSelected = selectedItems.filter(selected => selected.path !== item.path);
-                            clearSelection();
-                            otherSelected.forEach(otherItem => {
-                                selectItem(otherItem, true);
-                            });
+                            selectMultiple(otherSelected);
                         } else {
-                            selectItem(item, true);
+                            selectMultiple([...selectedItems, item]);
                         }
                         setLastSelectedIndex(newFocusedIndex);
                     } else {
                         // No modifier: single selection
-                        selectItem(item, false);
+                        selectMultiple([item]);
                         setLastSelectedIndex(newFocusedIndex);
                     }
                 }
@@ -616,41 +611,53 @@ const FileList = ({
 
         // For single click, handle selection
         const isAlreadySelected = selectedItems.some(selected => selected.path === item.path);
+        const isShift = (e && e.shiftKey) || isShiftKeyPressed;
+        const isCtrl = (e && (e.ctrlKey || e.metaKey)) || isCtrlKeyPressed;
 
-        if (isShiftKeyPressed && lastSelectedIndex !== -1) {
-            // Multi-select with shift key
-            const start = Math.min(lastSelectedIndex, index);
-            const end = Math.max(lastSelectedIndex, index);
+        if (isShift) {
+            // Find anchor index for shift selection
+            let anchor = lastSelectedIndex;
+            if (anchor === -1) {
+                if (selectedItems.length > 0) {
+                    anchor = sortedItems.findIndex(i => i.path === selectedItems[0].path);
+                } else if (focusedItem) {
+                    anchor = sortedItems.findIndex(i => i.path === focusedItem.path);
+                }
+            }
+            if (anchor === -1) {
+                anchor = 0;
+            }
+
+            const start = Math.min(anchor, index);
+            const end = Math.max(anchor, index);
             const itemsToSelect = sortedItems.slice(start, end + 1);
 
-            // Clear current selection and select range
-            clearSelection();
-            itemsToSelect.forEach(rangeItem => {
-                selectItem(rangeItem, true);
-            });
-            setLastSelectedIndex(index);
-        } else if (isCtrlKeyPressed) {
+            // Instant atomic selection update (no slow loops or deselection glitches)
+            selectMultiple(itemsToSelect);
+            setFocusedItem(item);
+            if (lastSelectedIndex === -1) {
+                setLastSelectedIndex(anchor);
+            }
+        } else if (isCtrl) {
             // Toggle selection with Ctrl key
             if (isAlreadySelected) {
-                // Deselect by clearing and re-selecting others
                 const otherSelected = selectedItems.filter(selected => selected.path !== item.path);
-                clearSelection();
-                otherSelected.forEach(otherItem => {
-                    selectItem(otherItem, true);
-                });
+                selectMultiple(otherSelected);
             } else {
-                selectItem(item, true);
+                selectMultiple([...selectedItems, item]);
             }
             setLastSelectedIndex(index);
+            setFocusedItem(item);
         } else {
-            // Single selection
+            // Single selection without modifiers
             if (isAlreadySelected && selectedItems.length === 1) {
                 // If clicking on the only selected item, deselect it
                 clearSelection();
                 setLastSelectedIndex(-1);
             } else {
-                selectItem(item, false);
+                selectMultiple([item]);
                 setLastSelectedIndex(index);
+                setFocusedItem(item);
             }
         }
     };
