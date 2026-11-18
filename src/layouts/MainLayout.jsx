@@ -954,17 +954,26 @@ const MainLayout = () => {
     }, [settings.show_hidden_files_and_folders, updateSetting, currentPath, loadDirectory]);
 
     /**
+     * Active selected items (falls back to focusedItem if selectedItems is empty)
+     */
+    const activeSelectedItems = useMemo(() => {
+        if (selectedItems && selectedItems.length > 0) return selectedItems;
+        if (focusedItem) return [focusedItem];
+        return [];
+    }, [selectedItems, focusedItem]);
+
+    /**
      * File operation handlers - use the existing context menu functionality
      */
     const handleCut = useCallback(() => {
-        if (selectedItems.length === 0) return;
-        cutToClipboard(selectedItems);
-    }, [selectedItems, cutToClipboard]);
+        if (activeSelectedItems.length === 0) return;
+        cutToClipboard(activeSelectedItems);
+    }, [activeSelectedItems, cutToClipboard]);
 
     const handleCopy = useCallback(() => {
-        if (selectedItems.length === 0) return;
-        copyToClipboard(selectedItems);
-    }, [selectedItems, copyToClipboard]);
+        if (activeSelectedItems.length === 0) return;
+        copyToClipboard(activeSelectedItems);
+    }, [activeSelectedItems, copyToClipboard]);
 
     const handlePaste = useCallback(() => {
         if (!clipboard.items || clipboard.items.length === 0) return;
@@ -972,28 +981,28 @@ const MainLayout = () => {
     }, [clipboard.items, pasteFromClipboard]);
 
     const handleRenameToolbar = useCallback(() => {
-        if (selectedItems.length !== 1) return;
+        if (activeSelectedItems.length !== 1) return;
         // Directly dispatch the event instead of calling renameItem to avoid conflicts
         document.dispatchEvent(new CustomEvent('open-rename-modal', {
-            detail: { item: selectedItems[0] }
+            detail: { item: activeSelectedItems[0] }
         }));
-    }, [selectedItems]);
+    }, [activeSelectedItems]);
 
     const handleDelete = useCallback(() => {
-        if (selectedItems.length === 0) return;
-        deleteItems(selectedItems);
-    }, [selectedItems, deleteItems]);
+        if (activeSelectedItems.length === 0) return;
+        deleteItems(activeSelectedItems);
+    }, [activeSelectedItems, deleteItems]);
 
     const handleProperties = useCallback(() => {
-        if (selectedItems.length === 0) return;
+        if (activeSelectedItems.length === 0) return;
         // Toggle the details panel: close if open, open if closed
         if (isDetailsPanelOpen) {
             setIsDetailsPanelOpen(false);
         } else {
-            showProperties(selectedItems[0]);
+            showProperties(activeSelectedItems[0]);
             setIsDetailsPanelOpen(true);
         }
-    }, [selectedItems, showProperties, isDetailsPanelOpen]);
+    }, [activeSelectedItems, showProperties, isDetailsPanelOpen]);
 
     /**
      * Effect to clear search when changing directory
@@ -1033,7 +1042,7 @@ const MainLayout = () => {
                                 <button
                                     className="icon-button"
                                     onClick={handleCut}
-                                    disabled={selectedItems.length === 0}
+                                    disabled={activeSelectedItems.length === 0}
                                     title={t('toolbar.cut')}
                                     aria-label="Cut selected items"
                                 >
@@ -1043,7 +1052,7 @@ const MainLayout = () => {
                                 <button
                                     className="icon-button"
                                     onClick={handleCopy}
-                                    disabled={selectedItems.length === 0}
+                                    disabled={activeSelectedItems.length === 0}
                                     title={t('toolbar.copy')}
                                     aria-label="Copy selected items"
                                 >
@@ -1063,7 +1072,7 @@ const MainLayout = () => {
                                 <button
                                     className="icon-button"
                                     onClick={handleRenameToolbar}
-                                    disabled={selectedItems.length !== 1}
+                                    disabled={activeSelectedItems.length !== 1}
                                     title={t('toolbar.rename')}
                                     aria-label="Rename selected item"
                                 >
@@ -1073,7 +1082,7 @@ const MainLayout = () => {
                                 <button
                                     className="icon-button"
                                     onClick={handleDelete}
-                                    disabled={selectedItems.length === 0}
+                                    disabled={activeSelectedItems.length === 0}
                                     title={t('toolbar.delete')}
                                     aria-label="Delete selected items"
                                 >
@@ -1083,7 +1092,7 @@ const MainLayout = () => {
                                 <button
                                     className="icon-button"
                                     onClick={handleProperties}
-                                    disabled={selectedItems.length === 0}
+                                    disabled={activeSelectedItems.length === 0}
                                     title={t('toolbar.properties')}
                                     aria-label="Show properties"
                                 >
@@ -1226,8 +1235,8 @@ const MainLayout = () => {
                                 <>
                                     <div className="panel-resize-handle"></div>
                                     <DetailsPanel
-                                        item={selectedItems[0] || null}
-                                        isMultipleSelection={selectedItems.length > 1}
+                                        item={activeSelectedItems[0] || null}
+                                        isMultipleSelection={activeSelectedItems.length > 1}
                                     />
                                 </>
                             )}

@@ -290,7 +290,9 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
     // Delete selected items in active pane
     const handleDeleteSelected = async () => {
         const isLeft = activePane === 'left';
-        const sourceItems = isLeft ? leftSelected : rightSelected;
+        const rawItems = isLeft ? leftSelected : rightSelected;
+        const focused = isLeft ? leftFocused : rightFocused;
+        const sourceItems = (rawItems && rawItems.length > 0) ? rawItems : (focused ? [focused] : []);
         const currentDir = isLeft ? leftPath : rightPath;
 
         if (!sourceItems || sourceItems.length === 0) return;
@@ -315,14 +317,16 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
             showSuccess(`${t('common.success')}: ${deleted} ${t('common.items')}`);
             if (isLeft) {
                 setLeftSelected([]);
+                setLeftFocused(null);
             } else {
                 setRightSelected([]);
+                setRightFocused(null);
             }
             loadPaneDirectory(activePane, currentDir);
         }
     };
 
-    // Keyboard shortcuts (F5: copy, F6: move, Tab: switch pane, Delete: delete, Backspace: up, Ctrl+A: select all)
+    // Keyboard shortcuts (F5: copy, F6: move, Tab: switch pane, Delete: delete, Backspace: up, Ctrl+A: select all, F2: rename)
     useEffect(() => {
         const handleKeyDown = (e) => {
             if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target.isContentEditable) return;
@@ -339,6 +343,17 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
             } else if (e.key === 'Delete') {
                 e.preventDefault();
                 handleDeleteSelected();
+            } else if (e.key === 'F2') {
+                const isLeft = activePane === 'left';
+                const rawItems = isLeft ? leftSelected : rightSelected;
+                const focused = isLeft ? leftFocused : rightFocused;
+                const target = (rawItems && rawItems.length === 1) ? rawItems[0] : (focused || null);
+                if (target) {
+                    e.preventDefault();
+                    document.dispatchEvent(new CustomEvent('open-rename-modal', {
+                        detail: { item: target }
+                    }));
+                }
             } else if (e.key === 'Backspace' || (e.altKey && e.key === 'ArrowUp')) {
                 e.preventDefault();
                 handleGoUp(activePane);
@@ -368,7 +383,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [activePane, leftSelected, rightSelected, leftPath, rightPath, leftDirData, rightDirData, handleCopyToOpposite, handleMoveToOpposite, handleGoUp, handleDeleteSelected]);
+    }, [activePane, leftSelected, rightSelected, leftFocused, rightFocused, leftPath, rightPath, leftDirData, rightDirData, handleCopyToOpposite, handleMoveToOpposite, handleGoUp, handleDeleteSelected]);
 
     // Selection handlers for left pane
     const handleLeftSelect = (item, multi) => {

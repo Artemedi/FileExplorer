@@ -301,6 +301,16 @@ const FileList = ({
         const clickedItem = e.target.closest('[data-path]');
         const item = clickedItem ? currentSortedItems.find(item => item.path === clickedItem.dataset.path) : null;
 
+        if (item) {
+            const isAlreadySelected = selectedItems.some(s => s.path === item.path);
+            if (!isAlreadySelected) {
+                selectMultiple([item]);
+                const idx = currentSortedItems.findIndex(i => i.path === item.path);
+                setLastSelectedIndex(idx);
+            }
+            setFocusedItem(item);
+        }
+
         openContextMenu(e, item);
     };
 
@@ -426,7 +436,8 @@ const FileList = ({
                         const targetItem = focusedItem || (selectedItems && selectedItems.length === 1 ? selectedItems[0] : null);
                         if (targetItem) {
                             e.preventDefault();
-                            if (targetItem.isDirectory) {
+                            const isDir = Boolean(targetItem.isDirectory || 'sub_file_count' in targetItem || targetItem.is_directory);
+                            if (isDir) {
                                 loadDirectory(targetItem.path);
                             } else {
                                 openFile(targetItem.path);
@@ -438,10 +449,14 @@ const FileList = ({
 
                 const item = sortedItems[newFocusedIndex];
                 if (moved && item) {
-                    if (e.shiftKey && lastSelectedIndex !== -1) {
-                        // Shift+Arrow: select range from lastSelectedIndex to newFocusedIndex
-                        const start = Math.min(lastSelectedIndex, newFocusedIndex);
-                        const end = Math.max(lastSelectedIndex, newFocusedIndex);
+                    if (e.shiftKey) {
+                        // Shift+Arrow: select range from anchor to newFocusedIndex
+                        const anchor = lastSelectedIndex !== -1 ? lastSelectedIndex : (currentFocusedIndex !== -1 ? currentFocusedIndex : 0);
+                        if (lastSelectedIndex === -1) {
+                            setLastSelectedIndex(anchor);
+                        }
+                        const start = Math.min(anchor, newFocusedIndex);
+                        const end = Math.max(anchor, newFocusedIndex);
                         const itemsToSelect = sortedItems.slice(start, end + 1);
                         selectMultiple(itemsToSelect);
                     } else if (e.ctrlKey || e.metaKey) {
@@ -595,13 +610,16 @@ const FileList = ({
      * @param {number} index - Index of the clicked item
      * @param {boolean} [isDoubleClick=false] - Whether this is a double-click
      */
-    const handleItemClick = (item, index, isDoubleClick = false) => {
+    const handleItemClick = (e, item, index, isDoubleClick = false) => {
+        if (!item) return;
+
         // Always set the focused item when clicking on it
         setFocusedItem(item);
 
         // For double-click, open the item
         if (isDoubleClick) {
-            if (item.isDirectory) {
+            const isDir = Boolean(item.isDirectory || 'sub_file_count' in item || item.is_directory);
+            if (isDir) {
                 loadDirectory(item.path);
             } else {
                 openFile(item.path);
@@ -609,22 +627,24 @@ const FileList = ({
             return;
         }
 
-        // For single click, handle selection
+        // For single click, handle selection safely with MouseEvent
         const isAlreadySelected = selectedItems.some(selected => selected.path === item.path);
-        const isShift = (e && e.shiftKey) || isShiftKeyPressed;
-        const isCtrl = (e && (e.ctrlKey || e.metaKey)) || isCtrlKeyPressed;
+        const isShift = Boolean(e?.shiftKey || isShiftKeyPressed);
+        const isCtrl = Boolean(e?.ctrlKey || e?.metaKey || isCtrlKeyPressed);
 
         if (isShift) {
             // Find anchor index for shift selection
             let anchor = lastSelectedIndex;
-            if (anchor === -1) {
+            if (anchor === -1 || anchor >= sortedItems.length) {
                 if (selectedItems.length > 0) {
-                    anchor = sortedItems.findIndex(i => i.path === selectedItems[0].path);
+                    const found = sortedItems.findIndex(i => i.path === selectedItems[0].path);
+                    if (found !== -1) anchor = found;
                 } else if (focusedItem) {
-                    anchor = sortedItems.findIndex(i => i.path === focusedItem.path);
+                    const found = sortedItems.findIndex(i => i.path === focusedItem.path);
+                    if (found !== -1) anchor = found;
                 }
             }
-            if (anchor === -1) {
+            if (anchor === -1 || anchor >= sortedItems.length) {
                 anchor = 0;
             }
 
@@ -649,16 +669,10 @@ const FileList = ({
             setLastSelectedIndex(index);
             setFocusedItem(item);
         } else {
-            // Single selection without modifiers
-            if (isAlreadySelected && selectedItems.length === 1) {
-                // If clicking on the only selected item, deselect it
-                clearSelection();
-                setLastSelectedIndex(-1);
-            } else {
-                selectMultiple([item]);
-                setLastSelectedIndex(index);
-                setFocusedItem(item);
-            }
+            // Single selection without modifiers (keeps selected item selected)
+            selectMultiple([item]);
+            setLastSelectedIndex(index);
+            setFocusedItem(item);
         }
     };
 
@@ -723,8 +737,8 @@ const FileList = ({
                             viewMode={viewMode}
                             isSelected={selectedItems.some(selected => selected.path === item.path)}
                             isFocused={focusedItem && focusedItem.path === item.path}
-                            onClick={(e) => handleItemClick(item, index)}
-                            onDoubleClick={() => handleItemClick(item, index, true)}
+                            onClick={(e) => handleItemClick(e, item, index, false)}
+                            onDoubleClick={(e) => handleItemClick(e, item, index, true)}
                             onContextMenu={handleContextMenu}
                         />
                     ))}
