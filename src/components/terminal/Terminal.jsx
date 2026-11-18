@@ -3,7 +3,74 @@ import { invoke } from '@tauri-apps/api/core';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useSettings } from '../../providers/SettingsProvider';
 import Icon from '../common/Icon';
+import { joinPath } from '../../utils/pathUtils';
 import './terminal.css';
+
+const escapeHtml = (str) => String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const parsePrompt = (promptStr = '') => {
+    const atIdx = promptStr.indexOf('@');
+    const colonIdx = promptStr.indexOf(':', atIdx + 1);
+    const user = atIdx !== -1 ? promptStr.slice(0, atIdx) : 'user';
+    const host = colonIdx !== -1
+        ? promptStr.slice(atIdx + 1, colonIdx)
+        : (atIdx !== -1 ? promptStr.slice(atIdx + 1) : 'localhost');
+    let path = colonIdx !== -1 ? promptStr.slice(colonIdx + 1) : '/';
+    if (path.endsWith('$')) {
+        path = path.slice(0, -1);
+    }
+    return { user, host, path };
+};
+
+const resolveTerminalCdPath = (targetPath, basePath) => {
+    const rawTarget = (targetPath || '').trim();
+    const isWindowsDrive = /^[A-Za-z]:/.test(rawTarget) || (!rawTarget.startsWith('/') && /^[A-Za-z]:/.test(basePath || ''));
+
+    let combined;
+    if (/^[A-Za-z]:/.test(rawTarget) || rawTarget.startsWith('/')) {
+        combined = rawTarget;
+    } else if (/^\\\\/.test(rawTarget)) {
+        combined = rawTarget;
+    } else {
+        const base = basePath || '/';
+        const normalizedBase = base.replace(/[/\\]+$/, '') || (base.startsWith('/') ? '/' : '');
+        combined = normalizedBase === '/' ? `/${rawTarget}` : `${normalizedBase}/${rawTarget}`;
+    }
+
+    if (isWindowsDrive || /^[A-Za-z]:/.test(combined)) {
+        const driveMatch = combined.match(/^([A-Za-z]:)(.*)$/);
+        const drive = driveMatch ? driveMatch[1] : '';
+        const rest = driveMatch ? driveMatch[2] : combined;
+        const parts = rest.split(/[/\\]+/);
+        const stack = [];
+        for (const part of parts) {
+            if (!part || part === '.') continue;
+            if (part === '..') {
+                if (stack.length > 0) stack.pop();
+            } else {
+                stack.push(part);
+            }
+        }
+        return stack.length > 0 ? `${drive}\\${stack.join('\\')}` : `${drive}\\`;
+    }
+
+    const parts = combined.split('/');
+    const stack = [];
+    for (const part of parts) {
+        if (!part || part === '.') continue;
+        if (part === '..') {
+            if (stack.length > 0) stack.pop();
+        } else {
+            stack.push(part);
+        }
+    }
+    return stack.length > 0 ? '/' + stack.join('/') : '/';
+};
 
 /**
  * Terminal component - Provides a command-line interface within the application
@@ -155,12 +222,12 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
             const commandPromise = isLongRunning 
                 ? invoke('execute_command_with_timeout', { 
                     command, 
-                    working_directory: currentPath,
-                    timeout_seconds: 30
+                    workingDirectory: currentPath,
+                    timeoutSeconds: 30
                 })
                 : invoke('execute_command_improved', { 
                     command, 
-                    working_directory: currentPath 
+                    workingDirectory: currentPath 
                 });
             const cancelPromise = new Promise((_, reject) => {
                 controller.signal.addEventListener('abort', () => {
@@ -378,8 +445,8 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                         // No argument provided - go to home directory
                         try {
                             const homeResult = await invoke('execute_command_improved', {
-                                command: process.platform === 'win32' ? 'echo %USERPROFILE%' : 'echo $HOME',
-                                working_directory: null
+                                command: 'echo $HOME',
+                                workingDirectory: null
                             });
                             
                             let homeDir;
@@ -404,7 +471,7 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                     }
 
                     let targetPath = args[0];
-                    let resolvedPath;
+                    let finalPath;
                     
                     console.log('[Terminal cd] Input:', targetPath, 'Current path:', currentPath);
                     
@@ -412,45 +479,20 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                     if (targetPath === '~') {
                         // Handle home directory
                         const homeResult = await invoke('execute_command_improved', {
-                            command: process.platform === 'win32' ? 'echo %USERPROFILE%' : 'echo $HOME',
-                            working_directory: null
+                            command: 'echo $HOME',
+                            workingDirectory: null
                         });
                         if (typeof homeResult === 'string') {
                             const parsed = JSON.parse(homeResult);
-                            resolvedPath = parsed.stdout.trim();
+                            finalPath = parsed.stdout.trim();
                         }
-                    } else if (targetPath.startsWith('/') || targetPath.match(/^[A-Za-z]:/)) {
-                        // Absolute path - use as is
-                        resolvedPath = targetPath;
                     } else {
-                        // Relative path - build from current path
-                        const basePath = currentPath || '/';
-                        if (basePath === '/') {
-                            resolvedPath = '/' + targetPath;
-                        } else {
-                            resolvedPath = basePath + '/' + targetPath;
-                        }
+                        finalPath = resolveTerminalCdPath(targetPath, currentPath);
                     }
 
-                    // Clean up path - remove trailing slashes except for root
-                    if (resolvedPath.endsWith('/') && resolvedPath.length > 1) {
-                        resolvedPath = resolvedPath.slice(0, -1);
+                    if (!finalPath) {
+                        throw new Error('Could not resolve target directory');
                     }
-
-                    // Resolve . and .. segments
-                    const parts = resolvedPath.split('/');
-                    const stack = [];
-                    for (let part of parts) {
-                        if (part === '' || part === '.') continue;
-                        if (part === '..') {
-                            if (stack.length > 0) stack.pop();
-                        } else {
-                            stack.push(part);
-                        }
-                    }
-                    
-                    // Final path construction
-                    const finalPath = stack.length > 0 ? '/' + stack.join('/') : '/';
 
                     console.log('[Terminal cd] Resolved to:', finalPath);
 
@@ -596,8 +638,8 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                 }
                 try {
                     await invoke('create_directory', {
-                        folder_path_abs: currentPath,
-                        directory_name: args[0]
+                        folderPathAbs: currentPath,
+                        folderName: args[0]
                     });
                     return {
                         type: 'output',
@@ -619,8 +661,8 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                 }
                 try {
                     await invoke('create_file', {
-                        folder_path_abs: currentPath,
-                        file_name: args[0]
+                        folderPathAbs: currentPath,
+                        fileName: args[0]
                     });
                     return {
                         type: 'output',
@@ -641,8 +683,10 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                     };
                 }
                 try {
-                    const filePath = `${currentPath}/${args[0]}`;
-                    const content = await invoke('open_file', { file_path: filePath });
+                    const filePath = (/^[A-Za-z]:/.test(args[0]) || args[0].startsWith('/'))
+                        ? args[0]
+                        : joinPath(currentPath || '/', args[0]);
+                    const content = await invoke('open_file', { path: filePath });
                     return {
                         type: 'output',
                         content: content,
@@ -723,7 +767,7 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                     try {
                         const testResult = await invoke('execute_command_improved', { 
                             command: `${searchCommand} --version`, 
-                            working_directory: currentPath 
+                            workingDirectory: currentPath 
                         });
                         return {
                             type: 'output',
@@ -831,46 +875,46 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
      * @returns {string} Formatted content with HTML-like structure
      */
     const formatOutput = (content, command = '') => {
-        if (!content || typeof content !== 'string') return content;
+        if (!content || typeof content !== 'string') return escapeHtml(content);
 
         // Format ls/dir output to highlight directories and files differently
         if (command.startsWith('ls') || command.startsWith('dir')) {
             return content.split(/\s+/).map(item => {
+                const safeItem = escapeHtml(item);
                 if (item.endsWith('/')) {
-                    return `<span class="terminal-directory">${item}</span>`;
+                    return `<span class="terminal-directory">${safeItem}</span>`;
                 } else if (item.includes('.')) {
-                    const ext = item.split('.').pop().toLowerCase();
-                    return `<span class="terminal-file terminal-file-${ext}">${item}</span>`;
+                    const ext = item.split('.').pop().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+                    return `<span class="terminal-file terminal-file-${ext}">${safeItem}</span>`;
                 } else {
-                    return `<span class="terminal-file">${item}</span>`;
+                    return `<span class="terminal-file">${safeItem}</span>`;
                 }
             }).join('  ');
         }
 
+        const escaped = escapeHtml(content);
+
         // For simple outputs like version numbers and paths, don't apply complex formatting
-        // This prevents issues with version numbers like "11.5.0" and path formatting in pwd
-        const isSimpleOutput = content.trim().match(/^[\d\.]+$/) || 
-                              content.trim().match(/^v?[\d\.]+(-[\w\.]+)?$/) ||
-                              content.trim().match(/^\/[\w\-\.\/]+$/) || // Unix absolute paths
-                              content.trim().match(/^[A-Za-z]:[\\\w\-\.\\]+$/); // Windows paths
+        const trimmed = content.trim();
+        const isSimpleOutput = trimmed.match(/^[\d.]+$/) || 
+                              trimmed.match(/^v?[\d.]+(-[\w.]+)?$/) ||
+                              trimmed.match(/^\/[\w\-./]+$/) || // Unix absolute paths
+                              trimmed.match(/^[A-Za-z]:[\\\w\-.\\]+$/); // Windows paths
         
         if (isSimpleOutput) {
-            return content;
+            return escaped;
         }
 
-        // Only apply formatting to more complex outputs
-        let formattedContent = content;
-        
-        // Format file paths (only if they look like actual paths in complex text)
-        formattedContent = formattedContent.replace(/\b([\/\\][\w\-\.\/\\]{3,})\b/g, '<span class="terminal-path">$1</span>');
-        
-        // Format URLs
-        formattedContent = formattedContent.replace(/(https?:\/\/[^\s]+)/g, '<span class="terminal-url">$1</span>');
-        
-        // Format quoted strings
-        formattedContent = formattedContent.replace(/["']([^"']+)["']/g, '<span class="terminal-string">"$1"</span>');
-        
-        return formattedContent;
+        // Apply URL, path, and quoted-string highlighting in a single pass so added <span> tags are never matched
+        return escaped.replace(
+            /(https?:\/\/[^\s<]+)|(&quot;[^&\n]*?&quot;)|(\b[\/\\][\w\-./\\]{3,}\b)/g,
+            (match, url, quoted, pathMatch) => {
+                if (url) return `<span class="terminal-url">${url}</span>`;
+                if (quoted) return `<span class="terminal-string">${quoted}</span>`;
+                if (pathMatch) return `<span class="terminal-path">${pathMatch}</span>`;
+                return match;
+            }
+        );
     };
 
     /**
@@ -1125,24 +1169,27 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                         className={`terminal-line terminal-${entry.type}`}
                     >
                         <div className="terminal-entry">
-                            {entry.type === 'command' && (
-                                <div className="terminal-command-line">
-                                    <span className="terminal-prompt-user">{entry.prompt.split('@')[0]}</span>
-                                    <span className="terminal-prompt-at">@</span>
-                                    <span className="terminal-prompt-host">{entry.prompt.split('@')[1].split(':')[0]}</span>
-                                    <span className="terminal-prompt-colon">:</span>
-                                    <span className="terminal-prompt-path">{entry.prompt.split(':')[1].replace('$', '')}</span>
-                                    <span className="terminal-prompt-dollar">$ </span>
-                                    <span className="terminal-command-text">{entry.content}</span>
-                                </div>
-                            )}
+                            {entry.type === 'command' && (() => {
+                                const promptParts = parsePrompt(entry.prompt);
+                                return (
+                                    <div className="terminal-command-line">
+                                        <span className="terminal-prompt-user">{promptParts.user}</span>
+                                        <span className="terminal-prompt-at">@</span>
+                                        <span className="terminal-prompt-host">{promptParts.host}</span>
+                                        <span className="terminal-prompt-colon">:</span>
+                                        <span className="terminal-prompt-path">{promptParts.path}</span>
+                                        <span className="terminal-prompt-dollar">$ </span>
+                                        <span className="terminal-command-text">{entry.content}</span>
+                                    </div>
+                                );
+                            })()}
                             {entry.type !== 'command' && (
                                 <pre 
                                     className="terminal-text"
                                     dangerouslySetInnerHTML={{ 
                                         __html: entry.type === 'output' && entry.originalCommand 
                                             ? formatOutput(entry.content, entry.originalCommand) 
-                                            : entry.content 
+                                            : escapeHtml(entry.content)
                                     }}
                                 ></pre>
                             )}
@@ -1152,16 +1199,19 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                 <form onSubmit={handleSubmit} className="terminal-input-line">
                     {isSearchMode ? (
                         <span className="terminal-prompt-search">(reverse-i-search) </span>
-                    ) : (
-                        <div className="terminal-current-prompt">
-                            <span className="terminal-prompt-user">{getPrompt().split('@')[0]}</span>
-                            <span className="terminal-prompt-at">@</span>
-                            <span className="terminal-prompt-host">{getPrompt().split('@')[1].split(':')[0]}</span>
-                            <span className="terminal-prompt-colon">:</span>
-                            <span className="terminal-prompt-path">{getPrompt().split(':')[1].replace('$', '')}</span>
-                            <span className="terminal-prompt-dollar">$ </span>
-                        </div>
-                    )}
+                    ) : (() => {
+                        const promptParts = parsePrompt(getPrompt());
+                        return (
+                            <div className="terminal-current-prompt">
+                                <span className="terminal-prompt-user">{promptParts.user}</span>
+                                <span className="terminal-prompt-at">@</span>
+                                <span className="terminal-prompt-host">{promptParts.host}</span>
+                                <span className="terminal-prompt-colon">:</span>
+                                <span className="terminal-prompt-path">{promptParts.path}</span>
+                                <span className="terminal-prompt-dollar">$ </span>
+                            </div>
+                        );
+                    })()}
                     <input
                         ref={inputRef}
                         type="text"

@@ -3,9 +3,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { useFileSystem } from './FileSystemProvider';
 import { useHistory } from './HistoryProvider';
 import { useSftp } from './SftpProvider';
+import { useSettings } from './SettingsProvider';
+import { getDirectoryPath, getFileName, joinPath } from '../utils/pathUtils';
 import { showNotification, showError, showSuccess, showConfirm } from '../utils/NotificationSystem';
 
-const ContextMenuContext = createContext({
+export const ContextMenuContext = createContext({
     isOpen: false,
     position: { x: 0, y: 0 },
     target: null,
@@ -26,6 +28,7 @@ export default function ContextMenuProvider({ children }) {
     const { selectedItems, loadDirectory, clearSelection, moveToTrash, currentDirData } = useFileSystem();
     const { currentPath } = useHistory();
     const { isSftpPath, parseSftpPath, copySftpItem, moveSftpItem, downloadAndOpenSftpFile } = useSftp();
+    const { settings } = useSettings();
 
     // Check if item is in favorites
     const isInFavorites = useCallback((item) => {
@@ -91,12 +94,13 @@ export default function ContextMenuProvider({ children }) {
         }
     }, []);
 
-    // Update navigation history with live update
+    // Update navigation history with live update (stored separately from HistoryProvider session stack)
     const updateNavigationHistory = useCallback((path) => {
+        if (!path) return;
         try {
-            const existingHistory = JSON.parse(sessionStorage.getItem('fileExplorerHistory') || '[]');
+            const existingHistory = JSON.parse(sessionStorage.getItem('fileExplorerRecentPaths') || '[]');
             const updatedHistory = [path, ...existingHistory.filter(p => p !== path)].slice(0, 10);
-            sessionStorage.setItem('fileExplorerHistory', JSON.stringify(updatedHistory));
+            sessionStorage.setItem('fileExplorerRecentPaths', JSON.stringify(updatedHistory));
 
             // Dispatch events to update quick access immediately
             window.dispatchEvent(new CustomEvent('navigation-changed'));
@@ -198,21 +202,29 @@ export default function ContextMenuProvider({ children }) {
 
     // Helper function to generate unique destination path
     const generateUniqueDestPath = useCallback(async (basePath, fileName) => {
-        const currentDir = currentDirData;
-        if (!currentDir) return `${basePath}/${fileName}`;
-
-        // Get all existing file and directory names in the current directory
-        const existingNames = new Set();
-        if (currentDir.files) {
-            currentDir.files.forEach(file => existingNames.add(file.name));
+        let targetDirData = basePath === currentPath ? currentDirData : null;
+        if (!targetDirData && basePath && !isSftpPath(basePath)) {
+            try {
+                const rawDir = await invoke('open_directory', { path: basePath });
+                targetDirData = rawDir ? JSON.parse(rawDir) : null;
+            } catch {
+                targetDirData = null;
+            }
         }
-        if (currentDir.directories) {
-            currentDir.directories.forEach(dir => existingNames.add(dir.name));
+        if (!targetDirData) return joinPath(basePath, fileName);
+
+        // Get all existing file and directory names in the destination directory
+        const existingNames = new Set();
+        if (targetDirData.files) {
+            targetDirData.files.forEach(file => existingNames.add(file.name));
+        }
+        if (targetDirData.directories) {
+            targetDirData.directories.forEach(dir => existingNames.add(dir.name));
         }
 
         // If the original name doesn't exist, use it
         if (!existingNames.has(fileName)) {
-            return `${basePath}/${fileName}`;
+            return joinPath(basePath, fileName);
         }
 
         // Extract file name and extension
@@ -235,30 +247,31 @@ export default function ContextMenuProvider({ children }) {
             counter++;
         } while (existingNames.has(uniqueName));
 
-        return `${basePath}/${uniqueName}`;
-    }, [currentDirData]);
+        return joinPath(basePath, uniqueName);
+    }, [currentDirData, currentPath, isSftpPath]);
 
-    // Paste items from clipboard - enhanced with SFTP support
-    const pasteFromClipboard = useCallback(async () => {
-        if (!clipboard.items.length || !currentPath) return;
+    // Paste items from clipboard - enhanced with SFTP support and target directory support
+    const pasteFromClipboard = useCallback(async (targetDirectory = null) => {
+        const destRoot = (typeof targetDirectory === 'string' && targetDirectory) ? targetDirectory : currentPath;
+        if (!clipboard.items.length || !destRoot) return;
 
         setIsProcessing(true);
         try {
             for (const item of clipboard.items) {
-                const fileName = item.name;
+                const fileName = item.name || getFileName(item.path);
                 const sourcePath = item.path;
 
                 // Check if source and/or destination are SFTP paths
                 const sourceIsSftp = isSftpPath(sourcePath);
-                const destIsSftp = isSftpPath(currentPath);
+                const destIsSftp = isSftpPath(destRoot);
 
                 if (clipboard.operation === 'cut') {
                     // For move operations, use original filename (no duplicates)
-                    const destPath = `${currentPath}/${fileName}`;
+                    const destPath = joinPath(destRoot, fileName);
                     
                     // Check if we're trying to paste in the same directory
-                    const sourceDir = sourcePath.substring(0, sourcePath.lastIndexOf('/')) || '/';
-                    const destDir = currentPath;
+                    const sourceDir = getDirectoryPath(sourcePath);
+                    const destDir = destRoot;
                     
                     if (sourceDir === destDir) {
                         continue;
@@ -282,7 +295,7 @@ export default function ContextMenuProvider({ children }) {
                     }
                 } else {
                     // Copy operation - generate unique destination path to allow duplicates
-                    const destPath = await generateUniqueDestPath(currentPath, fileName);
+                    const destPath = await generateUniqueDestPath(destRoot, fileName);
                     
                     if (sourceIsSftp || destIsSftp) {
                         if (sourceIsSftp && destIsSftp) {
@@ -294,10 +307,6 @@ export default function ContextMenuProvider({ children }) {
                         }
                     } else {
                         // Local file system copy
-                        console.log('DEBUG: About to invoke copy_file_or_dir with params:', {
-                            sourcePath: sourcePath,
-                            destinationPath: destPath
-                        });
                         await invoke('copy_file_or_dir', {
                             sourcePath: sourcePath,
                             destinationPath: destPath
@@ -312,7 +321,9 @@ export default function ContextMenuProvider({ children }) {
             }
 
             // Reload directory
-            await loadDirectory(currentPath);
+            if (currentPath) {
+                await loadDirectory(currentPath);
+            }
         } catch (error) {
             console.error('Paste operation failed:', error);
             showError(`Failed to paste: ${error.message || error}`);
@@ -325,12 +336,14 @@ export default function ContextMenuProvider({ children }) {
     const deleteItems = useCallback(async (items) => {
         if (!items.length) return;
 
-        const itemNames = items.map(item => item.name).join(', ');
-        const confirmMessage = `Are you sure you want to move ${items.length === 1 ? itemNames : `${items.length} items`} to trash?`;
+        if (settings?.confirm_delete !== false) {
+            const itemNames = items.map(item => item.name).join(', ');
+            const confirmMessage = `Are you sure you want to move ${items.length === 1 ? itemNames : `${items.length} items`} to trash?`;
 
-        // Use custom confirm dialog
-        const shouldDelete = await showConfirm(confirmMessage, 'Move to Trash');
-        if (!shouldDelete) return;
+            // Use custom confirm dialog
+            const shouldDelete = await showConfirm(confirmMessage, 'Move to Trash');
+            if (!shouldDelete) return;
+        }
 
         setIsProcessing(true);
         try {
@@ -344,7 +357,7 @@ export default function ContextMenuProvider({ children }) {
         } finally {
             setIsProcessing(false);
         }
-    }, [moveToTrash]);
+    }, [moveToTrash, settings?.confirm_delete]);
 
     // Rename item - dispatch event to open rename modal
     const renameItem = useCallback((item) => {
@@ -401,8 +414,9 @@ export default function ContextMenuProvider({ children }) {
                     tempPaths.push(tempPath);
                 }
                 
-                // Create temp zip file in system temp directory
-                const tempZipPath = `/tmp/${zipName}`; // Use a standard temp path
+                // Create temp zip file in the same directory as downloaded SFTP temp files
+                const tempDir = getDirectoryPath(tempPaths[0]);
+                const tempZipPath = joinPath(tempDir, zipName);
                 
                 // Create zip from downloaded files
                 await invoke('zip', {
@@ -415,8 +429,6 @@ export default function ContextMenuProvider({ children }) {
                     // Parse current SFTP path to get connection details
                     const parsed = parseSftpPath(currentPath);
                     if (parsed && parsed.connection) {
-                        const targetRemotePath = `${parsed.remotePath}/${zipName}`.replace(/\/+/g, '/');
-                        
                         // Upload the zip file (we'd need an upload function in SFTP provider)
                         // For now, we'll copy it to local temp and let user know
                         showSuccess(`ZIP created locally at: ${tempZipPath}. SFTP upload not yet implemented.`);
@@ -440,7 +452,7 @@ export default function ContextMenuProvider({ children }) {
         } else {
             // Handle local items (original logic)
             const sourcePaths = items.map(item => item.path);
-            destinationPath = `${currentPath}/${zipName}`;
+            destinationPath = joinPath(currentPath, zipName);
             
             setIsProcessing(true);
             try {
@@ -450,7 +462,7 @@ export default function ContextMenuProvider({ children }) {
                 });
 
                 await loadDirectory(currentPath);
-                showSuccess(`Successfully created ${destinationPath.split('/').pop()}`);
+                showSuccess(`Successfully created ${getFileName(destinationPath)}`);
             } catch (error) {
                 console.error('Zip operation failed:', error);
                 showError(`Failed to create zip: ${error.message || error}`);
@@ -474,8 +486,8 @@ export default function ContextMenuProvider({ children }) {
                     throw new Error('Failed to download SFTP zip file for extraction');
                 }
                 
-                // Extract to temp directory first
-                const tempExtractPath = '/tmp/extracted_' + Date.now();
+                // Extract to temp directory in the same OS temp dir as tempZipPath
+                const tempExtractPath = joinPath(getDirectoryPath(tempZipPath), 'extracted_' + Date.now());
                 
                 await invoke('unzip', {
                     zipPaths: [tempZipPath],
@@ -750,11 +762,13 @@ export default function ContextMenuProvider({ children }) {
     }, [getCurrentFolderMetadata]);
 
     // Generate menu items
-    const getMenuItemsForContext = useCallback((contextTarget) => {
+    const getMenuItemsForContext = useCallback((contextTarget, overrideSelectedItems = null) => {
         const isDirectory = contextTarget && (contextTarget.isDirectory || ('sub_file_count' in contextTarget));
         const isFile = contextTarget && !isDirectory;
         const hasClipboard = clipboard.items.length > 0;
         const isZipFile = contextTarget && contextTarget.name.toLowerCase().endsWith('.zip');
+        const effectiveSelectedItems = Array.isArray(overrideSelectedItems) ? overrideSelectedItems : selectedItems;
+        const selectionCount = contextTarget ? (effectiveSelectedItems.length || 1) : 0;
 
         // Empty space context menu
         if (!contextTarget) {
@@ -764,7 +778,7 @@ export default function ContextMenuProvider({ children }) {
                     label: 'Paste',
                     icon: 'paste',
                     disabled: !hasClipboard || isProcessing,
-                    action: pasteFromClipboard
+                    action: () => pasteFromClipboard(currentPath)
                 },
                 { type: 'separator' },
                 {
@@ -801,7 +815,7 @@ export default function ContextMenuProvider({ children }) {
         }
 
         // File/folder context menu
-        const targetItems = selectedItems.length > 1 ? selectedItems : [contextTarget];
+        const targetItems = selectionCount > 1 ? effectiveSelectedItems : [contextTarget];
         const itemIsInFavorites = isInFavorites(contextTarget);
 
         const menuItems = [
@@ -809,7 +823,7 @@ export default function ContextMenuProvider({ children }) {
                 id: 'open',
                 label: 'Open',
                 icon: 'open',
-                disabled: selectedItems.length > 1,
+                disabled: selectionCount > 1,
                 action: async () => {
                     if (isDirectory) {
                         await loadDirectory(contextTarget.path);
@@ -850,14 +864,14 @@ export default function ContextMenuProvider({ children }) {
                 label: 'Paste',
                 icon: 'paste',
                 disabled: !hasClipboard || !isDirectory || isProcessing,
-                action: pasteFromClipboard
+                action: () => pasteFromClipboard(contextTarget.path)
             },
             { type: 'separator' },
             {
                 id: 'copy-path',
                 label: 'Copy Path',
                 icon: 'copy',
-                disabled: selectedItems.length > 1 || isProcessing,
+                disabled: selectionCount > 1 || isProcessing,
                 action: () => copyPath(contextTarget)
             },
             { type: 'separator' },
@@ -865,7 +879,7 @@ export default function ContextMenuProvider({ children }) {
                 id: 'rename',
                 label: 'Rename',
                 icon: 'rename',
-                disabled: selectedItems.length > 1 || isProcessing,
+                disabled: selectionCount > 1 || isProcessing,
                 action: () => renameItem(contextTarget)
             },
             {
@@ -878,7 +892,7 @@ export default function ContextMenuProvider({ children }) {
         ];
 
         // Add "Add as Template" for files only
-        if (isFile && selectedItems.length === 1) {
+        if (isFile && selectionCount === 1) {
             menuItems.push(
                 { type: 'separator' },
                 {
@@ -892,7 +906,7 @@ export default function ContextMenuProvider({ children }) {
         }
 
         // Add zip/unzip options
-        if (isZipFile && selectedItems.length === 1) {
+        if (isZipFile && selectionCount === 1) {
             menuItems.push(
                 { type: 'separator' },
                 {
@@ -908,7 +922,7 @@ export default function ContextMenuProvider({ children }) {
                 { type: 'separator' },
                 {
                     id: 'compress',
-                    label: selectedItems.length > 1 ? 'Add to Archive...' : 'Compress to ZIP',
+                    label: selectionCount > 1 ? 'Add to Archive...' : 'Compress to ZIP',
                     icon: 'compress',
                     disabled: isProcessing,
                     action: () => zipItems(targetItems)
@@ -916,8 +930,8 @@ export default function ContextMenuProvider({ children }) {
             );
         }
 
-        // Add hash options for files only - as submenu - MIT DEBUG
-        if (isFile && selectedItems.length === 1) {
+        // Add hash options for files only - as submenu
+        if (isFile && selectionCount === 1) {
             console.log('🔨 Adding hash submenu for file:', contextTarget.name);
             menuItems.push(
                 { type: 'separator' },
@@ -970,7 +984,7 @@ export default function ContextMenuProvider({ children }) {
                 id: itemIsInFavorites ? 'remove-from-favorites' : 'add-to-favorites',
                 label: itemIsInFavorites ? 'Remove from Favorites' : 'Add to Favorites',
                 icon: 'star',
-                disabled: selectedItems.length > 1,
+                disabled: selectionCount > 1,
                 action: () => {
                     if (itemIsInFavorites) {
                         removeFromFavorites(contextTarget.path);
@@ -988,7 +1002,7 @@ export default function ContextMenuProvider({ children }) {
                 id: 'properties',
                 label: 'Properties',
                 icon: 'properties',
-                disabled: selectedItems.length > 1,
+                disabled: selectionCount > 1,
                 action: () => showProperties(contextTarget)
             }
         );
@@ -997,12 +1011,12 @@ export default function ContextMenuProvider({ children }) {
     }, [selectedItems, clipboard, isProcessing, currentPath, copyToClipboard, cutToClipboard, pasteFromClipboard, deleteItems, renameItem, loadDirectory, showProperties, addToFavorites, removeFromFavorites, updateNavigationHistory, zipItems, unzipItem, isInFavorites, getCurrentFolderMetadata, generateHash, generateHashToFile, compareHash, copyPath, addAsTemplate, isSftpPath, downloadAndOpenSftpFile, parseSftpPath]);
 
     // Open context menu
-    const openContextMenu = useCallback((e, contextTarget = null) => {
+    const openContextMenu = useCallback((e, contextTarget = null, overrideSelectedItems = null) => {
         e.preventDefault();
 
         console.log('🎯 Opening context menu for:', contextTarget?.name || 'empty space');
 
-        const menuItems = getMenuItemsForContext(contextTarget);
+        const menuItems = getMenuItemsForContext(contextTarget, overrideSelectedItems);
 
         setPosition({ x: e.clientX, y: e.clientY });
         setTarget(contextTarget);

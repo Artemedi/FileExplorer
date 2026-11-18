@@ -15,4 +15,5 @@ const useContextMenu = () => {
     return context;
 };
 
+export { useContextMenu };
 export default useContextMenu;

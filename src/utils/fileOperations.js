@@ -1,12 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
+import { getDirectoryPath, getFileName, joinPath } from './pathUtils';
 
 /**
- * Open a file with the default application.
+ * Open a file and read its text contents.
  * @param {string} filePath - The path to the file to open.
- * @returns {Promise<void>}
+ * @returns {Promise<string>}
  */
 export const openFile = async (filePath) => {
-    return invoke('open_file', { file_path: filePath });
+    return invoke('open_file', { path: filePath });
 };
 
 /**
@@ -26,8 +27,8 @@ export const openInDefaultApp = async (filePath) => {
  */
 export const createFile = async (folderPath, fileName) => {
     return invoke('create_file', {
-        folder_path_abs: folderPath,
-        file_name: fileName
+        folderPathAbs: folderPath,
+        fileName: fileName
     });
 };
 
@@ -39,8 +40,8 @@ export const createFile = async (folderPath, fileName) => {
  */
 export const createDirectory = async (folderPath, directoryName) => {
     return invoke('create_directory', {
-        folder_path_abs: folderPath,
-        directory_name: directoryName
+        folderPathAbs: folderPath,
+        folderName: directoryName
     });
 };
 
@@ -53,8 +54,8 @@ export const createDirectory = async (folderPath, directoryName) => {
  */
 export const copyItem = async (sourcePath, destinationPath) => {
     return invoke('copy_file_or_dir', {
-        source_path: sourcePath,
-        destination_path: destinationPath
+        sourcePath: sourcePath,
+        destinationPath: destinationPath
     });
 };
 
@@ -65,7 +66,7 @@ export const copyItem = async (sourcePath, destinationPath) => {
  * @returns {Promise<void>}
  */
 export const renameItem = async (oldPath, newPath) => {
-    return invoke('rename', { old_path: oldPath, new_path: newPath });
+    return invoke('rename', { oldPath: oldPath, newPath: newPath });
 };
 
 /**
@@ -104,8 +105,8 @@ export const getSystemVolumes = async () => {
  */
 export const zipItems = async (sourcePaths, destinationPath = null) => {
     return invoke('zip', {
-        source_paths: sourcePaths,
-        destination_path: destinationPath
+        sourcePaths: sourcePaths,
+        destinationPath: destinationPath
     });
 };
 
@@ -117,8 +118,8 @@ export const zipItems = async (sourcePaths, destinationPath = null) => {
  */
 export const unzipItem = async (zipPath, destinationPath = null) => {
     return invoke('unzip', {
-        zip_paths: [zipPath],
-        destination_path: destinationPath
+        zipPaths: [zipPath],
+        destinationPath: destinationPath
     });
 };
 
@@ -179,8 +180,8 @@ export const generateHash = async (path) => {
  */
 export const copyMultipleItems = async (sourcePaths, destinationPath) => {
     const copyPromises = sourcePaths.map(sourcePath => {
-        const fileName = sourcePath.split('/').pop();
-        const destPath = `${destinationPath}/${fileName}`;
+        const fileName = getFileName(sourcePath);
+        const destPath = joinPath(destinationPath, fileName);
         return copyItem(sourcePath, destPath);
     });
 
@@ -195,8 +196,8 @@ export const copyMultipleItems = async (sourcePaths, destinationPath) => {
  */
 export const moveMultipleItems = async (sourcePaths, destinationPath) => {
     const movePromises = sourcePaths.map(sourcePath => {
-        const fileName = sourcePath.split('/').pop();
-        const destPath = `${destinationPath}/${fileName}`;
+        const fileName = getFileName(sourcePath);
+        const destPath = joinPath(destinationPath, fileName);
         return renameItem(sourcePath, destPath);
     });
 
@@ -211,8 +212,8 @@ export const moveMultipleItems = async (sourcePaths, destinationPath) => {
 export const getItemInfo = async (path) => {
     // This would need a specific endpoint in the backend
     // For now, we can use the directory endpoint and find the item
-    const parentPath = path.substring(0, path.lastIndexOf('/'));
-    const itemName = path.substring(path.lastIndexOf('/') + 1);
+    const parentPath = getDirectoryPath(path);
+    const itemName = getFileName(path);
 
     const dirContent = await loadDirectory(parentPath);
 

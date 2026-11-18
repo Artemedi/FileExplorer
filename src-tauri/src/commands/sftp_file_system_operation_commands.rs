@@ -469,7 +469,11 @@ pub fn build_preview_sftp(
         let mut text = cow.to_string();
         let mut truncated = false;
         if text.len() > 200_000 {
-            text.truncate(200_000);
+            let mut cut = 200_000;
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
             text.push_str("\n…(truncated)");
             truncated = true;
         }

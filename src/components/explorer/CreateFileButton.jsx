@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
+import { showConfirm, showError } from '../../utils/NotificationSystem';
 import Modal from '../common/Modal';
 import Button from '../common/Button';
 import './createFileButton.css';
@@ -16,7 +17,6 @@ const CreateFileButton = () => {
     const [itemName, setItemName] = useState('');
     const dropdownRef = useRef(null);
     const inputRef = useRef(null);
-    const skipNextToggle = useRef(false);
 
     const { createFile, createDirectory } = useFileSystem();
     const { currentPath } = useHistory();
@@ -45,12 +45,7 @@ const CreateFileButton = () => {
     /**
      * Toggles the dropdown menu
      */
-    // Prevent immediate reopen after closing
     const toggleDropdown = () => {
-        if (skipNextToggle.current) {
-            skipNextToggle.current = false;
-            return;
-        }
         setIsDropdownOpen(prev => !prev);
     };
 
@@ -59,7 +54,6 @@ const CreateFileButton = () => {
      */
     const closeDropdown = () => {
         setIsDropdownOpen(false);
-        skipNextToggle.current = true;
     };
 
     /**
@@ -71,7 +65,6 @@ const CreateFileButton = () => {
         setItemName(getDefaultName(type));
         setIsCreateModalOpen(true);
         closeDropdown();
-        skipNextToggle.current = false;
 
         // Focus input on next render
         setTimeout(() => {
@@ -106,21 +99,25 @@ const CreateFileButton = () => {
         if (!itemName.trim()) return;
 
         try {
+            let ok = true;
             if (creationType === 'file') {
-                await createFile(currentPath, itemName);
+                ok = await createFile(currentPath, itemName.trim());
             } else if (creationType === 'folder') {
-                await createDirectory(currentPath, itemName);
+                ok = await createDirectory(currentPath, itemName.trim());
             }
 
-            setIsCreateModalOpen(false);
-            setItemName('');
+            if (ok !== false) {
+                setIsCreateModalOpen(false);
+                setItemName('');
+            }
         } catch (error) {
             console.error('Failed to create item:', error);
 
             // Check for specific error types
             if (error.message && error.message.includes('already exists')) {
-                const shouldCreateCopy = confirm(
-                    `An item named "${itemName}" already exists. Would you like to create a copy instead?`
+                const shouldCreateCopy = await showConfirm(
+                    `An item named "${itemName}" already exists. Would you like to create a copy instead?`,
+                    'Item Already Exists'
                 );
 
                 if (shouldCreateCopy) {
@@ -131,7 +128,7 @@ const CreateFileButton = () => {
                     return; // Don't close modal, let user try again
                 }
             } else {
-                alert(`Failed to create ${creationType}: ${error.message || error}`);
+                showError(`Failed to create ${creationType}: ${error.message || error}`);
             }
         }
     };
@@ -167,7 +164,7 @@ const CreateFileButton = () => {
 
     return (
         <>
-            <div className="create-file-container">
+            <div className="create-file-container" ref={dropdownRef}>
                 <button
                     className="create-button"
                     onClick={toggleDropdown}
@@ -181,7 +178,7 @@ const CreateFileButton = () => {
                 </button>
 
                 {isDropdownOpen && (
-                    <div className="create-dropdown" ref={dropdownRef}>
+                    <div className="create-dropdown">
                         <ul className="create-options">
                             <li>
                                 <button
@@ -210,7 +207,6 @@ const CreateFileButton = () => {
                                     onClick={() => {
                                         document.dispatchEvent(new CustomEvent('open-templates'));
                                         closeDropdown();
-                                        skipNextToggle.current = false;
                                     }}
                                 >
                                     <span className="icon icon-template"></span>

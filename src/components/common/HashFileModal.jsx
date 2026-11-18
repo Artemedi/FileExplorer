@@ -28,12 +28,13 @@ const HashFileModal = ({ isOpen, onClose, item }) => {
      */
     useEffect(() => {
         if (isOpen && item) {
-            setFileName(`${item.name}.hash`);
+            const initialName = `${item.name}.hash`;
+            setFileName(initialName);
             // Focus and select filename without extension
             setTimeout(() => {
                 if (inputRef.current) {
                     inputRef.current.focus();
-                    const lastDotIndex = fileName.lastIndexOf('.');
+                    const lastDotIndex = initialName.lastIndexOf('.');
                     if (lastDotIndex > 0) {
                         inputRef.current.setSelectionRange(0, lastDotIndex);
                     } else {
@@ -42,7 +43,7 @@ const HashFileModal = ({ isOpen, onClose, item }) => {
                 }
             }, 100);
         }
-    }, [isOpen, item, fileName]);
+    }, [isOpen, item]);
 
     /**
      * Handle form submission to generate hash file

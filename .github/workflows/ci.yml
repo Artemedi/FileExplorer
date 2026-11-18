@@ -30,6 +30,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Run tests
+        run: npm test
+
       - name: Build frontend
         run: npm run build
 

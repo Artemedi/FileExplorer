@@ -395,7 +395,7 @@ pub async fn get_indexing_progress(
         progress.files_indexed,
         progress.files_discovered,
         progress.percentage_complete,
-        progress.current_path.as_ref().and_then(|p| p.split('/').last()).unwrap_or(""),
+        progress.current_path.as_ref().and_then(|p| p.split(&['/', '\\'][..]).last()).unwrap_or(""),
         data.status
     );
 
@@ -782,7 +782,7 @@ pub fn get_suggestions_impl(
             for (path, _score) in search_results.into_iter().take(limit * 3) { // Get more results to filter from
                 
                 // Extract filename suggestions
-                if let Some(filename) = path.split('/').last() {
+                if let Some(filename) = path.split(&['/', '\\'][..]).last() {
                     // Only suggest if filename starts with prefix (case-insensitive)
                     if filename.to_lowercase().starts_with(&prefix.to_lowercase()) && 
                        !seen_suggestions.contains(filename) &&
@@ -793,7 +793,7 @@ pub fn get_suggestions_impl(
                 }
                 
                 // Extract directory name suggestions from path components
-                let path_components: Vec<&str> = path.split('/').collect();
+                let path_components: Vec<&str> = path.split(&['/', '\\'][..]).collect();
                 for component in path_components {
                     if component.to_lowercase().starts_with(&prefix.to_lowercase()) && 
                        !seen_suggestions.contains(component) &&

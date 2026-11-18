@@ -49,7 +49,9 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
             const selectedPath = await open({
                 directory: true,
                 title: `Browse to your ${folderName} folder`,
-                defaultPath: expectedPath ? expectedPath.substring(0, expectedPath.lastIndexOf('/')) : undefined
+                defaultPath: expectedPath
+                    ? (expectedPath.substring(0, Math.max(expectedPath.lastIndexOf('/'), expectedPath.lastIndexOf('\\'))) || undefined)
+                    : undefined
             });
             
             if (selectedPath) {
@@ -73,12 +75,14 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
     React.useEffect(() => {
         loadSftpConnections();
         const handler = () => loadSftpConnections();
-        window.addEventListener('sftp-connections-updated', handler);
-        window.addEventListener('storage', (e) => {
+        const storageHandler = (e) => {
             if (e.key === 'fileExplorerSftpConnections') loadSftpConnections();
-        });
+        };
+        window.addEventListener('sftp-connections-updated', handler);
+        window.addEventListener('storage', storageHandler);
         return () => {
             window.removeEventListener('sftp-connections-updated', handler);
+            window.removeEventListener('storage', storageHandler);
         };
     }, [loadSftpConnections]);
 
@@ -112,9 +116,9 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                 key: 'fileExplorerSftpConnections',
                 newValue: JSON.stringify(newConnections)
             }));
-            showSuccess('SFTP COnnection "${name}" removed successfully.', 'success');
+            showSuccess(`SFTP connection "${name}" removed successfully.`);
         } catch (err) {
-            showError('Failed to remove SFTP connection: ' + err.message, 'error');
+            showError('Failed to remove SFTP connection: ' + err.message);
         }
     };
 
@@ -125,7 +129,8 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
             quickAccess: false,
             thisPC: false,
             favorites: false,
-            drives: false
+            drives: false,
+            network: false
         };
     });
 
@@ -195,11 +200,11 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
             }
         }
         
-        // Always update navigation history and reload directory, even if path is the same
+        // Always update recent paths for quick access (without clobbering HistoryProvider session stack)
         try {
-            const existingHistory = JSON.parse(sessionStorage.getItem('fileExplorerHistory') || '[]');
+            const existingHistory = JSON.parse(sessionStorage.getItem('fileExplorerRecentPaths') || '[]');
             const updatedHistory = [targetPath, ...existingHistory.filter(p => p !== targetPath)].slice(0, 10);
-            sessionStorage.setItem('fileExplorerHistory', JSON.stringify(updatedHistory));
+            sessionStorage.setItem('fileExplorerRecentPaths', JSON.stringify(updatedHistory));
 
             // Dispatch events to update quick access immediately
             window.dispatchEvent(new CustomEvent('navigation-changed'));
@@ -425,7 +430,6 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                                     path="this-pc"
                                     isActive={currentView === 'this-pc'}
                                     onClick={() => {
-                                        navigateTo(null); // Clear explorer path
                                         document.dispatchEvent(new CustomEvent('open-this-pc'));
                                     }}
                                 />
@@ -549,7 +553,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                                                         const commandResponse = JSON.parse(result);
                                                         
                                                         if (commandResponse.status === 0) {
-                                                            showSuccess(`${volume.volume_name} has been safely ejected.`, 'success');
+                                                            showSuccess(`${volume.volume_name} has been safely ejected.`);
                                                             // Reload volumes to update the UI after ejection
                                                             setTimeout(() => {
                                                                 loadVolumes();
@@ -569,7 +573,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                                                             // If not JSON, use as-is
                                                         }
                                                         
-                                                        showError(`Failed to eject ${volume.volume_name}: ${errorMessage}`, 'error');
+                                                        showError(`Failed to eject ${volume.volume_name}: ${errorMessage}`);
                                                     }
                                                 }
                                             }
@@ -580,7 +584,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                         )}
                     </section>
                     {/* Network section */}
-                    <section>
+                    <section className="sidebar-section">
                         <div className="sidebar-section-header">
                             <h3 className="sidebar-section-title">{t('nav.network')}</h3>
                             <div className="sidebar-section-actions">
@@ -682,7 +686,6 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                     <button
                         className="sidebar-action-button"
                         onClick={() => {
-                            navigateTo(null); // Clear explorer path
                             document.dispatchEvent(new CustomEvent('open-settings'));
                         }}
                         aria-label="Settings"
@@ -695,7 +698,6 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                     <button
                         className="sidebar-action-button"
                         onClick={() => {
-                            navigateTo(null); // Clear explorer path
                             document.dispatchEvent(new CustomEvent('open-templates'));
                         }}
                         aria-label="Templates"

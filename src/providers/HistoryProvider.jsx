@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 
 // Create history context
-const HistoryContext = createContext({
+export const HistoryContext = createContext({
     history: [],
     currentIndex: -1,
     currentPath: null,
@@ -13,9 +13,9 @@ const HistoryContext = createContext({
 });
 
 export default function HistoryProvider({ children }) {
-    // State for navigation history
-    const [history, setHistory] = useState([]);
-    const [currentIndex, setCurrentIndex] = useState(-1);
+    // Atomic state for navigation history to avoid index/array desync
+    const [navState, setNavState] = useState({ entries: [], index: -1 });
+    const { entries: history, index: currentIndex } = navState;
 
     // Derived state
     const currentPath = history[currentIndex] || null;
@@ -26,11 +26,13 @@ export default function HistoryProvider({ children }) {
     useEffect(() => {
         try {
             const savedHistory = JSON.parse(sessionStorage.getItem('fileExplorerHistory') || '[]');
-            const savedIndex = parseInt(sessionStorage.getItem('fileExplorerHistoryIndex') || '-1');
+            const savedIndex = parseInt(sessionStorage.getItem('fileExplorerHistoryIndex') || '-1', 10);
 
-            if (savedHistory.length) {
-                setHistory(savedHistory);
-                setCurrentIndex(savedIndex >= 0 ? savedIndex : 0);
+            if (Array.isArray(savedHistory) && savedHistory.length > 0) {
+                const clampedIndex = (Number.isInteger(savedIndex) && savedIndex >= 0 && savedIndex < savedHistory.length)
+                    ? savedIndex
+                    : savedHistory.length - 1;
+                setNavState({ entries: savedHistory, index: clampedIndex });
             }
         } catch (error) {
             console.error('Failed to load navigation history:', error);
@@ -39,7 +41,7 @@ export default function HistoryProvider({ children }) {
 
     // Save history to session storage when it changes
     useEffect(() => {
-        if (history.length) {
+        if (history.length > 0) {
             sessionStorage.setItem('fileExplorerHistory', JSON.stringify(history));
             sessionStorage.setItem('fileExplorerHistoryIndex', currentIndex.toString());
         }
@@ -47,33 +49,30 @@ export default function HistoryProvider({ children }) {
 
     // Navigate to a specific path
     const navigateTo = useCallback((path) => {
-        if (path === currentPath) return;
+        if (!path) return;
 
-        setHistory(prevHistory => {
-            // If we're not at the end of the history, trim the forward history
-            const newHistory = prevHistory.slice(0, currentIndex + 1);
+        setNavState(prev => {
+            const activePath = prev.entries[prev.index] || null;
+            if (path === activePath) return prev;
 
-            // Add the new path to history
-            newHistory.push(path);
-
-            // Set current index to the new end of history
-            setCurrentIndex(newHistory.length - 1);
-
-            return newHistory;
+            const trimmed = prev.index >= 0 ? prev.entries.slice(0, prev.index + 1) : [];
+            const nextEntries = [...trimmed, path];
+            return {
+                entries: nextEntries,
+                index: nextEntries.length - 1,
+            };
         });
-    }, [currentIndex, currentPath]);
+    }, []);
 
     // Navigate back in history
     const goBack = useCallback(() => {
-        if (!canGoBack) return;
-        setCurrentIndex(prevIndex => prevIndex - 1);
-    }, [canGoBack]);
+        setNavState(prev => (prev.index > 0 ? { ...prev, index: prev.index - 1 } : prev));
+    }, []);
 
     // Navigate forward in history
     const goForward = useCallback(() => {
-        if (!canGoForward) return;
-        setCurrentIndex(prevIndex => prevIndex + 1);
-    }, [canGoForward]);
+        setNavState(prev => (prev.index < prev.entries.length - 1 ? { ...prev, index: prev.index + 1 } : prev));
+    }, []);
 
     const contextValue = {
         history,

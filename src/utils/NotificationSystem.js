@@ -1,7 +1,7 @@
 /**
  * Simple notification system to replace browser alerts
  */
-import { formatErrorMessage } from './formatters.js';
+import { formatErrorMessage } from './formatters';
 
 let notificationContainer = null;
 
@@ -135,7 +135,9 @@ export const showConfirm = (message, title = 'Confirm') => {
 
         const dialog = document.createElement('div');
         dialog.style.cssText = `
-            background: #ffffff;
+            background: var(--bg-primary, #ffffff);
+            color: var(--text-primary, #1a1c1e);
+            border: 1px solid var(--border-color, #e0e4e8);
             border-radius: 8px;
             padding: 24px;
             max-width: 400px;
@@ -147,7 +149,7 @@ export const showConfirm = (message, title = 'Confirm') => {
         titleEl.textContent = title;
         titleEl.style.cssText = `
             margin: 0 0 16px 0;
-            color: #1a1c1e;
+            color: var(--text-primary, #1a1c1e);
             font-size: 18px;
         `;
 
@@ -155,7 +157,7 @@ export const showConfirm = (message, title = 'Confirm') => {
         messageEl.textContent = message;
         messageEl.style.cssText = `
             margin: 0 0 24px 0;
-            color: #4b5563;
+            color: var(--text-secondary, #4b5563);
             line-height: 1.5;
         `;
 
@@ -170,9 +172,9 @@ export const showConfirm = (message, title = 'Confirm') => {
         cancelBtn.textContent = 'Cancel';
         cancelBtn.style.cssText = `
             padding: 8px 16px;
-            border: 1px solid #e0e4e8;
+            border: 1px solid var(--border-color, #e0e4e8);
             background: transparent;
-            color: #1a1c1e;
+            color: var(--text-primary, #1a1c1e);
             border-radius: 6px;
             cursor: pointer;
         `;
@@ -182,13 +184,21 @@ export const showConfirm = (message, title = 'Confirm') => {
         confirmBtn.style.cssText = `
             padding: 8px 16px;
             border: none;
-            background: #0672ef;
+            background: var(--accent-primary, #0672ef);
             color: white;
             border-radius: 6px;
             cursor: pointer;
         `;
 
+        const handleKeyDown = (e) => {
+            if (e.key === 'Escape') {
+                cleanup();
+                resolve(false);
+            }
+        };
+
         const cleanup = () => {
+            document.removeEventListener('keydown', handleKeyDown);
             if (modal.parentNode) {
                 modal.parentNode.removeChild(modal);
             }
@@ -212,13 +222,6 @@ export const showConfirm = (message, title = 'Confirm') => {
         });
 
         // ESC key to cancel
-        const handleKeyDown = (e) => {
-            if (e.key === 'Escape') {
-                cleanup();
-                resolve(false);
-                document.removeEventListener('keydown', handleKeyDown);
-            }
-        };
         document.addEventListener('keydown', handleKeyDown);
 
         buttonContainer.appendChild(cancelBtn);

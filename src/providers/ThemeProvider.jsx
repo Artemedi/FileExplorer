@@ -1,8 +1,8 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 
 // Create context
-const ThemeContext = createContext({
+export const ThemeContext = createContext({
     theme: 'light',
     toggleTheme: () => {},
     setTheme: () => {},
@@ -14,9 +14,9 @@ export default function ThemeProvider({ children }) {
     const [isLoading, setIsLoading] = useState(true);
 
     // Function to apply theme to DOM
-    const applyThemeToDOM = (newTheme) => {
-        // Update DOM class
-        document.documentElement.classList.remove(`theme-${theme}`);
+    const applyThemeToDOM = useCallback((newTheme) => {
+        // Always remove both theme classes so classes never accumulate
+        document.documentElement.classList.remove('theme-light', 'theme-dark');
         document.documentElement.classList.add(`theme-${newTheme}`);
 
         // Update CSS variables
@@ -57,7 +57,7 @@ export default function ThemeProvider({ children }) {
             document.body.style.setProperty('--warning', 'var(--light-warning)');
             document.body.style.setProperty('--info', 'var(--light-info)');
         }
-    };
+    }, []);
 
     // Function to set theme and update settings
     const setTheme = async (newTheme) => {
@@ -156,10 +156,20 @@ export default function ThemeProvider({ children }) {
 
         mediaQuery.addEventListener('change', handleSystemThemeChange);
 
+        const handleThemeSettingChanged = (e) => {
+            if (typeof e?.detail?.isDark === 'boolean') {
+                const nextTheme = e.detail.isDark ? 'dark' : 'light';
+                setThemeState(nextTheme);
+                applyThemeToDOM(nextTheme);
+            }
+        };
+        window.addEventListener('theme-setting-changed', handleThemeSettingChanged);
+
         return () => {
             mediaQuery.removeEventListener('change', handleSystemThemeChange);
+            window.removeEventListener('theme-setting-changed', handleThemeSettingChanged);
         };
-    }, []);
+    }, [applyThemeToDOM]);
 
     // Don't render children until theme is loaded
     if (isLoading) {
@@ -191,7 +201,7 @@ export default function ThemeProvider({ children }) {
                 }}>
                     Loading theme...
                 </div>
-                <style jsx global>{`
+                <style>{`
                     @keyframes spin {
                         to { transform: rotate(360deg); }
                     }

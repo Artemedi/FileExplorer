@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useSettings } from '../../providers/SettingsProvider';
+import { useTheme } from '../../providers/ThemeProvider';
 import { useTranslation } from '../../i18n';
+import { showConfirm, showSuccess, showError } from '../../utils/NotificationSystem';
 import Modal from '../common/Modal';
 import Button from '../common/Button';
 import './settings.css';
@@ -15,6 +17,7 @@ import './settings.css';
  */
 const SettingsPanel = ({ isOpen, onClose }) => {
     const { settings, error, updateSetting, resetSettings, reloadSettings } = useSettings();
+    const { setTheme } = useTheme();
     const { t, language, setLanguage } = useTranslation();
     const [isResetting, setIsResetting] = useState(false);
     const [activeTab, setActiveTab] = useState('appearance');
@@ -159,7 +162,11 @@ const SettingsPanel = ({ isOpen, onClose }) => {
      * @async
      */
     const handleReset = async () => {
-        if (!confirm('Are you sure you want to reset all settings to default? This cannot be undone.')) {
+        const confirmed = await showConfirm(
+            'Are you sure you want to reset all settings to default? This cannot be undone.',
+            'Reset Settings'
+        );
+        if (!confirmed) {
             return;
         }
 
@@ -167,10 +174,11 @@ const SettingsPanel = ({ isOpen, onClose }) => {
         try {
             await resetSettings();
             setLocalError(null);
-            alert('Settings have been reset to default.');
+            showSuccess('Settings have been reset to default.');
         } catch (error) {
             console.error('Failed to reset settings:', error);
             setLocalError('Failed to reset settings. Please try again.');
+            showError('Failed to reset settings. Please try again.');
         } finally {
             setIsResetting(false);
         }
@@ -183,10 +191,11 @@ const SettingsPanel = ({ isOpen, onClose }) => {
     const handleClearSearchIndex = async () => {
         try {
             await invoke('clear_search_engine');
-            alert('Search index has been cleared.');
+            showSuccess('Search index has been cleared.');
         } catch (error) {
             console.error('Failed to clear search index:', error);
             setLocalError('Failed to clear search index.');
+            showError('Failed to clear search index.');
         }
     };
 
@@ -232,7 +241,11 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                                 name="darkmode"
                                 value={theme.id}
                                 checked={settings.darkmode === theme.id}
-                                onChange={(e) => updateSetting('darkmode', e.target.value === 'true')}
+                                onChange={(e) => {
+                                    const isDark = e.target.value === 'true';
+                                    setTheme(isDark ? 'dark' : 'light');
+                                    updateSetting('darkmode', isDark);
+                                }}
                             />
                             <span>{theme.label}</span>
                         </label>

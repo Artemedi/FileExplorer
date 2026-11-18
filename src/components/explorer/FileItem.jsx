@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import FileIcon from './FileIcon';
 import { formatFileSize, formatDate, getFileType } from '../../utils/formatters';
-import { replaceFileName } from '../../utils/pathUtils.js';
+import { replaceFileName } from '../../utils/pathUtils';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useContextMenu } from '../../providers/ContextMenuProvider';
-import { showError, showConfirm } from '../../utils/NotificationSystem';
+import { useSettings } from '../../providers/SettingsProvider';
+import { showError, showSuccess, showConfirm } from '../../utils/NotificationSystem';
 import './fileItem.css';
 
 /**
@@ -33,9 +34,16 @@ const FileItem = ({
     const { loadDirectory } = useFileSystem();
     const { currentPath } = useHistory();
     const { clipboard } = useContextMenu();
+    const { settings } = useSettings();
     const [isDragOver, setIsDragOver] = useState(false);
 
     const isDirectory = item.isDirectory || 'sub_file_count' in item;
+    const showExtensions = settings?.show_file_extensions !== false;
+    const displayName = (() => {
+        if (isDirectory || showExtensions) return item.name;
+        const lastDot = item.name.lastIndexOf('.');
+        return lastDot > 0 ? item.name.slice(0, lastDot) : item.name;
+    })();
     const fileType = isDirectory ? 'Folder' : getFileType(item.name);
     const size = isDirectory
         ? `${item.sub_file_count || 0} items`
@@ -140,6 +148,7 @@ const FileItem = ({
             }
         } catch (err) {
             console.error('Drop on folder failed:', err);
+            showError(`Failed to drop item: ${err.message || err}`);
         }
     };
 
@@ -218,7 +227,7 @@ const FileItem = ({
                         </div>
 
                         <div className="file-name truncate" title={item.name}>
-                            {item.name}
+                            {displayName}
                         </div>
                     </div>
                 )}
@@ -231,7 +240,7 @@ const FileItem = ({
 
                         <div className="file-details">
                             <div className="file-name truncate" title={item.name}>
-                                {item.name}
+                                {displayName}
                             </div>
                             <div className="file-info truncate">
                                 {size} • {modified}
@@ -248,7 +257,7 @@ const FileItem = ({
                             </div>
 
                             <div className="file-name truncate" title={item.name}>
-                                {item.name}
+                                {displayName}
                             </div>
                         </div>
 

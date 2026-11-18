@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useEffect, useState, useCallback } from 'react';
 import { useSftp } from '../providers/SftpProvider';
+import { formatErrorMessage } from '../utils/formatters';
 
 /**
  * Hook for managing file/folder preview functionality
@@ -55,7 +56,7 @@ export function usePreview(getFocusedItem, navigateUp = null, navigateDown = nul
       setPayload({
         kind: 'Error',
         name: path.split(/[/\\]/).pop() || 'Unknown',
-        message: error instanceof Error ? error.message : 'Failed to generate preview'
+        message: formatErrorMessage(error) || 'Failed to generate preview'
       });
       setOpen(true);
     } finally {
@@ -89,8 +90,15 @@ export function usePreview(getFocusedItem, navigateUp = null, navigateDown = nul
   // Keyboard event handler
   useEffect(() => {
     const onKey = (e) => {
-      // Don't trigger if we're typing in an input
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+      // Don't trigger if we're typing in an input or activating a button/link
+      const target = e.target;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        target?.isContentEditable ||
+        (target instanceof HTMLElement && target.closest('button, a, [role="button"]'))
+      ) {
         return;
       }
 

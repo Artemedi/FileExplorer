@@ -25,6 +25,15 @@ const ContextMenuItem = ({
                          }) => {
     const [submenuPosition, setSubmenuPosition] = useState({ x: 0, y: 0, alignLeft: false });
     const itemRef = useRef(null);
+    const submenuTimeoutRef = useRef(null);
+
+    useEffect(() => {
+        return () => {
+            if (submenuTimeoutRef.current) {
+                clearTimeout(submenuTimeoutRef.current);
+            }
+        };
+    }, []);
 
     /**
      * Calculates the submenu position based on the parent element position and available space
@@ -65,6 +74,10 @@ const ContextMenuItem = ({
      * Handles mouse enter - opens submenu
      */
     const handleMouseEnter = () => {
+        if (submenuTimeoutRef.current) {
+            clearTimeout(submenuTimeoutRef.current);
+            submenuTimeoutRef.current = null;
+        }
         if (item.submenu) {
             onSubmenuOpen();
         }
@@ -75,8 +88,12 @@ const ContextMenuItem = ({
      */
     const handleMouseLeave = () => {
         if (item.submenu) {
+            if (submenuTimeoutRef.current) {
+                clearTimeout(submenuTimeoutRef.current);
+            }
             // Add delay to prevent submenu from closing immediately
-            setTimeout(() => {
+            submenuTimeoutRef.current = setTimeout(() => {
+                submenuTimeoutRef.current = null;
                 onSubmenuClose();
             }, 100);
         }

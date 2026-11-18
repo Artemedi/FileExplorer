@@ -140,7 +140,7 @@ pub async fn open_directory(path: String) -> Result<String, String> {
     let mut directories = Vec::new();
     let mut files = Vec::new();
 
-    for entry in read_dir(path_obj).map_err(|err| {
+    for entry_res in read_dir(path_obj).map_err(|err| {
         log_error!("Failed to read directory: {}", err);
         Error::new(
             ErrorCode::InternalError,
@@ -148,33 +148,30 @@ pub async fn open_directory(path: String) -> Result<String, String> {
         )
         .to_json()
     })? {
-        let entry = entry.map_err(|err| {
-            log_error!("Failed to read entry: {}", err);
-            Error::new(
-                ErrorCode::InternalError,
-                format!("Failed to read entry: {}", err),
-            )
-            .to_json()
-        })?;
+        let entry = match entry_res {
+            Ok(e) => e,
+            Err(err) => {
+                log_error!("Skipping unreadable directory entry: {}", err);
+                continue;
+            }
+        };
 
-        let file_type = entry.file_type().map_err(|err| {
-            log_error!("Failed to get file type: {}", err);
-            Error::new(
-                ErrorCode::InternalError,
-                format!("Failed to get file type: {}", err),
-            )
-            .to_json()
-        })?;
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(err) => {
+                log_error!("Skipping entry with unreadable file type: {}", err);
+                continue;
+            }
+        };
 
         let path_of_entry = entry.path();
-        let metadata = entry.metadata().map_err(|err| {
-            log_error!("Failed to get metadata: {}", err);
-            Error::new(
-                ErrorCode::InternalError,
-                format!("Failed to get metadata: {}", err),
-            )
-            .to_json()
-        })?;
+        let metadata = match entry.metadata() {
+            Ok(md) => md,
+            Err(err) => {
+                log_error!("Skipping entry with unreadable metadata ({}): {}", path_of_entry.display(), err);
+                continue;
+            }
+        };
 
         if file_type.is_dir() {
             directories.push(models::Directory {
@@ -292,19 +289,27 @@ pub async fn create_file(folder_path_abs: &str, file_name: &str) -> Result<(), S
     // Concatenate the folder path and filename
     let file_path = path.join(file_name);
 
-    // Create the file
-    match fs::File::create(&file_path) {
+    // Create the file without overwriting existing files
+    match fs::OpenOptions::new().write(true).create_new(true).open(&file_path) {
         Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            log_error!("File already exists: {}", file_path.display());
+            Err(Error::new(
+                ErrorCode::ResourceAlreadyExists,
+                format!("File already exists: {}", file_path.display()),
+            )
+            .to_json())
+        }
         Err(err) => {
             log_error!(
                 "File could not be created: {} error: {}",
-                folder_path_abs, err
+                file_path.display(), err
             );
             Err(Error::new(
                 ErrorCode::InternalError,
                 format!(
                     "File could not be created: {} error: {}",
-                    folder_path_abs, err
+                    file_path.display(), err
                 ),
             )
             .to_json())
@@ -355,19 +360,28 @@ pub async fn create_directory(folder_path_abs: &str, folder_name: &str) -> Resul
     // Concatenate the parent path and new directory name
     let dir_path = parent_path.join(folder_name);
 
+    if dir_path.exists() {
+        log_error!("Directory already exists: {}", dir_path.display());
+        return Err(Error::new(
+            ErrorCode::ResourceAlreadyExists,
+            format!("Directory already exists: {}", dir_path.display()),
+        )
+        .to_json());
+    }
+
     // Create the directory
     match fs::create_dir(&dir_path) {
         Ok(_) => Ok(()),
         Err(err) => {
             log_error!(
                 "Failed to create directory: {} err: {}",
-                folder_path_abs, err
+                dir_path.display(), err
             );
             Err(Error::new(
                 ErrorCode::InternalError,
                 format!(
                     "Failed to create directory: {} err: {}",
-                    folder_path_abs, err
+                    dir_path.display(), err
                 ),
             )
             .to_json())
@@ -408,8 +422,9 @@ pub async fn rename(old_path: &str, new_path: &str) -> Result<(), String> {
         .to_json());
     }
 
-    // Check if the new path is valid
-    if new_path_obj.exists() {
+    // Check if the new path already exists (allow case-only rename on case-insensitive filesystems)
+    let is_case_only_rename = old_path.eq_ignore_ascii_case(new_path) && old_path != new_path;
+    if new_path_obj.exists() && !is_case_only_rename {
         log_error!("New path already exists: {}", new_path);
         return Err(Error::new(
             ErrorCode::ResourceAlreadyExists,
@@ -546,6 +561,28 @@ pub async fn copy_file_or_dir(source_path: &str, destination_path: &str) -> Resu
     let final_destination_path = generate_unique_path(destination_path);
 
     if Path::new(source_path).is_dir() {
+        // Guard against infinite recursion when copying a directory into itself or a subdirectory
+        if let Ok(canon_src) = fs::canonicalize(source_path) {
+            let dest_parent = Path::new(&final_destination_path)
+                .parent()
+                .and_then(|p| fs::canonicalize(p).ok());
+            if let Some(canon_dest_parent) = dest_parent {
+                if canon_dest_parent == canon_src || canon_dest_parent.starts_with(&canon_src) {
+                    log_error!(
+                        "Cannot copy directory into itself: {} -> {}",
+                        source_path,
+                        final_destination_path
+                    );
+                    return Err(Error::new(
+                        ErrorCode::InvalidInput,
+                        "Cannot copy a directory into itself or a subdirectory of itself"
+                            .to_string(),
+                    )
+                    .to_json());
+                }
+            }
+        }
+
         // If the source is a directory, recursively copy it
         let mut total_size = 0;
 

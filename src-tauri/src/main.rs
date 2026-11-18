@@ -19,7 +19,7 @@ use tauri::{Emitter, Manager};
 fn all_commands() -> fn(Invoke) -> bool {
     tauri::generate_handler![
         // Filesystem commands
-        //file_system_operation_commands::open_file,
+        file_system_operation_commands::open_file,
         file_system_operation_commands::open_directory,
         file_system_operation_commands::open_in_default_app,
         file_system_operation_commands::create_file,

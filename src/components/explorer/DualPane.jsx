@@ -139,7 +139,10 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                     return;
                 }
             }
-        } catch (_) {}
+        } catch (err) {
+            console.error('Pane drop failed:', err);
+            showError(`${t('common.error')}: ${err?.message || err}`);
+        }
 
         if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
             let count = 0;
@@ -157,6 +160,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                         count++;
                     } catch (err) {
                         console.error('File drop copy failed:', err);
+                        showError(`${t('common.error')}: ${f.name}`);
                     }
                 }
             }
@@ -175,7 +179,9 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
         const parts = current.replace(/[\\/]+$/, '').split(separator);
         if (parts.length > 1) {
             parts.pop();
-            const parent = parts.join(separator) || (separator === '/' ? '/' : parts[0] + '\\');
+            const parent = (parts.length === 1 && /^[A-Za-z]:$/.test(parts[0]))
+                ? `${parts[0]}\\`
+                : (parts.join(separator) || (separator === '/' ? '/' : `${parts[0]}\\`));
             loadPaneDirectory(pane, parent);
             if (activePane === pane) navigateTo(parent);
         }

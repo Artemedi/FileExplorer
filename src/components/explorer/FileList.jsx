@@ -3,11 +3,29 @@ import { getFileType } from '../../utils/formatters';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useContextMenu } from '../../providers/ContextMenuProvider';
+import { useSettings } from '../../providers/SettingsProvider';
 import { showError, showSuccess } from '../../utils/NotificationSystem';
 import { invoke } from '@tauri-apps/api/core';
 import FileItem from './FileItem';
 import EmptyState from './EmptyState';
 import './fileList.css';
+
+const mapSettingSortKey = (sortBy) => {
+    switch ((sortBy || '').toLowerCase()) {
+        case 'size':
+            return 'size_in_bytes';
+        case 'modified':
+        case 'date':
+            return 'last_modified';
+        case 'type':
+            return 'type';
+        case 'name':
+        default:
+            return 'name';
+    }
+};
+
+const mapSettingSortDirection = (sortDir) => (sortDir === 'Descending' ? 'desc' : 'asc');
 
 /**
  * Component to display a list of files and directories
@@ -49,7 +67,18 @@ const FileList = ({
     const openFile = customOpenFile || fs.openFile;
     const { openContextMenu } = useContextMenu();
     const { currentPath } = useHistory();
-    const [sortConfig, setSortConfig] = useState({ key: 'name', direction: 'asc' });
+    const { settings } = useSettings();
+    const [sortConfig, setSortConfig] = useState(() => ({
+        key: mapSettingSortKey(settings?.sort_by),
+        direction: mapSettingSortDirection(settings?.sort_direction),
+    }));
+
+    useEffect(() => {
+        setSortConfig({
+            key: mapSettingSortKey(settings?.sort_by),
+            direction: mapSettingSortDirection(settings?.sort_direction),
+        });
+    }, [settings?.sort_by, settings?.sort_direction]);
     const [isShiftKeyPressed, setIsShiftKeyPressed] = useState(false);
     const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
     const [columnsPerRow, setColumnsPerRow] = useState(4); // Dynamic column calculation
@@ -258,7 +287,10 @@ const FileList = ({
                     return;
                 }
             }
-        } catch (_) {}
+        } catch (err) {
+            console.error('Drop item failed:', err);
+            showError(`Failed to drop item: ${err?.message || err}`);
+        }
 
         if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
             let count = 0;
@@ -276,6 +308,7 @@ const FileList = ({
                         count++;
                     } catch (err) {
                         console.error('File copy failed:', err);
+                        showError(`Failed to copy ${f.name}: ${err?.message || err}`);
                     }
                 }
             }
@@ -301,17 +334,21 @@ const FileList = ({
         const clickedItem = e.target.closest('[data-path]');
         const item = clickedItem ? currentSortedItems.find(item => item.path === clickedItem.dataset.path) : null;
 
+        let overrideSelection = null;
         if (item) {
             const isAlreadySelected = selectedItems.some(s => s.path === item.path);
             if (!isAlreadySelected) {
+                overrideSelection = [item];
                 selectMultiple([item]);
                 const idx = currentSortedItems.findIndex(i => i.path === item.path);
                 setLastSelectedIndex(idx);
+            } else {
+                overrideSelection = selectedItems;
             }
             setFocusedItem(item);
         }
 
-        openContextMenu(e, item);
+        openContextMenu(e, item, overrideSelection);
     };
 
     // Get sorted data - call this before useEffects that need it
@@ -616,9 +653,16 @@ const FileList = ({
         // Always set the focused item when clicking on it
         setFocusedItem(item);
 
-        // For double-click, open the item
+        const isSelectOnDoubleClick = settings?.double_click === 'SelectFilesAndFolders';
+        const isDir = Boolean(item.isDirectory || 'sub_file_count' in item || item.is_directory);
+
+        // For double-click: open normally, or toggle selection when double_click setting is SelectFilesAndFolders
         if (isDoubleClick) {
-            const isDir = Boolean(item.isDirectory || 'sub_file_count' in item || item.is_directory);
+            if (isSelectOnDoubleClick) {
+                selectItem(item, true);
+                setLastSelectedIndex(index);
+                return;
+            }
             if (isDir) {
                 loadDirectory(item.path);
             } else {
@@ -631,6 +675,15 @@ const FileList = ({
         const isAlreadySelected = selectedItems.some(selected => selected.path === item.path);
         const isShift = Boolean(e?.shiftKey || isShiftKeyPressed);
         const isCtrl = Boolean(e?.ctrlKey || e?.metaKey || isCtrlKeyPressed);
+
+        if (isSelectOnDoubleClick && !isShift && !isCtrl) {
+            if (isDir) {
+                loadDirectory(item.path);
+            } else {
+                openFile(item.path);
+            }
+            return;
+        }
 
         if (isShift) {
             // Find anchor index for shift selection

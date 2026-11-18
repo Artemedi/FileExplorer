@@ -40,8 +40,31 @@ const defaultSettings = {
     default_checksum_hash: "SHA256",
 };
 
+// Helper to normalize nested backend settings into the flat UI settings shape
+const normalizeSettingsPayload = (rawSettings) => {
+    if (!rawSettings || typeof rawSettings !== 'object') {
+        return { ...defaultSettings };
+    }
+    const flattened = {
+        ...rawSettings,
+        ...(rawSettings.backend_settings?.search_engine_config && {
+            search_engine_enabled: rawSettings.backend_settings.search_engine_config.search_engine_enabled,
+            case_sensitive_search: rawSettings.backend_settings.search_engine_config.case_sensitive_search,
+            index_hidden_files: rawSettings.backend_settings.search_engine_config.index_hidden_files,
+            fuzzy_search_enabled: rawSettings.backend_settings.search_engine_config.fuzzy_search_enabled,
+        }),
+        ...(rawSettings.backend_settings && {
+            default_checksum_hash: rawSettings.backend_settings.default_checksum_hash,
+        }),
+    };
+    return {
+        ...defaultSettings,
+        ...flattened,
+    };
+};
+
 // Create context
-const SettingsContext = createContext({
+export const SettingsContext = createContext({
     settings: defaultSettings,
     isLoading: true,
     error: null,
@@ -69,29 +92,7 @@ export default function SettingsProvider({ children }) {
 
             console.log('Loaded settings:', loadedSettings);
 
-            // Extract nested backend settings for easier access
-            const flattenedSettings = {
-                ...loadedSettings,
-                // Extract search engine settings from nested structure
-                ...(loadedSettings.backend_settings?.search_engine_config && {
-                    search_engine_enabled: loadedSettings.backend_settings.search_engine_config.search_engine_enabled,
-                    case_sensitive_search: loadedSettings.backend_settings.search_engine_config.case_sensitive_search,
-                    index_hidden_files: loadedSettings.backend_settings.search_engine_config.index_hidden_files,
-                    fuzzy_search_enabled: loadedSettings.backend_settings.search_engine_config.fuzzy_search_enabled,
-                }),
-                // Extract other backend settings
-                ...(loadedSettings.backend_settings && {
-                    default_checksum_hash: loadedSettings.backend_settings.default_checksum_hash,
-                }),
-            };
-
-            // Merge with default settings to ensure all fields exist
-            const mergedSettings = {
-                ...defaultSettings,
-                ...flattenedSettings,
-            };
-
-            setSettings(mergedSettings);
+            setSettings(normalizeSettingsPayload(loadedSettings));
             console.log('Settings loaded successfully');
         } catch (error) {
             console.error('Failed to load settings:', error);
@@ -134,13 +135,19 @@ export default function SettingsProvider({ children }) {
 
             // Parse the response to get the updated settings
             if (updatedSettingsJson) {
-                const updatedSettings = JSON.parse(updatedSettingsJson);
+                const updatedSettings = normalizeSettingsPayload(JSON.parse(updatedSettingsJson));
                 setSettings(updatedSettings);
             } else {
                 // Fallback: just update the local state
                 setSettings(prev => ({
                     ...prev,
                     [key]: value,
+                }));
+            }
+
+            if (key === 'darkmode') {
+                window.dispatchEvent(new CustomEvent('theme-setting-changed', {
+                    detail: { isDark: Boolean(value) }
                 }));
             }
 
@@ -172,13 +179,19 @@ export default function SettingsProvider({ children }) {
 
             // Parse the response to get the updated settings
             if (updatedSettingsJson) {
-                const updatedSettings = JSON.parse(updatedSettingsJson);
+                const updatedSettings = normalizeSettingsPayload(JSON.parse(updatedSettingsJson));
                 setSettings(updatedSettings);
             } else {
                 // Fallback: just update the local state
                 setSettings(prev => ({
                     ...prev,
                     ...updates,
+                }));
+            }
+
+            if (Object.prototype.hasOwnProperty.call(updates, 'darkmode')) {
+                window.dispatchEvent(new CustomEvent('theme-setting-changed', {
+                    detail: { isDark: Boolean(updates.darkmode) }
                 }));
             }
 
@@ -204,10 +217,13 @@ export default function SettingsProvider({ children }) {
 
         try {
             // Reset in backend
-            await invoke('reset_settings');
+            await invoke('reset_settings_command');
 
             // Update local state
             setSettings(defaultSettings);
+            window.dispatchEvent(new CustomEvent('theme-setting-changed', {
+                detail: { isDark: Boolean(defaultSettings.darkmode) }
+            }));
 
             console.log('Settings reset successfully');
         } catch (error) {

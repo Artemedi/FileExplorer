@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useSftp } from '../../providers/SftpProvider';
@@ -40,6 +40,7 @@ const TabManager = ({ children }) => {
     const { isSftpPath, parseSftpPath } = useSftp();
     const { t } = useTranslation();
     const [contextMenu, setContextMenu] = useState(null);
+    const draggedTabIndexRef = useRef(-1);
 
     useEffect(() => {
         const hideMenu = () => setContextMenu(null);
@@ -193,7 +194,7 @@ const TabManager = ({ children }) => {
         };
 
         setTabs(prevTabs => [...prevTabs, newTab]);
-        switchToTab(newTab.id);
+        setActiveTabId(newTab.id);
     };
 
     /**
@@ -208,17 +209,17 @@ const TabManager = ({ children }) => {
 
         const tabIndex = tabs.findIndex(tab => tab.id === tabId);
         const isActiveTab = tabId === activeTabId;
+        const remainingTabs = tabs.filter(tab => tab.id !== tabId);
 
-        setTabs(prevTabs => prevTabs.filter(tab => tab.id !== tabId));
+        setTabs(remainingTabs);
 
         // If we closed the active tab, switch to another tab
-        if (isActiveTab) {
-            const remainingTabs = tabs.filter(tab => tab.id !== tabId);
-            if (remainingTabs.length > 0) {
-                // Switch to the tab to the right, or the last tab if we closed the rightmost one
-                const nextTabIndex = Math.min(tabIndex, remainingTabs.length - 1);
-                const nextTab = remainingTabs[nextTabIndex];
-                switchToTab(nextTab.id);
+        if (isActiveTab && remainingTabs.length > 0) {
+            const nextTabIndex = Math.min(tabIndex, remainingTabs.length - 1);
+            const nextTab = remainingTabs[nextTabIndex];
+            setActiveTabId(nextTab.id);
+            if (nextTab.path && nextTab.path !== currentPath) {
+                loadDirectory(nextTab.path).catch(() => {});
             }
         }
     };
@@ -240,7 +241,6 @@ const TabManager = ({ children }) => {
                 await loadDirectory(tab.path);
             } catch (error) {
                 console.error('Failed to load directory for tab:', error);
-                // Optionally show an error or close the tab
             }
         }
     };
@@ -265,7 +265,7 @@ const TabManager = ({ children }) => {
         newTabs.splice(tabIndex + 1, 0, duplicatedTab);
 
         setTabs(newTabs);
-        switchToTab(duplicatedTab.id);
+        setActiveTabId(duplicatedTab.id);
     };
 
     /**
@@ -274,6 +274,9 @@ const TabManager = ({ children }) => {
      * @param {number} hoverIndex - Index where the tab should be inserted
      */
     const reorderTabs = (dragIndex, hoverIndex) => {
+        if (dragIndex < 0 || dragIndex >= tabs.length || hoverIndex < 0 || hoverIndex >= tabs.length || dragIndex === hoverIndex) {
+            return;
+        }
         const newTabs = [...tabs];
         const draggedTab = newTabs[dragIndex];
         newTabs.splice(dragIndex, 1);
@@ -332,10 +335,6 @@ const TabManager = ({ children }) => {
         closeTab(tabId, e);
     };
 
-    if (tabs.length === 0) {
-        return <div className="tab-manager-loading">Loading...</div>;
-    }
-
     return (
         <div className="tab-manager">
             <div className="tab-bar">
@@ -360,6 +359,7 @@ const TabManager = ({ children }) => {
                             }}
                             draggable
                             onDragStart={(e) => {
+                                draggedTabIndexRef.current = index;
                                 e.dataTransfer.setData('text/plain', '');
                                 e.dataTransfer.effectAllowed = 'move';
                             }}
@@ -369,8 +369,8 @@ const TabManager = ({ children }) => {
                             }}
                             onDrop={(e) => {
                                 e.preventDefault();
-                                // Handle tab reordering
-                                const dragIndex = tabs.findIndex(t => t.id === activeTabId);
+                                const dragIndex = draggedTabIndexRef.current;
+                                draggedTabIndexRef.current = -1;
                                 reorderTabs(dragIndex, index);
                             }}
                         >

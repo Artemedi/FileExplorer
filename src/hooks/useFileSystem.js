@@ -15,4 +15,5 @@ const useFileSystem = () => {
     return context;
 };
 
+export { useFileSystem };
 export default useFileSystem;

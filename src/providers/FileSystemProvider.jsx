@@ -4,11 +4,12 @@ import { listen } from '@tauri-apps/api/event';
 import { useHistory } from './HistoryProvider';
 import { useSettings } from './SettingsProvider';
 import { useSftp } from './SftpProvider';
-import { getDirectoryPath } from '../utils/pathUtils';
+import { getDirectoryPath, getFileName } from '../utils/pathUtils';
 import { formatErrorMessage } from '../utils/formatters';
+import { showError } from '../utils/NotificationSystem';
 
 // Create file system context
-const FileSystemContext = createContext({
+export const FileSystemContext = createContext({
     currentDirData: null,
     isLoading: false,
     selectedItems: [],
@@ -37,6 +38,8 @@ export default function FileSystemProvider({ children }) {
     const [focusedItem, setFocusedItem] = useState(null);
     const [volumes, setVolumes] = useState([]);
     const [error, setError] = useState(null);
+    const lastLoadedPathRef = useRef(null);
+    const hasMountedHiddenRef = useRef(false);
     const { navigateTo, currentPath } = useHistory();
     const { settings } = useSettings();
     const { 
@@ -106,15 +109,18 @@ export default function FileSystemProvider({ children }) {
     }, []);
 
     // Load directory contents - enhanced with SFTP support
-    const loadDirectory = useCallback(async (path) => {
+    const loadDirectory = useCallback(async (path, options = {}) => {
+        const silent = Boolean(options?.silent);
         if (!path) {
             console.error("Cannot load directory: path is empty");
-            setIsLoading(false);
+            if (!silent) setIsLoading(false);
             return false;
         }
 
         console.log(`Attempting to load directory: ${path}`);
-        setIsLoading(true);
+        if (!silent) {
+            setIsLoading(true);
+        }
         setError(null);
 
         try {
@@ -125,6 +131,7 @@ export default function FileSystemProvider({ children }) {
                 if (sftpData) {
                     const filteredData = filterDirectoryData(sftpData);
                     setCurrentDirData(filteredData);
+                    lastLoadedPathRef.current = path;
                     navigateTo(path);
                     invoke('unwatch_directory').catch(() => {});
                     console.log(`Successfully loaded SFTP directory: ${path}`);
@@ -150,6 +157,7 @@ export default function FileSystemProvider({ children }) {
                 const dirData = JSON.parse(dirContent);
                 const filteredData = filterDirectoryData(dirData);
                 setCurrentDirData(filteredData);
+                lastLoadedPathRef.current = path;
                 navigateTo(path);
                 invoke('watch_directory', { path }).catch((err) => {
                     console.warn(`Failed to watch directory: ${path}`, err);
@@ -162,10 +170,10 @@ export default function FileSystemProvider({ children }) {
         } catch (err) {
             console.error(`Failed to load directory: ${path}`, err);
             
-            // Handle permission errors specifically for macOS user directories
+            // Handle permission errors specifically for user directories
             const errorMessage = formatErrorMessage(err);
             if (errorMessage.toLowerCase().includes('permission denied') || errorMessage.toLowerCase().includes('unauthorized')) {
-                const folderName = path.split('/').pop() || path;
+                const folderName = getFileName(path) || path;
                 const isUserDir = ['Desktop', 'Documents', 'Downloads', 'Pictures', 'Movies', 'Music'].some(dir => 
                     path.toLowerCase().includes(dir.toLowerCase())
                 );
@@ -180,7 +188,9 @@ export default function FileSystemProvider({ children }) {
             }
             return false;
         } finally {
-            setIsLoading(false);
+            if (!silent) {
+                setIsLoading(false);
+            }
         }
     }, [navigateTo, filterDirectoryData, isSftpPath, loadSftpDirectory]);
 
@@ -199,6 +209,11 @@ export default function FileSystemProvider({ children }) {
                 }
             } catch (cliErr) {
                 console.warn('Could not retrieve CLI path:', cliErr);
+            }
+
+            // 0.5. Respect configured default opening folder if set
+            if (settings.default_folder_path_on_opening && settings.default_folder_path_on_opening.trim()) {
+                return settings.default_folder_path_on_opening.trim();
             }
 
             // 1. Versuche zuerst, die Volumes zu laden
@@ -242,7 +257,7 @@ export default function FileSystemProvider({ children }) {
             // Stelle sicher, dass ein Ladeindikator nicht nur wegen dieser Funktion aktiv bleibt
             // setIsLoading(false); -- Dies sollte in loadDirectory gesetzt werden, nicht hier
         }
-    }, [loadVolumes]);
+    }, [loadVolumes, settings.default_folder_path_on_opening]);
 
 // Verbesserte initializeFirstDirectory-Funktion
     const initializeFirstDirectory = useCallback(async () => {
@@ -300,38 +315,52 @@ export default function FileSystemProvider({ children }) {
         }
     }, [initializeFirstDirectory, currentDirData, currentPath]);
 
-// Reagiere auf Navigation/currentPath Änderungen
-    useEffect(() => {
-        if (currentPath) {
-            console.log(`Current path changed to: ${currentPath}, loading directory...`);
-            loadDirectory(currentPath);
-        }
-    }, [currentPath, loadDirectory]);
-
     const currentPathRef = useRef(currentPath);
     useEffect(() => {
         currentPathRef.current = currentPath;
     }, [currentPath]);
 
+    const loadDirectoryRef = useRef(loadDirectory);
+    useEffect(() => {
+        loadDirectoryRef.current = loadDirectory;
+    }, [loadDirectory]);
+
+    const isSftpPathRef = useRef(isSftpPath);
+    useEffect(() => {
+        isSftpPathRef.current = isSftpPath;
+    }, [isSftpPath]);
+
+    const autoRefreshRef = useRef(settings.auto_refresh_dir !== false);
+    useEffect(() => {
+        autoRefreshRef.current = settings.auto_refresh_dir !== false;
+    }, [settings.auto_refresh_dir]);
+
     // Live directory update via file watcher
     useEffect(() => {
+        let isMounted = true;
         let unlisten = null;
         let debounceTimer = null;
 
         const setupWatcher = async () => {
             try {
-                unlisten = await listen('fs-change', (event) => {
+                const fn = await listen('fs-change', () => {
+                    if (!autoRefreshRef.current) return;
                     if (debounceTimer) {
                         clearTimeout(debounceTimer);
                     }
                     debounceTimer = setTimeout(() => {
                         const targetPath = currentPathRef.current;
-                        if (targetPath && !isSftpPath(targetPath)) {
+                        if (targetPath && !isSftpPathRef.current(targetPath)) {
                             console.log(`Auto-refreshing directory after fs-change: ${targetPath}`);
-                            loadDirectory(targetPath);
+                            loadDirectoryRef.current(targetPath, { silent: true });
                         }
                     }, 250);
                 });
+                if (isMounted) {
+                    unlisten = fn;
+                } else {
+                    fn();
+                }
             } catch (err) {
                 console.warn('Failed to listen to fs-change events:', err);
             }
@@ -340,15 +369,15 @@ export default function FileSystemProvider({ children }) {
         setupWatcher();
 
         return () => {
+            isMounted = false;
             if (debounceTimer) clearTimeout(debounceTimer);
             if (unlisten) unlisten();
             invoke('unwatch_directory').catch(() => {});
         };
-    }, [loadDirectory, isSftpPath]);
+    }, []);
 
     // Open a file - enhanced with SFTP support
     const openFile = useCallback(async (filePath) => {
-        setIsLoading(true);
         setError(null);
 
         try {
@@ -361,9 +390,9 @@ export default function FileSystemProvider({ children }) {
             }
         } catch (err) {
             console.error(`Failed to open file: ${filePath}`, err);
-            setError(`Failed to open file: ${formatErrorMessage(err)}`);
-        } finally {
-            setIsLoading(false);
+            const msg = formatErrorMessage(err);
+            setError(`Failed to open file: ${msg}`);
+            showError(`Failed to open file: ${msg}`);
         }
     }, [isSftpPath, downloadAndOpenSftpFile]);
 
@@ -378,16 +407,21 @@ export default function FileSystemProvider({ children }) {
                 if (success) {
                     await loadDirectory(folderPath);
                 }
+                return success;
             } else {
                 await invoke('create_file', {
                     folderPathAbs: folderPath,
                     fileName: fileName
                 });
                 await loadDirectory(folderPath);
+                return true;
             }
         } catch (err) {
             console.error(`Failed to create file: ${fileName}`, err);
-            setError(`Failed to create file: ${formatErrorMessage(err)}`);
+            const msg = formatErrorMessage(err);
+            setError(`Failed to create file: ${msg}`);
+            showError(`Failed to create file: ${msg}`);
+            return false;
         } finally {
             setIsLoading(false);
         }
@@ -404,16 +438,21 @@ export default function FileSystemProvider({ children }) {
                 if (success) {
                     await loadDirectory(folderPath);
                 }
+                return success;
             } else {
                 await invoke('create_directory', {
                     folderPathAbs: folderPath,
                     folderName: directoryName
                 });
                 await loadDirectory(folderPath);
+                return true;
             }
         } catch (err) {
             console.error(`Failed to create directory: ${directoryName}`, err);
-            setError(`Failed to create directory: ${formatErrorMessage(err)}`);
+            const msg = formatErrorMessage(err);
+            setError(`Failed to create directory: ${msg}`);
+            showError(`Failed to create directory: ${msg}`);
+            return false;
         } finally {
             setIsLoading(false);
         }
@@ -431,26 +470,27 @@ export default function FileSystemProvider({ children }) {
                 const pathParts = newPath.split('/');
                 const newName = pathParts[pathParts.length - 1];
                 const success = await renameSftpItem(oldPath, newName);
-                if (success) {
+                if (success && currentPath) {
                     // For SFTP paths, reload the current directory instead of trying to extract parent path
-                    if (currentPath) {
-                        await loadDirectory(currentPath);
-                    }
+                    await loadDirectory(currentPath);
                 }
+                return success;
             } else {
                 await invoke('rename', { oldPath, newPath });
                 const dirPath = getDirectoryPath(oldPath);
                 await loadDirectory(dirPath);
+                return true;
             }
-
-            console.log('FileSystemProvider: Rename operation completed successfully');
         } catch (err) {
             console.error(`Failed to rename item: ${oldPath}`, err);
-            setError(`Failed to rename item: ${formatErrorMessage(err)}`);
+            const msg = formatErrorMessage(err);
+            setError(`Failed to rename item: ${msg}`);
+            showError(`Failed to rename item: ${msg}`);
+            return false;
         } finally {
             setIsLoading(false);
         }
-    }, [loadDirectory, isSftpPath, renameSftpItem]);
+    }, [loadDirectory, isSftpPath, renameSftpItem, currentPath]);
 
     // Move item to trash - enhanced with SFTP support
     const moveToTrash = useCallback(async (path) => {
@@ -468,16 +508,21 @@ export default function FileSystemProvider({ children }) {
                     // Clear selection if the deleted item was selected
                     setSelectedItems(prev => prev.filter(item => !item.path.startsWith(path)));
                 }
+                return success;
             } else {
                 await invoke('move_to_trash', { path });
-                const dirPath = path.substring(0, path.lastIndexOf('/'));
+                const dirPath = getDirectoryPath(path);
                 await loadDirectory(dirPath);
                 // Clear selection if the deleted item was selected
                 setSelectedItems(prev => prev.filter(item => !item.path.startsWith(path)));
+                return true;
             }
         } catch (err) {
             console.error(`Failed to move item to trash: ${path}`, err);
-            setError(`Failed to move item to trash: ${formatErrorMessage(err)}`);
+            const msg = formatErrorMessage(err);
+            setError(`Failed to move item to trash: ${msg}`);
+            showError(`Failed to move item to trash: ${msg}`);
+            return false;
         } finally {
             setIsLoading(false);
         }
@@ -498,9 +543,13 @@ export default function FileSystemProvider({ children }) {
             if (currentPath) {
                 await loadDirectory(currentPath);
             }
+            return true;
         } catch (err) {
             console.error('Failed to create zip:', err);
-            setError(`Failed to create zip: ${formatErrorMessage(err)}`);
+            const msg = formatErrorMessage(err);
+            setError(`Failed to create zip: ${msg}`);
+            showError(`Failed to create zip: ${msg}`);
+            return false;
         } finally {
             setIsLoading(false);
         }
@@ -521,9 +570,13 @@ export default function FileSystemProvider({ children }) {
             if (currentPath) {
                 await loadDirectory(currentPath);
             }
+            return true;
         } catch (err) {
             console.error(`Failed to extract zip: ${zipPath}`, err);
-            setError(`Failed to extract zip: ${formatErrorMessage(err)}`);
+            const msg = formatErrorMessage(err);
+            setError(`Failed to extract zip: ${msg}`);
+            showError(`Failed to extract zip: ${msg}`);
+            return false;
         } finally {
             setIsLoading(false);
         }
@@ -572,6 +625,7 @@ export default function FileSystemProvider({ children }) {
 
     // Listen for open-path requests from single-instance launches (e.g. user opens a folder from Windows)
     useEffect(() => {
+        let isMounted = true;
         let unlisten = null;
         listen('open-path-requested', (event) => {
             if (event.payload) {
@@ -579,24 +633,35 @@ export default function FileSystemProvider({ children }) {
                 loadDirectory(event.payload);
                 window.dispatchEvent(new CustomEvent('force-explorer-view'));
             }
-        }).then(fn => { unlisten = fn; });
+        }).then(fn => {
+            if (isMounted) {
+                unlisten = fn;
+            } else {
+                fn();
+            }
+        });
 
         return () => {
+            isMounted = false;
             if (unlisten) unlisten();
         };
     }, [loadDirectory]);
 
     // Reload current directory when navigating back/forward
     useEffect(() => {
-        if (currentPath) {
+        if (currentPath && lastLoadedPathRef.current !== currentPath) {
             loadDirectory(currentPath);
         }
     }, [currentPath, loadDirectory]);
 
     // Reload current directory when hidden files setting changes
     useEffect(() => {
+        if (!hasMountedHiddenRef.current) {
+            hasMountedHiddenRef.current = true;
+            return;
+        }
         if (currentPath) {
-            loadDirectory(currentPath);
+            loadDirectory(currentPath, { silent: true });
         }
     }, [settings.show_hidden_files_and_folders, currentPath, loadDirectory]);
 

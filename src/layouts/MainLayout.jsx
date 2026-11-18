@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { useTheme } from '../providers/ThemeProvider';
 import { useFileSystem } from '../providers/FileSystemProvider';
 import { useContextMenu } from '../providers/ContextMenuProvider';
@@ -345,7 +345,6 @@ const MainLayout = () => {
         const handleOpenTemplates = () => {
             setCurrentView('templates');
             setIsTemplatesOpen(true);
-            navigateTo(null); // Clear explorer path
         };
 
         /**
@@ -360,7 +359,6 @@ const MainLayout = () => {
          */
         const handleOpenThisPC = () => {
             setCurrentView('this-pc');
-            navigateTo(null); // Clear explorer path bug fix
         };
 
         /**
@@ -368,7 +366,6 @@ const MainLayout = () => {
          */
         const handleOpenNetwork = () => {
             setCurrentView('network');
-            navigateTo(null); // Clear explorer path
         };
 
         /**

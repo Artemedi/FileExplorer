@@ -123,12 +123,15 @@ pub async fn add_template_impl(
 
     // Create destination directory if it doesn't exist
     if !dest_path.exists() {
-        let error_msg = format!(
-            "Failed to find templates directory: {}",
-            dest_path.display()
-        );
-        log_error!(error_msg.as_str());
-        return Err(error_msg);
+        if let Err(err) = fs::create_dir_all(&dest_path) {
+            let error_msg = format!(
+                "Failed to create templates directory '{}': {}",
+                dest_path.display(),
+                err
+            );
+            log_error!(error_msg.as_str());
+            return Err(error_msg);
+        }
     }
 
     // Copy the template using our helper function

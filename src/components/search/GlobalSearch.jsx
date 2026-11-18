@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useFileSystem } from '../../providers/FileSystemProvider';
+import { getDirectoryPath, getFileName } from '../../utils/pathUtils';
+import { showError } from '../../utils/NotificationSystem';
 import SearchBar from '../search/SearchBar';
 import EmptyState from '../explorer/EmptyState';
 import FileIcon from '../explorer/FileIcon';
@@ -565,9 +567,9 @@ const GlobalSearch = ({ isOpen, onClose }) => {
 
             // Convert API results to our format and apply frontend filtering
             let formattedResults = searchResults.map(([path, score]) => {
-                const fileName = path.split(/[/\\]/).pop() || path;
-                const directory = path.substring(0, path.lastIndexOf(fileName) - 1) || '/';
-                const isDirectory = !fileName.includes('.') || path.endsWith('/');
+                const fileName = getFileName(path) || path;
+                const directory = getDirectoryPath(path) || '/';
+                const isDirectory = !fileName.includes('.') || path.endsWith('/') || path.endsWith('\\');
 
                 return {
                     path,
@@ -783,13 +785,13 @@ const GlobalSearch = ({ isOpen, onClose }) => {
     // Quick navigate to most accessed path
     const navigateToAccessedPath = async (path) => {
         try {
-            const directory = path.substring(0, path.lastIndexOf('/')) || '/';
+            const directory = getDirectoryPath(path) || '/';
             await loadDirectory(directory);
             navigateTo(directory);
             onClose();
         } catch (error) {
             console.error('Failed to navigate to path:', error);
-            alert(`Failed to navigate: ${error.message || error}`);
+            showError(`Failed to navigate: ${error.message || error}`);
         }
     };
 

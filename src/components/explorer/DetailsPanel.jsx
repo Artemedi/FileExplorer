@@ -1,6 +1,7 @@
 import React from 'react';
 import FileIcon from './FileIcon';
 import { formatFileSize, formatDate, getFileType } from '../../utils/formatters';
+import { getDirectoryPath } from '../../utils/pathUtils';
 import './detailsPanel.css';
 
 /**
@@ -41,7 +42,7 @@ const DetailsPanel = ({ item, isMultipleSelection = false }) => {
     }
 
     // Determine if item is a directory or file
-    const isDirectory = 'sub_file_count' in item;
+    const isDirectory = Boolean(item.isDirectory || 'sub_file_count' in item || item.is_directory);
 
     // Format size
     const size = isDirectory
@@ -92,7 +93,7 @@ const DetailsPanel = ({ item, isMultipleSelection = false }) => {
                     <div className="details-row">
                         <span className="details-label">Location:</span>
                         <span className="details-value truncate" title={item.path}>
-                          {item.path.replace(`/${item.name}`, '')}
+                          {getDirectoryPath(item.path)}
                         </span>
                     </div>
 

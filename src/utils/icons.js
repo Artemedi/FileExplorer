@@ -90,8 +90,8 @@ export const getFolderIconType = (folderName) => {
         return 'folder';
     }
 
-    // Get the last part of the path
-    const name = folderName.split('/').pop().toLowerCase();
+    // Get the last part of the path (supports both '/' and '\', ignoring trailing separators)
+    const name = (folderName.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || '').toLowerCase();
 
     // Special folder types
     const specialFolders = {

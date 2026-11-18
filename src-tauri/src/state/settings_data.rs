@@ -35,7 +35,8 @@ pub enum FontSize {
 /// Controls whether items are sorted in ascending or descending order.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub enum SortDirection {
-    Acscending,
+    #[serde(alias = "Acscending")]
+    Ascending,
     Descending,
 }
 
@@ -46,6 +47,7 @@ pub enum SortDirection {
 pub enum SortBy {
     Name,
     Size,
+    #[serde(alias = "Modified")]
     Date,
     Type,
 }
@@ -132,7 +134,7 @@ impl Default for Settings {
             accent_color: "#0672ef".to_string(),
             confirm_delete: true,
             auto_refresh_dir: true,
-            sort_direction: SortDirection::Acscending,
+            sort_direction: SortDirection::Ascending,
             sort_by: SortBy::Name,
             double_click: DoubleClick::OpenFilesAndFolders,
             show_file_extensions: true,
@@ -267,14 +269,27 @@ impl SettingsState {
     /// let result = settings_state.update_setting_field("theme", json!("dark"))?;
     /// println!("Updated settings: {:?}", result);
     /// ```
+    fn resolve_setting_key(key: &str) -> &str {
+        match key {
+            "search_engine_enabled" => "backend_settings.search_engine_config.search_engine_enabled",
+            "case_sensitive_search" => "backend_settings.search_engine_config.case_sensitive_search",
+            "index_hidden_files" => "backend_settings.search_engine_config.index_hidden_files",
+            "fuzzy_search_enabled" => "backend_settings.search_engine_config.fuzzy_search_enabled",
+            "default_checksum_hash" => "backend_settings.default_checksum_hash",
+            "logging_level" => "backend_settings.logging_config.logging_level",
+            _ => key,
+        }
+    }
+
     pub fn update_setting_field(&self, key: &str, value: Value) -> Result<Settings, Error> {
         let mut settings = self.0.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to acquire settings lock"))?;
 
         let mut settings_map = Self::settings_to_json_map(&settings)?;
+        let resolved_key = Self::resolve_setting_key(key);
 
         // Handle nested fields with dot notation (e.g., "backend_settings.logging_config.logging_level")
-        if key.contains('.') {
-            let path: Vec<&str> = key.split('.').collect();
+        if resolved_key.contains('.') {
+            let path: Vec<&str> = resolved_key.split('.').collect();
 
             // Check if top-level key exists
             if !settings_map.contains_key(path[0]) {
@@ -294,8 +309,8 @@ impl SettingsState {
             }
         } else {
             // Update the top-level field
-            if settings_map.contains_key(key) {
-                settings_map.insert(key.to_string(), value);
+            if settings_map.contains_key(resolved_key) {
+                settings_map.insert(resolved_key.to_string(), value);
             } else {
                 return Err(Error::new(
                     io::ErrorKind::InvalidInput,
@@ -378,14 +393,16 @@ impl SettingsState {
             serde_json::to_value(&*settings).map_err(|e| Error::new(io::ErrorKind::Other, e))?;
 
         if let Some(obj) = settings_value.as_object() {
+            let resolved_key = Self::resolve_setting_key(key);
+
             // Handle nested fields with dot notation
-            if key.contains('.') {
-                let path: Vec<&str> = key.split('.').collect();
+            if resolved_key.contains('.') {
+                let path: Vec<&str> = resolved_key.split('.').collect();
                 return Self::get_nested_field(obj, &path);
             }
 
             // Handle top-level fields
-            obj.get(key).cloned().ok_or_else(|| {
+            obj.get(resolved_key).cloned().ok_or_else(|| {
                 Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("Unknown settings key: {}", key),

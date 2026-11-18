@@ -69,18 +69,20 @@ impl Default for MetaData {
 fn load_templates() -> Vec<PathBuf> {
     let templates_path = constants::TEMPLATES_ABS_PATH_FOLDER.to_path_buf();
     if templates_path.exists() {
-        fs::read_dir(templates_path)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .collect()
+        match fs::read_dir(&templates_path) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .collect(),
+            Err(e) => {
+                log_error!("Failed to read templates folder: {}", e);
+                vec![]
+            }
+        }
     } else {
-        //create the empty folder
-        fs::create_dir_all(templates_path)
-            .map_err(|e| {
-                log_error!("Failed to create templates folder. Error: {}", e);
-            })
-            .unwrap();
+        if let Err(e) = fs::create_dir_all(&templates_path) {
+            log_error!("Failed to create templates folder. Error: {}", e);
+        }
         vec![]
     }
 }
@@ -178,7 +180,9 @@ impl MetaDataState {
     /// metadata_state.update_template_paths()?;
     /// ```
     pub fn update_template_paths(&self) -> io::Result<()> {
-        let mut meta_data = self.0.lock().unwrap();
+        let mut meta_data = self.0.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "Failed to acquire metadata lock")
+        })?;
         meta_data.template_paths = load_templates();
         self.write_meta_data_to_file(&meta_data)
     }

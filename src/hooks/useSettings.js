@@ -15,4 +15,5 @@ const useSettings = () => {
     return context;
 };
 
+export { useSettings };
 export default useSettings;
