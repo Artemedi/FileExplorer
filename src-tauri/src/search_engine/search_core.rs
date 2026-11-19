@@ -553,6 +553,7 @@ impl SearchCore {
 
         let result = task::spawn_blocking(move || {
             let patterns_ref = excluded.clone().unwrap_or_default();
+            let root_path_buf = std::path::PathBuf::from(&root_path);
             let mut file_count = 0;
             for entry in WalkDir::new(&root_path)
                 .follow_links(false)
@@ -561,6 +562,9 @@ impl SearchCore {
                 .filter_entry(|e| {
                     if stop_flag.load(Ordering::SeqCst) {
                         return false;
+                    }
+                    if e.depth() == 0 {
+                        return true;
                     }
                     if e.file_type().is_symlink() {
                         return false;
@@ -582,8 +586,9 @@ impl SearchCore {
                             return false;
                         }
                     }
-                    if let Some(path_str) = e.path().to_str() {
-                        if Self::path_matches_excluded_patterns(path_str, &patterns_ref) {
+                    let rel_path = e.path().strip_prefix(&root_path_buf).unwrap_or(e.path());
+                    if let Some(rel_str) = rel_path.to_str() {
+                        if Self::path_matches_excluded_patterns(rel_str, &patterns_ref) {
                             return false;
                         }
                     }
@@ -617,7 +622,12 @@ impl SearchCore {
                 }
 
                 if let Some(path_str) = path.to_str() {
-                    if Self::path_matches_excluded_patterns(path_str, &patterns_ref) {
+                    let rel_str = path
+                        .strip_prefix(&root_path_buf)
+                        .ok()
+                        .and_then(|p| p.to_str())
+                        .unwrap_or(path_str);
+                    if Self::path_matches_excluded_patterns(rel_str, &patterns_ref) {
                         #[cfg(feature = "index-progress-logging")]
                         log_info!("Excluded by pattern: '{}'", path_str);
                         continue;

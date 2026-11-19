@@ -577,7 +577,7 @@ mod command_exec_tests {
         let cmd = if cfg!(target_os = "windows") {
             "ping -n 1 127.0.0.1 | Out-Null; Write-Output 'marker'".to_string()
         } else {
-            "ping 127.0.0.1 >/dev/null 2>&1; echo marker".to_string()
+            "ping -c 1 127.0.0.1 >/dev/null 2>&1; echo marker".to_string()
         };
         let res = execute_command_with_timeout(cmd, None, Some(10))
             .await

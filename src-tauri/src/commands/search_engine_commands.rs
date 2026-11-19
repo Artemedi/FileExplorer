@@ -452,7 +452,6 @@ pub fn set_search_current_directory_impl(
 mod tests_autocomplete_commands {
     use super::*;
     use crate::state::searchengine_data::SearchEngineStatus;
-    use crate::state::SettingsState;
     use std::fs::File;
     use std::io::Write;
     use std::time::{Duration, Instant};
@@ -460,9 +459,8 @@ mod tests_autocomplete_commands {
 
     // Helper function to create an isolated test SearchEngineState with RAII TempDir
     fn create_test_search_engine_state() -> (Arc<Mutex<SearchEngineState>>, TempDir) {
-        let settings_dir = TempDir::new().unwrap();
-        let settings_path = settings_dir.path().join("settings.json");
-        let settings_state = Arc::new(Mutex::new(SettingsState::new_with_path(settings_path)));
+        let (settings_state, settings_dir) =
+            crate::state::searchengine_data::create_isolated_test_settings();
         let engine_state = Arc::new(Mutex::new(SearchEngineState::new(settings_state)));
         (engine_state, settings_dir)
     }

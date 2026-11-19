@@ -752,10 +752,11 @@ impl SearchEngineState {
                         }
                     }
 
-                    if let Some(path_str) = path.to_str() {
-                        // Unified normalized, case-insensitive exclusion check
+                    let rel_path = path.strip_prefix(root_dir).unwrap_or(&path);
+                    if let (Some(path_str), Some(rel_str)) = (path.to_str(), rel_path.to_str()) {
+                        // Unified normalized, case-insensitive exclusion check against relative path under root_dir
                         let should_exclude =
-                            SearchCore::path_matches_excluded_patterns(path_str, excluded_patterns);
+                            SearchCore::path_matches_excluded_patterns(rel_str, excluded_patterns);
 
                         if !should_exclude {
                             // Add to current batch with is_dir metadata
@@ -1607,6 +1608,21 @@ pub(crate) fn create_isolated_test_settings() -> (Arc<Mutex<SettingsState>>, tem
     let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory for settings");
     let settings_path = temp_dir.path().join("settings.json");
     let settings_state = Arc::new(Mutex::new(SettingsState::new_with_path(settings_path)));
+    {
+        // On Windows, TempDir paths live under ...\AppData\Local\Temp\..., which would
+        // match the default "AppData" and "Temp" excluded_patterns in single-path tests.
+        let state_guard = settings_state.lock().unwrap();
+        let mut inner = state_guard.0.lock().unwrap();
+        if let Some(patterns) = inner
+            .backend_settings
+            .search_engine_config
+            .excluded_patterns
+            .as_mut()
+        {
+            patterns
+                .retain(|p| !p.eq_ignore_ascii_case("AppData") && !p.eq_ignore_ascii_case("Temp"));
+        }
+    }
     (settings_state, temp_dir)
 }
 
