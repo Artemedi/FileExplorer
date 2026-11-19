@@ -178,17 +178,6 @@ img, svg {
     background-color: var(--accent);
 }
 
-.main-layout {
-    display: flex;
-    height: 100vh;
-    overflow: hidden;
-    position: relative;
-}
-
-.main-layout.with-terminal .content-section {
-    overflow-y: auto;
-}
-
 .terminal-toggle {
     background: none;
     border: none;
@@ -198,28 +187,20 @@ img, svg {
     justify-content: center;
     padding: 4px 8px;
     border-radius: 4px;
-    color: var(--text-color);
+    color: var(--text-primary);
     margin-left: 8px;
 }
 
 .terminal-toggle:hover {
-    background-color: var(--hover-color);
+    background-color: var(--surface-hover);
 }
 
 .terminal-toggle.active {
-    color: var(--accent-color);
+    color: var(--accent);
 }
 
 .terminal-toggle .icon {
     font-size: 16px;
-}
-
-.main-layout.with-terminal .main-content {
-    overflow-y: auto;
-}
-
-.main-layout .main-content {
-    transition: padding-bottom 0.2s ease;
 }
 
 .terminal-wrapper {

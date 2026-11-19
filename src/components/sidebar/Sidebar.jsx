@@ -1,4 +1,5 @@
 import React, {useEffect, useRef, useState} from 'react';
+import {invoke} from '@tauri-apps/api/core';
 import {useFileSystem} from '../../providers/FileSystemProvider';
 import {useHistory} from '../../providers/HistoryProvider';
 import {useContextMenu} from '../../providers/ContextMenuProvider';
@@ -27,8 +28,17 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
     const { volumes, loadDirectory, loadVolumes } = useFileSystem();
     const { currentPath, navigateTo } = useHistory();
     const { removeFromFavorites } = useContextMenu();
-    const { navigateToSftpConnection, createSftpUrl, isSftpPath, parseSftpPath, createSftpPath } = useSftp();
+    const { currentSftpConnection, disconnectSftp, createSftpUrl, isSftpPath, parseSftpPath, createSftpPath } = useSftp();
     const { t } = useTranslation();
+    const ejectTimerRef = useRef(null);
+    const focusTimerRef = useRef(null);
+
+    useEffect(() => {
+        return () => {
+            if (ejectTimerRef.current) clearTimeout(ejectTimerRef.current);
+            if (focusTimerRef.current) clearTimeout(focusTimerRef.current);
+        };
+    }, []);
 
     const [systemInfo, setSystemInfo] = useState(null);
     const [isAddSourceModalOpen, setIsAddSourceModalOpen] = useState(false);
@@ -65,7 +75,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
     const loadSftpConnections = React.useCallback(() => {
         try {
             const saved = JSON.parse(localStorage.getItem('fileExplorerSftpConnections') || '[]');
-            setSftpConnections(saved);
+            setSftpConnections(Array.isArray(saved) ? saved : []);
         } catch (err) {
             setSftpConnections([]);
         }
@@ -86,11 +96,18 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
         };
     }, [loadSftpConnections]);
 
-    // Add SFTP connection
+    // Add SFTP connection (never store plaintext password in localStorage)
     const addSftpConnection = (conn) => {
         try {
-            const existing = JSON.parse(localStorage.getItem('fileExplorerSftpConnections') || '[]');
-            const newConnections = [...existing, conn];
+            const { password: _omitted, ...safeConn } = conn || {};
+            let existing = [];
+            try {
+                const parsed = JSON.parse(localStorage.getItem('fileExplorerSftpConnections') || '[]');
+                existing = Array.isArray(parsed) ? parsed : [];
+            } catch {
+                existing = [];
+            }
+            const newConnections = [...existing, safeConn];
             localStorage.setItem('fileExplorerSftpConnections', JSON.stringify(newConnections));
             window.dispatchEvent(new CustomEvent('sftp-connections-updated'));
             window.dispatchEvent(new StorageEvent('storage', {
@@ -104,11 +121,27 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
     };
 
     // Remove SFTP connection with confirmation
-    const removeSftpConnection = async (name) => {
+    const removeSftpConnection = async (connOrName) => {
+        const name = typeof connOrName === 'string' ? connOrName : connOrName?.name;
         const confirmRemove = await showConfirm(`Are you sure you want to remove the SFTP connection "${name}"?`);
         if (!confirmRemove) return;
         try {
-            const existing = JSON.parse(localStorage.getItem('fileExplorerSftpConnections') || '[]');
+            let existing = [];
+            try {
+                const parsed = JSON.parse(localStorage.getItem('fileExplorerSftpConnections') || '[]');
+                existing = Array.isArray(parsed) ? parsed : [];
+            } catch {
+                existing = [];
+            }
+            const targetConn = typeof connOrName === 'object' && connOrName !== null
+                ? connOrName
+                : existing.find(c => c.name === name);
+
+            if (targetConn && targetConn.host && targetConn.username) {
+                const connectionKey = `${targetConn.username}@${targetConn.host}:${targetConn.port || 22}`;
+                await invoke('remove_sftp_credentials', { connectionKey }).catch(() => {});
+            }
+
             const newConnections = existing.filter(c => c.name !== name);
             localStorage.setItem('fileExplorerSftpConnections', JSON.stringify(newConnections));
             window.dispatchEvent(new CustomEvent('sftp-connections-updated'));
@@ -116,6 +149,15 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                 key: 'fileExplorerSftpConnections',
                 newValue: JSON.stringify(newConnections)
             }));
+
+            const isActiveSession =
+                currentSftpConnection?.name === name ||
+                (isSftpPath(currentPath) && parseSftpPath(currentPath)?.connection?.name === name);
+            if (isActiveSession) {
+                disconnectSftp();
+                document.dispatchEvent(new CustomEvent('open-this-pc'));
+            }
+
             showSuccess(`SFTP connection "${name}" removed successfully.`);
         } catch (err) {
             showError('Failed to remove SFTP connection: ' + err.message);
@@ -124,14 +166,22 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
 
     // State for collapsible sections
     const [sectionCollapsed, setSectionCollapsed] = useState(() => {
-        const saved = localStorage.getItem('sidebarSectionsCollapsed');
-        return saved ? JSON.parse(saved) : {
+        const defaults = {
             quickAccess: false,
             thisPC: false,
             favorites: false,
             drives: false,
             network: false
         };
+        try {
+            const saved = localStorage.getItem('sidebarSectionsCollapsed');
+            const parsed = saved ? JSON.parse(saved) : null;
+            return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+                ? { ...defaults, ...parsed }
+                : defaults;
+        } catch {
+            return defaults;
+        }
     });
 
     /**
@@ -140,7 +190,6 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
     useEffect(() => {
         const loadSystemInfo = async () => {
             try {
-                const { invoke } = await import('@tauri-apps/api/core');
                 const metaDataJson = await invoke('get_meta_data_as_json');
                 const metaData = JSON.parse(metaDataJson);
                 setSystemInfo(metaData);
@@ -184,7 +233,13 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
         if (isSftpPath(path)) {
             // Check if this is a favorite item and if it looks like a file
             // For SFTP favorites, check if the path ends with a file extension or doesn't look like a directory
-            const favorites = JSON.parse(localStorage.getItem('fileExplorerFavorites') || '[]');
+            let favorites = [];
+            try {
+                const parsedFavs = JSON.parse(localStorage.getItem('fileExplorerFavorites') || '[]');
+                favorites = Array.isArray(parsedFavs) ? parsedFavs : [];
+            } catch {
+                favorites = [];
+            }
             const favoriteItem = favorites.find(fav => fav.path === path);
             
             if (favoriteItem && favoriteItem.icon === 'file') {
@@ -248,7 +303,16 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
      */
     const addToFavorites = (location) => {
         try {
-            const existingFavorites = JSON.parse(localStorage.getItem('fileExplorerFavorites') || '[]');
+            let existingFavorites = [];
+            try {
+                const parsed = JSON.parse(localStorage.getItem('fileExplorerFavorites') || '[]');
+                existingFavorites = Array.isArray(parsed) ? parsed : [];
+            } catch {
+                existingFavorites = [];
+            }
+            if (existingFavorites.some(fav => fav.path === location.path)) {
+                return;
+            }
             const newFavorites = [...existingFavorites, location];
             localStorage.setItem('fileExplorerFavorites', JSON.stringify(newFavorites));
 
@@ -279,7 +343,8 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
         setIsAddSourceModalOpen(true);
 
         // Focus input after modal opens
-        setTimeout(() => {
+        if (focusTimerRef.current) clearTimeout(focusTimerRef.current);
+        focusTimerRef.current = setTimeout(() => {
             if (addSourceInputRef.current) {
                 addSourceInputRef.current.focus();
             }
@@ -533,37 +598,15 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                                                     if (!confirmEject) return;
 
                                                     try {
-                                                        const { invoke } = await import('@tauri-apps/api/core');
-                                                        let command;
-                                                        const os = systemInfo?.current_running_os?.toLowerCase();
-                                                        
-                                                        if (os === 'windows') {
-                                                            command = `eject ${volume.mount_point}`;
-                                                        } else if (os === 'macos' || os === 'darwin') {
-                                                            // Use diskutil for proper ejection on macOS
-                                                            command = `diskutil eject "${volume.mount_point}"`;
-                                                        } else {
-                                                            // Linux and other Unix-like systems
-                                                            command = `umount "${volume.mount_point}"`;
-                                                        }
-
-                                                        const result = await invoke('execute_command', { command });
-                                                        
-                                                        // Parse the command result to check for success
-                                                        const commandResponse = JSON.parse(result);
-                                                        
-                                                        if (commandResponse.status === 0) {
-                                                            showSuccess(`${volume.volume_name} has been safely ejected.`);
-                                                            // Reload volumes to update the UI after ejection
-                                                            setTimeout(() => {
-                                                                loadVolumes();
-                                                            }, 1000);
-                                                        } else {
-                                                            throw new Error(commandResponse.stderr || commandResponse.stdout || 'Ejection failed');
-                                                        }
+                                                        await invoke('eject_volume', { mountPoint: volume.mount_point });
+                                                        showSuccess(`${volume.volume_name} has been safely ejected.`);
+                                                        if (ejectTimerRef.current) clearTimeout(ejectTimerRef.current);
+                                                        ejectTimerRef.current = setTimeout(() => {
+                                                            loadVolumes();
+                                                        }, 1000);
                                                     } catch (error) {
                                                         console.error('Failed to eject volume:', error);
-                                                        let errorMessage = error.message || error;
+                                                        let errorMessage = error?.message || String(error);
                                                         
                                                         // Parse error message if it's JSON
                                                         try {
@@ -590,8 +633,17 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                             <div className="sidebar-section-actions">
                                 <button
                                     className="section-add-button"
+                                    onClick={() => document.dispatchEvent(new CustomEvent('open-network'))}
+                                    title="Open Network View"
+                                    aria-label="Open Network View"
+                                >
+                                    <span className="icon icon-network"></span>
+                                </button>
+                                <button
+                                    className="section-add-button"
                                     onClick={() => setIsAddSftpModalOpen(true)}
                                     title="Add SFTP Connection"
+                                    aria-label="Add SFTP Connection"
                                 >
                                     <span className="icon icon-plus-small"></span>
                                 </button>
@@ -623,14 +675,17 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                                             icon="network"
                                             name={conn.name}
                                             path={`sftp://${conn.username}@${conn.host}:${conn.port}`}
-                                            isActive={currentView === 'network' && currentPath === conn.name}
+                                            isActive={
+                                                currentView === 'explorer' &&
+                                                isSftpPath(currentPath) &&
+                                                parseSftpPath(currentPath)?.connection?.name === conn.name
+                                            }
                                             onClick={async () => {
-                                                // Navigate to SFTP connection using the new provider
                                                 try {
-                                                    const sftpData = await navigateToSftpConnection(conn);
-                                                    if (sftpData) {
-                                                        const sftpPath = createSftpUrl(conn, '.');
-                                                        await loadDirectory(sftpPath);
+                                                    const sftpPath = createSftpUrl(conn, '.');
+                                                    window.dispatchEvent(new CustomEvent('force-explorer-view'));
+                                                    const ok = await loadDirectory(sftpPath);
+                                                    if (ok) {
                                                         navigateTo(sftpPath);
                                                     }
                                                 } catch (error) {
@@ -640,7 +695,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                                             actions={[{
                                                 icon: 'x',
                                                 tooltip: 'Remove SFTP Connection',
-                                                onClick: () => removeSftpConnection(conn.name)
+                                                onClick: () => removeSftpConnection(conn)
                                             }]}
                                         />
                                     ))
@@ -653,6 +708,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                 isOpen={isAddSftpModalOpen}
                 onClose={() => setIsAddSftpModalOpen(false)}
                 onAdd={addSftpConnection}
+                existingConnections={sftpConnections}
             />
 
             {/* Permission Helper Modal */}

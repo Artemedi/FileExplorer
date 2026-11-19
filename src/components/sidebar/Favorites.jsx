@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import SidebarItem from './SidebarItem';
+import { showConfirm } from '../../utils/NotificationSystem';
 
 /**
  * Favorites component - Displays and manages favorite locations
@@ -30,7 +31,7 @@ const Favorites = ({
     const loadFavorites = useCallback(() => {
         try {
             const savedFavorites = JSON.parse(localStorage.getItem('fileExplorerFavorites') || '[]');
-            setFavorites(savedFavorites);
+            setFavorites(Array.isArray(savedFavorites) ? savedFavorites : []);
         } catch (err) {
             console.error('Failed to load favorites:', err);
             setFavorites([]);
@@ -75,10 +76,10 @@ const Favorites = ({
      * @param {React.MouseEvent} e - Context menu event
      * @param {Object} item - The favorite item
      */
-    const handleContextMenu = (e, item) => {
+    const handleContextMenu = async (e, item) => {
         e.preventDefault();
 
-        const choice = confirm('Remove from favorites?');
+        const choice = await showConfirm('Remove from favorites?');
         if (choice) {
             onRemove(item.path);
         }

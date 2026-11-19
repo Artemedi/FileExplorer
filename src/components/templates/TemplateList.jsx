@@ -159,13 +159,16 @@ const TemplateList = ({ onClose }) => {
      * @async
      */
     const applyTemplate = async () => {
-        if (!selectedTemplate || !destinationPath) return;
+        const trimmedDest = destinationPath.trim();
+        if (!selectedTemplate || !trimmedDest) return;
 
         try {
-            await useTemplate(selectedTemplate.path, destinationPath);
+            await useTemplate(selectedTemplate.path, trimmedDest);
 
-            // Reload the directory to show the new content
-            await loadDirectory(currentPath);
+            // Reload the directory to show the new content if a directory is currently open
+            if (currentPath) {
+                await loadDirectory(currentPath);
+            }
 
             // Close the modal
             setIsUseModalOpen(false);
@@ -174,7 +177,7 @@ const TemplateList = ({ onClose }) => {
             showSuccess(`Template "${selectedTemplate.name}" applied successfully!`);
         } catch (err) {
             console.error('Failed to apply template:', err);
-            setError('Failed to apply template. Please try again.');
+            showError(`Failed to apply template: ${err?.message || err}`);
         }
     };
 
@@ -351,6 +354,7 @@ const TemplateList = ({ onClose }) => {
                         <Button
                             variant="primary"
                             onClick={applyTemplate}
+                            disabled={!destinationPath.trim()}
                         >
                             Apply Template
                         </Button>

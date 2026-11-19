@@ -1,7 +1,10 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useId } from 'react';
 import ReactDOM from 'react-dom';
 import Icon from './Icon';
 import './common.css';
+
+// Track open modal stack so Escape closes only the topmost modal
+const modalStack = [];
 
 /**
  * Modal component
@@ -32,27 +35,40 @@ const Modal = ({
                    ...rest
                }) => {
     const modalRef = useRef(null);
+    const modalId = useId();
+    const titleId = useId();
 
-    // Close modal when Escape key is pressed
+    // Manage modal stack, Escape key handling, and body scroll lock
     useEffect(() => {
+        if (!isOpen) return;
+
+        modalStack.push(modalId);
+        document.body.style.overflow = 'hidden';
+
         const handleKeyDown = (event) => {
-            if (closeOnEsc && event.key === 'Escape' && isOpen) {
+            if (
+                closeOnEsc &&
+                event.key === 'Escape' &&
+                modalStack[modalStack.length - 1] === modalId
+            ) {
+                event.stopPropagation();
                 onClose();
             }
         };
 
-        if (isOpen) {
-            document.addEventListener('keydown', handleKeyDown);
-            // Prevent scrolling of the body when modal is open
-            document.body.style.overflow = 'hidden';
-        }
+        document.addEventListener('keydown', handleKeyDown);
 
         return () => {
             document.removeEventListener('keydown', handleKeyDown);
-            // Restore scrolling when modal is closed
-            document.body.style.overflow = '';
+            const idx = modalStack.lastIndexOf(modalId);
+            if (idx !== -1) {
+                modalStack.splice(idx, 1);
+            }
+            if (modalStack.length === 0) {
+                document.body.style.overflow = '';
+            }
         };
-    }, [isOpen, onClose, closeOnEsc]);
+    }, [isOpen, onClose, closeOnEsc, modalId]);
 
     // Focus the modal when it opens
     useEffect(() => {
@@ -65,7 +81,7 @@ const Modal = ({
 
             // Restore focus when modal closes
             return () => {
-                if (previouslyFocused) {
+                if (typeof previouslyFocused?.focus === 'function') {
                     previouslyFocused.focus();
                 }
             };
@@ -105,14 +121,14 @@ const Modal = ({
                 tabIndex={-1}
                 role="dialog"
                 aria-modal="true"
-                aria-labelledby={title ? 'modal-title' : undefined}
+                aria-labelledby={title ? titleId : undefined}
                 {...rest}
             >
                 {/* Modal Header */}
                 {(title || showCloseButton) && (
                     <div className="modal-header">
                         {title && (
-                            <h2 className="modal-title" id="modal-title">
+                            <h2 className="modal-title" id={titleId}>
                                 {title}
                             </h2>
                         )}

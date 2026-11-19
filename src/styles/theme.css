@@ -22,6 +22,10 @@
     --success: var(--light-success);
     --warning: var(--light-warning);
     --info: var(--light-info);
+    --warning-bg: var(--light-warning-bg);
+    --warning-border: var(--light-warning-border);
+    --warning-text: var(--light-warning-text);
+    --info-bg: var(--light-info-bg);
 }
 
 /* Dark Theme */
@@ -43,6 +47,10 @@
     --success: var(--dark-success);
     --warning: var(--dark-warning);
     --info: var(--dark-info);
+    --warning-bg: var(--dark-warning-bg);
+    --warning-border: var(--dark-warning-border);
+    --warning-text: var(--dark-warning-text);
+    --info-bg: var(--dark-info-bg);
 }
 
 /* System preference based theme */
@@ -65,6 +73,10 @@
         --success: var(--dark-success);
         --warning: var(--dark-warning);
         --info: var(--dark-info);
+        --warning-bg: var(--dark-warning-bg);
+        --warning-border: var(--dark-warning-border);
+        --warning-text: var(--dark-warning-text);
+        --info-bg: var(--dark-info-bg);
     }
 }
 
@@ -87,6 +99,10 @@
         --success: var(--light-success);
         --warning: var(--light-warning);
         --info: var(--light-info);
+        --warning-bg: var(--light-warning-bg);
+        --warning-border: var(--light-warning-border);
+        --warning-text: var(--light-warning-text);
+        --info-bg: var(--light-info-bg);
     }
 }
 
@@ -109,6 +125,10 @@
     --success: #00ff00;
     --warning: #ffaa00;
     --info: #00ffff;
+    --warning-bg: #1a1200;
+    --warning-border: #ffaa00;
+    --warning-text: #ffaa00;
+    --info-bg: #001a1a;
 }
 
 /* Custom color themes */

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useSettings } from '../../providers/SettingsProvider';
 import { useTheme } from '../../providers/ThemeProvider';
@@ -16,7 +16,7 @@ import './settings.css';
  * @returns {React.ReactElement} Settings panel modal component
  */
 const SettingsPanel = ({ isOpen, onClose }) => {
-    const { settings, error, updateSetting, resetSettings, reloadSettings } = useSettings();
+    const { settings, error, updateSetting, resetSettings } = useSettings();
     const { setTheme } = useTheme();
     const { t, language, setLanguage } = useTranslation();
     const [isResetting, setIsResetting] = useState(false);
@@ -25,6 +25,32 @@ const SettingsPanel = ({ isOpen, onClose }) => {
     const [isDefaultFileManager, setIsDefaultFileManager] = useState(false);
     const [isContextMenuEnabled, setIsContextMenuEnabled] = useState(false);
     const [isIntegrationLoading, setIsIntegrationLoading] = useState(false);
+    const [accentColor, setAccentColor] = useState(settings.accent_color || '#0672ef');
+    const [defaultFolderPath, setDefaultFolderPath] = useState(settings.default_folder_path_on_opening || '');
+    const [terminalHeightInput, setTerminalHeightInput] = useState(String(settings.terminal_height ?? 240));
+    const accentTimerRef = useRef(null);
+    const folderPathTimerRef = useRef(null);
+
+    useEffect(() => {
+        setAccentColor(settings.accent_color || '#0672ef');
+    }, [settings.accent_color]);
+
+    useEffect(() => {
+        setDefaultFolderPath(settings.default_folder_path_on_opening || '');
+    }, [settings.default_folder_path_on_opening]);
+
+    useEffect(() => {
+        if (settings.terminal_height !== undefined && settings.terminal_height !== null) {
+            setTerminalHeightInput(String(settings.terminal_height));
+        }
+    }, [settings.terminal_height]);
+
+    useEffect(() => {
+        return () => {
+            if (accentTimerRef.current) clearTimeout(accentTimerRef.current);
+            if (folderPathTimerRef.current) clearTimeout(folderPathTimerRef.current);
+        };
+    }, []);
 
     useEffect(() => {
         if (isOpen) {
@@ -112,7 +138,7 @@ const SettingsPanel = ({ isOpen, onClose }) => {
     const sortOptions = [
         { id: 'Name', label: 'Name' },
         { id: 'Size', label: 'Size' },
-        { id: 'Modified', label: 'Date Modified' },
+        { id: 'Date', label: 'Date Modified' },
         { id: 'Type', label: 'Type' }
     ];
 
@@ -244,7 +270,6 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                                 onChange={(e) => {
                                     const isDark = e.target.value === 'true';
                                     setTheme(isDark ? 'dark' : 'light');
-                                    updateSetting('darkmode', isDark);
                                 }}
                             />
                             <span>{theme.label}</span>
@@ -289,8 +314,15 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                 <div className="form-group">
                     <input
                         type="color"
-                        value={settings.accent_color || '#0672ef'}
-                        onChange={(e) => updateSetting('accent_color', e.target.value)}
+                        value={accentColor}
+                        onChange={(e) => {
+                            const nextColor = e.target.value;
+                            setAccentColor(nextColor);
+                            if (accentTimerRef.current) clearTimeout(accentTimerRef.current);
+                            accentTimerRef.current = setTimeout(() => {
+                                updateSetting('accent_color', nextColor);
+                            }, 250);
+                        }}
                         className="color-picker"
                     />
                     <div className="input-hint">
@@ -528,8 +560,24 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                         type="number"
                         min="200"
                         max="600"
-                        value={settings.terminal_height || 240}
-                        onChange={(e) => updateSetting('terminal_height', parseInt(e.target.value))}
+                        value={terminalHeightInput}
+                        onChange={(e) => {
+                            const raw = e.target.value;
+                            setTerminalHeightInput(raw);
+                            const parsed = Number.parseInt(raw, 10);
+                            if (Number.isNaN(parsed)) return;
+                            const clamped = Math.min(600, Math.max(200, parsed));
+                            updateSetting('terminal_height', clamped);
+                        }}
+                        onBlur={() => {
+                            const parsed = Number.parseInt(terminalHeightInput, 10);
+                            if (Number.isNaN(parsed)) {
+                                setTerminalHeightInput(String(settings.terminal_height ?? 240));
+                            } else {
+                                const clamped = Math.min(600, Math.max(200, parsed));
+                                setTerminalHeightInput(String(clamped));
+                            }
+                        }}
                         className="settings-input"
                     />
                 </div>
@@ -578,8 +626,15 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                     <label>Default folder on opening:</label>
                     <input
                         type="text"
-                        value={settings.default_folder_path_on_opening || ''}
-                        onChange={(e) => updateSetting('default_folder_path_on_opening', e.target.value)}
+                        value={defaultFolderPath}
+                        onChange={(e) => {
+                            const nextPath = e.target.value;
+                            setDefaultFolderPath(nextPath);
+                            if (folderPathTimerRef.current) clearTimeout(folderPathTimerRef.current);
+                            folderPathTimerRef.current = setTimeout(() => {
+                                updateSetting('default_folder_path_on_opening', nextPath);
+                            }, 250);
+                        }}
                         className="settings-input"
                         placeholder="Leave empty to use system default"
                     />
@@ -632,7 +687,7 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                         </div>
                     )}
                     <div className="settings-footer-buttons">
-                        <Button variant="primary" onClick={reloadSettings}>
+                        <Button variant="primary" onClick={onClose}>
                             {t('common.save')}
                         </Button>
                         <Button variant="ghost" onClick={onClose}>

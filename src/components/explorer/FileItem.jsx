@@ -1,14 +1,26 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import FileIcon from './FileIcon';
 import { formatFileSize, formatDate, getFileType } from '../../utils/formatters';
-import { replaceFileName } from '../../utils/pathUtils';
+import { joinPath, normalizePath, getDirectoryPath } from '../../utils/pathUtils';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useContextMenu } from '../../providers/ContextMenuProvider';
 import { useSettings } from '../../providers/SettingsProvider';
-import { showError, showSuccess, showConfirm } from '../../utils/NotificationSystem';
+import { showError, showSuccess } from '../../utils/NotificationSystem';
 import './fileItem.css';
+
+const isSameOrChildPath = (sourcePath, targetDirPath) => {
+    const isSftp = sourcePath.startsWith('sftp:') || targetDirPath.startsWith('sftp:');
+    const normSrc = normalizePath(sourcePath);
+    const normTarget = normalizePath(targetDirPath);
+    const a = isSftp ? normSrc : normSrc.toLowerCase();
+    const b = isSftp ? normTarget : normTarget.toLowerCase();
+    if (a === b) return true;
+    const sep = isSftp ? '/' : (a.includes('/') ? '/' : '\\');
+    const prefix = a.endsWith(sep) ? a : `${a}${sep}`;
+    return b.startsWith(prefix);
+};
 
 /**
  * Component that displays a single file or directory item
@@ -17,6 +29,7 @@ import './fileItem.css';
  * @param {string} [props.viewMode='grid'] - The view mode: 'grid', 'list', or 'details'
  * @param {boolean} [props.isSelected=false] - Whether the item is currently selected
  * @param {boolean} [props.isFocused=false] - Whether the item is currently focused for keyboard navigation
+ * @param {Function} [props.onRefresh] - Optional refresh callback (e.g. for DualPane)
  * @param {Function} props.onClick - Click handler function
  * @param {Function} props.onDoubleClick - Double-click handler function
  * @param {Function} props.onContextMenu - Context menu handler function
@@ -27,6 +40,7 @@ const FileItem = ({
                       viewMode = 'grid',
                       isSelected = false,
                       isFocused = false,
+                      onRefresh,
                       onClick,
                       onDoubleClick,
                       onContextMenu
@@ -37,7 +51,7 @@ const FileItem = ({
     const { settings } = useSettings();
     const [isDragOver, setIsDragOver] = useState(false);
 
-    const isDirectory = item.isDirectory || 'sub_file_count' in item;
+    const isDirectory = Boolean(item.isDirectory || item.is_directory || 'sub_file_count' in item);
     const showExtensions = settings?.show_file_extensions !== false;
     const displayName = (() => {
         if (isDirectory || showExtensions) return item.name;
@@ -45,56 +59,24 @@ const FileItem = ({
         return lastDot > 0 ? item.name.slice(0, lastDot) : item.name;
     })();
     const fileType = isDirectory ? 'Folder' : getFileType(item.name);
+    const rawSize = item.size_in_bytes ?? item.size ?? 0;
     const size = isDirectory
         ? `${item.sub_file_count || 0} items`
-        : formatFileSize(item.size_in_bytes);
+        : formatFileSize(rawSize);
 
     // Check if this item is cut (in clipboard with cut operation)
     const isCut = clipboard.operation === 'cut' && 
                   clipboard.items.some(clipItem => clipItem.path === item.path);
 
     // Format modified date
-    const modified = formatDate(item.last_modified);
+    const modified = formatDate(item.last_modified ?? item.modified);
 
 
-    /**
-     * Handles the rename operation with robust path handling
-     * @param {Object} item - The item to rename
-     * @param {string} newName - The new name for the item
-     */
-    const handleRename = async (item, newName) => {
-        if (!newName || newName === item.name) return;
-
-        try {
-            // Use the robust path utility to create the new path
-            const newPath = replaceFileName(item.path, newName);
-
-            console.log(`Renaming: "${item.path}" -> "${newPath}"`);
-
-            await invoke('rename', {
-                oldPath: item.path,
-                newPath: newPath
-            });
-
-            console.log('Rename operation completed successfully');
-
-            // Reload current directory
-            if (currentPath) {
-                await loadDirectory(currentPath);
-            }
-        } catch (error) {
-            console.error('Rename operation failed:', error);
-            if (error.message && error.message.includes('already exists')) {
-                const shouldCreateCopy = await showConfirm(`A file named "${newName}" already exists. Create a copy instead?`, 'File Exists');
-                if (shouldCreateCopy) {
-                    const extension = newName.includes('.') ? newName.split('.').pop() : '';
-                    const baseName = extension ? newName.replace(`.${extension}`, '') : newName;
-                    const copyName = extension ? `${baseName} - Copy.${extension}` : `${baseName} - Copy`;
-                    handleRename(item, copyName);
-                }
-            } else {
-                showError(`Failed to rename: ${error.message || error}`);
-            }
+    const refreshTarget = () => {
+        if (onRefresh) {
+            onRefresh();
+        } else if (currentPath) {
+            loadDirectory(currentPath);
         }
     };
 
@@ -130,25 +112,61 @@ const FileItem = ({
         setIsDragOver(false);
 
         try {
-            const raw = e.dataTransfer.getData('application/json');
+            const raw = e.dataTransfer?.getData('application/json');
             if (raw) {
                 const source = JSON.parse(raw);
-                if (source && source.path && source.path !== item.path) {
-                    const separator = item.path.includes('/') ? '/' : '\\';
-                    const dest = item.path.endsWith(separator)
-                        ? `${item.path}${source.name}`
-                        : `${item.path}${separator}${source.name}`;
+                if (source && source.path) {
+                    if (isSameOrChildPath(source.path, item.path)) {
+                        return;
+                    }
+                    const parentDir = normalizePath(getDirectoryPath(source.path));
+                    const targetDir = normalizePath(item.path);
+                    const isSftp = source.path.startsWith('sftp:') || item.path.startsWith('sftp:');
+                    const alreadyInTarget = isSftp
+                        ? parentDir === targetDir
+                        : parentDir.toLowerCase() === targetDir.toLowerCase();
+                    if (alreadyInTarget) {
+                        return;
+                    }
+
+                    const dest = joinPath(item.path, source.name);
                     await invoke('copy_file_or_dir', {
                         sourcePath: source.path,
                         destinationPath: dest
                     });
                     showSuccess(`Copied into ${item.name}`);
-                    if (currentPath) loadDirectory(currentPath);
+                    refreshTarget();
+                    return;
                 }
             }
         } catch (err) {
             console.error('Drop on folder failed:', err);
-            showError(`Failed to drop item: ${err.message || err}`);
+            showError(`Failed to drop item: ${err?.message || err}`);
+            return;
+        }
+
+        if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+            let count = 0;
+            for (let i = 0; i < e.dataTransfer.files.length; i++) {
+                const f = e.dataTransfer.files[i];
+                if (f.path && !isSameOrChildPath(f.path, item.path)) {
+                    const dest = joinPath(item.path, f.name);
+                    try {
+                        await invoke('copy_file_or_dir', {
+                            sourcePath: f.path,
+                            destinationPath: dest
+                        });
+                        count++;
+                    } catch (err) {
+                        console.error('File drop copy failed:', err);
+                        showError(`Failed to copy ${f.name}: ${err?.message || err}`);
+                    }
+                }
+            }
+            if (count > 0) {
+                showSuccess(`Copied ${count} item(s) into ${item.name}`);
+                refreshTarget();
+            }
         }
     };
 
@@ -166,17 +184,6 @@ const FileItem = ({
      */
     const handleMouseDown = (_e) => {
         // Allow drag and drop without blocking
-    };
-
-    /**
-     * Handles selectstart events
-     * @param {React.SyntheticEvent} e - The selectstart event
-     */
-    const handleSelectStart = (e) => {
-        // Only prevent text selection if not dragging
-        if (!e.target.closest('.file-item')) {
-            e.preventDefault();
-        }
     };
 
     /**
@@ -208,6 +215,8 @@ const FileItem = ({
         <>
             <div
                 className={`file-item view-mode-${viewMode.toLowerCase()} ${isSelected ? 'selected' : ''} ${isFocused ? 'focused' : ''} ${isDirectory ? 'directory' : 'file'} ${isCut ? 'cut' : ''} ${isDragOver ? 'drag-over' : ''}`}
+                role="option"
+                aria-selected={isSelected}
                 draggable
                 onDragStart={handleDragStart}
                 onDragOver={handleDragOver}
@@ -216,7 +225,6 @@ const FileItem = ({
                 onClick={handleClick}
                 onDoubleClick={handleDoubleClick}
                 onMouseDown={handleMouseDown}
-                onSelectStart={handleSelectStart}
                 onContextMenu={handleContextMenu}
                 data-path={item.path}
             >

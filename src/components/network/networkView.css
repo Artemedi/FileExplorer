@@ -273,7 +273,7 @@
 }
 
 /* Dark theme adjustments */
-[data-theme="dark"] .connection-card:hover {
+.theme-dark .connection-card:hover {
     box-shadow: 0 8px 25px rgba(255, 255, 255, 0.1);
 }
 

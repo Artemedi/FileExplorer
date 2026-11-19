@@ -26,11 +26,10 @@ const HashCompareModal = ({ isOpen, onClose, item }) => {
         if (isOpen) {
             setHashValue('');
             // Focus input after modal animation
-            setTimeout(() => {
-                if (inputRef.current) {
-                    inputRef.current.focus();
-                }
+            const timer = setTimeout(() => {
+                inputRef.current?.focus();
             }, 100);
+            return () => clearTimeout(timer);
         }
     }, [isOpen]);
 
@@ -77,24 +76,31 @@ const HashCompareModal = ({ isOpen, onClose, item }) => {
      */
     const handleKeyDown = (e) => {
         if (e.key === 'Escape') {
+            if (isComparing) {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
             onClose();
         }
     };
 
     /**
-     * Clean up pasted hash values by removing whitespace and common prefixes
+     * Clean up pasted hash values by extracting the longest hex hash token
      * @param {React.ClipboardEvent<HTMLTextAreaElement>} e - Paste event
      */
     const handlePaste = (e) => {
+        const target = e.target;
         // Allow the paste to happen, then clean it up
         setTimeout(() => {
-            const pastedValue = e.target.value;
-            // Remove any whitespace and common hash file prefixes
-            const cleanedValue = pastedValue
-                .replace(/^\s*([A-Fa-f0-9]+)\s*.*$/, '$1') // Extract just the hex part
-                .replace(/\s+/g, '') // Remove all whitespace
-                .toLowerCase();
-            setHashValue(cleanedValue);
+            const pastedValue = target?.value || '';
+            const matches = pastedValue.match(/[a-fA-F0-9]{8,}/g);
+            if (matches && matches.length > 0) {
+                const longest = matches.reduce((a, b) => (b.length > a.length ? b : a), matches[0]);
+                setHashValue(longest.toLowerCase());
+            } else {
+                setHashValue(pastedValue.trim().toLowerCase());
+            }
         }, 0);
     };
 
@@ -103,7 +109,11 @@ const HashCompareModal = ({ isOpen, onClose, item }) => {
     return (
         <Modal
             isOpen={isOpen}
-            onClose={onClose}
+            onClose={() => {
+                if (!isComparing) onClose();
+            }}
+            closeOnEsc={!isComparing}
+            closeOnOverlayClick={!isComparing}
             title="Compare Hash"
             size="md"
             footer={

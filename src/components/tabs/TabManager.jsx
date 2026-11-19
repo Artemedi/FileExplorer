@@ -41,6 +41,12 @@ const TabManager = ({ children }) => {
     const { t } = useTranslation();
     const [contextMenu, setContextMenu] = useState(null);
     const draggedTabIndexRef = useRef(-1);
+    const activeTabIdRef = useRef(activeTabId);
+    const pendingSwitchTabIdRef = useRef(null);
+
+    useEffect(() => {
+        activeTabIdRef.current = activeTabId;
+    }, [activeTabId]);
 
     useEffect(() => {
         const hideMenu = () => setContextMenu(null);
@@ -86,8 +92,17 @@ const TabManager = ({ children }) => {
         if (tabs.length > 0) {
             const active = tabs.find(t => t.id === activeTabId) || tabs[0];
             setActiveTabId(active.id);
-            if (active.path && active.path !== currentPath) {
-                loadDirectory(active.path).catch(() => {});
+            if (active.path === null) {
+                document.dispatchEvent(new CustomEvent('open-this-pc'));
+            } else if (active.path && active.path !== currentPath) {
+                pendingSwitchTabIdRef.current = active.id;
+                loadDirectory(active.path)
+                    .catch(() => {})
+                    .finally(() => {
+                        if (pendingSwitchTabIdRef.current === active.id) {
+                            pendingSwitchTabIdRef.current = null;
+                        }
+                    });
             }
         }
     }, []);
@@ -109,19 +124,20 @@ const TabManager = ({ children }) => {
     }, [currentPath, tabs.length]);
 
     /**
-     * Update active tab when path changes
+     * Update active tab when path changes (never triggered by activeTabId change alone)
      */
     useEffect(() => {
-        if (currentPath && activeTabId) {
+        const targetTabId = activeTabIdRef.current;
+        if (currentPath && targetTabId && !pendingSwitchTabIdRef.current) {
             setTabs(prevTabs =>
                 prevTabs.map(tab =>
-                    tab.id === activeTabId
+                    tab.id === targetTabId
                         ? { ...tab, title: getTabTitle(currentPath), path: currentPath }
                         : tab
                 )
             );
         }
-    }, [currentPath, activeTabId]);
+    }, [currentPath]);
 
     /**
      * Generates a unique ID for a new tab
@@ -217,9 +233,25 @@ const TabManager = ({ children }) => {
         if (isActiveTab && remainingTabs.length > 0) {
             const nextTabIndex = Math.min(tabIndex, remainingTabs.length - 1);
             const nextTab = remainingTabs[nextTabIndex];
-            setActiveTabId(nextTab.id);
-            if (nextTab.path && nextTab.path !== currentPath) {
-                loadDirectory(nextTab.path).catch(() => {});
+            if (nextTab.path === null) {
+                pendingSwitchTabIdRef.current = null;
+                setActiveTabId(nextTab.id);
+                document.dispatchEvent(new CustomEvent('open-this-pc'));
+            } else {
+                document.dispatchEvent(new CustomEvent('force-explorer-view'));
+                if (nextTab.path && nextTab.path !== currentPath) {
+                    pendingSwitchTabIdRef.current = nextTab.id;
+                    setActiveTabId(nextTab.id);
+                    loadDirectory(nextTab.path)
+                        .catch(() => {})
+                        .finally(() => {
+                            if (pendingSwitchTabIdRef.current === nextTab.id) {
+                                pendingSwitchTabIdRef.current = null;
+                            }
+                        });
+                } else {
+                    setActiveTabId(nextTab.id);
+                }
             }
         }
     };
@@ -233,15 +265,30 @@ const TabManager = ({ children }) => {
         const tab = tabs.find(t => t.id === tabId);
         if (!tab) return;
 
-        setActiveTabId(tabId);
+        if (tab.path === null) {
+            pendingSwitchTabIdRef.current = null;
+            setActiveTabId(tabId);
+            document.dispatchEvent(new CustomEvent('open-this-pc'));
+            return;
+        }
+
+        document.dispatchEvent(new CustomEvent('force-explorer-view'));
 
         // Load the directory for this tab
         if (tab.path !== currentPath) {
+            pendingSwitchTabIdRef.current = tabId;
+            setActiveTabId(tabId);
             try {
                 await loadDirectory(tab.path);
             } catch (error) {
                 console.error('Failed to load directory for tab:', error);
+            } finally {
+                if (pendingSwitchTabIdRef.current === tabId) {
+                    pendingSwitchTabIdRef.current = null;
+                }
             }
+        } else {
+            setActiveTabId(tabId);
         }
     };
 
@@ -300,25 +347,6 @@ const TabManager = ({ children }) => {
     };
 
     /**
-     * Handles mouse down events to prevent text selection
-     * @param {React.MouseEvent} e - The mouse down event
-     */
-    const handleMouseDown = (e) => {
-        // Prevent text selection on mouse down
-        e.preventDefault();
-    };
-
-    /**
-     * Handles selectstart events to prevent text selection
-     * @param {React.SyntheticEvent} e - The selectstart event
-     */
-    const handleSelectStart = (e) => {
-        // Prevent any text selection
-        e.preventDefault();
-        return false;
-    };
-
-    /**
      * Handles close button interactions with text selection prevention
      * @param {string} tabId - ID of the tab to close
      * @param {React.MouseEvent} e - The click event
@@ -345,8 +373,6 @@ const TabManager = ({ children }) => {
                             className={`tab ${tab.id === activeTabId ? 'active' : ''}`}
                             onClick={() => switchToTab(tab.id)}
                             onDoubleClick={handleDoubleClick}
-                            onMouseDown={handleMouseDown}
-                            onSelectStart={handleSelectStart}
                             onContextMenu={(e) => {
                                 e.preventDefault();
                                 e.stopPropagation();
@@ -362,6 +388,9 @@ const TabManager = ({ children }) => {
                                 draggedTabIndexRef.current = index;
                                 e.dataTransfer.setData('text/plain', '');
                                 e.dataTransfer.effectAllowed = 'move';
+                            }}
+                            onDragEnd={() => {
+                                draggedTabIndexRef.current = -1;
                             }}
                             onDragOver={(e) => {
                                 e.preventDefault();
@@ -386,8 +415,6 @@ const TabManager = ({ children }) => {
                                         className="tab-close"
                                         onClick={(e) => handleCloseTab(tab.id, e)}
                                         onDoubleClick={handleDoubleClick}
-                                        onMouseDown={handleMouseDown}
-                                        onSelectStart={handleSelectStart}
                                         aria-label="Close tab"
                                     >
                                         <span className="icon icon-x"></span>
@@ -401,6 +428,7 @@ const TabManager = ({ children }) => {
                         <IconButton
                             icon="plus"
                             size="sm"
+                            aria-label="New tab"
                             onClick={createNewTab}
                         />
                     </div>

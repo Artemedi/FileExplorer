@@ -20,10 +20,11 @@ const HashDisplayModal = ({ isOpen, onClose, hash, fileName }) => {
      */
     useEffect(() => {
         if (isOpen && hash && textAreaRef.current) {
-            setTimeout(() => {
-                textAreaRef.current.focus();
-                textAreaRef.current.select();
+            const timer = setTimeout(() => {
+                textAreaRef.current?.focus();
+                textAreaRef.current?.select();
             }, 100);
+            return () => clearTimeout(timer);
         }
     }, [isOpen, hash]);
 

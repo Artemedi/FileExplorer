@@ -30,7 +30,7 @@ const SearchResults = ({ query, viewMode, onClearSearch }) => {
     useEffect(() => {
         if (query) {
             updateQuery(query);
-            performSearch();
+            performSearch(query);
         }
     }, [query, updateQuery, performSearch]);
 

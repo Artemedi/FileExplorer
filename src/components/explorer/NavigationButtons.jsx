@@ -1,6 +1,7 @@
 import React from 'react';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useFileSystem } from '../../providers/FileSystemProvider';
+import { showSuccess, showError } from '../../utils/NotificationSystem';
 import './navigationButtons.css';
 
 /**
@@ -22,98 +23,19 @@ const NavigationButtons = () => {
                 // Refresh volumes (disks, space, etc.)
                 await loadVolumes();
                 await loadDirectory(currentPath);
-                console.log('Directory and volumes refreshed successfully');
-
-                // Optionally show a brief success indicator
-                const notification = document.createElement('div');
-                notification.textContent = 'Directory and disks refreshed';
-                notification.style.cssText = `
-                    position: fixed;
-                    top: 20px;
-                    right: 20px;
-                    background: var(--success);
-                    color: white;
-                    padding: 8px 16px;
-                    border-radius: 4px;
-                    z-index: 10000;
-                    font-size: 14px;
-                    animation: slideIn 0.3s ease-out;
-                `;
-                document.body.appendChild(notification);
-                setTimeout(() => {
-                    notification.remove();
-                }, 2000);
+                showSuccess('Directory and disks refreshed');
             } catch (error) {
                 console.error('Failed to refresh directory or disks:', error);
-
-                // Show error notification
-                const notification = document.createElement('div');
-                notification.textContent = 'Failed to refresh directory or disks';
-                notification.style.cssText = `
-                    position: fixed;
-                    top: 20px;
-                    right: 20px;
-                    background: var(--error);
-                    color: white;
-                    padding: 8px 16px;
-                    border-radius: 4px;
-                    z-index: 10000;
-                    font-size: 14px;
-                    animation: slideIn 0.3s ease-out;
-                `;
-                document.body.appendChild(notification);
-                setTimeout(() => {
-                    notification.remove();
-                }, 3000);
+                showError('Failed to refresh directory or disks');
             }
-        }
-        else {
+        } else {
             try {
                 // Refresh volumes (disks, space, etc.)
                 await loadVolumes();
-                console.log('Volumes refreshed successfully');
-
-                // Optionally show a brief success indicator
-                const notification = document.createElement('div');
-                notification.textContent = 'Volumes refreshed';
-                notification.style.cssText = `
-                    position: fixed;
-                    top: 20px;
-                    right: 20px;
-                    background: var(--success);
-                    color: white;
-                    padding: 8px 16px;
-                    border-radius: 4px;
-                    z-index: 10000;
-                    font-size: 14px;
-                    animation: slideIn 0.3s ease-out;
-                `;
-                document.body.appendChild(notification);
-                setTimeout(() => {
-                    notification.remove();
-                }, 2000);
+                showSuccess('Volumes refreshed');
             } catch (error) {
                 console.error('Failed to refresh volumes:', error);
-
-                // Show error notification
-                const notification = document.createElement('div');
-                notification.textContent = 'Failed to refresh volumes';
-                notification.style.cssText = `
-                    position: fixed;
-                    top: 20px;
-                    right: 20px;
-                    background: var(--error);
-                    color: white;
-                    padding: 8px 16px;
-                    border-radius: 4px;
-                    z-index: 10000;
-                    font-size: 14px;
-                    animation: slideIn 0.3s ease-out;
-                `;
-                document.body.appendChild(notification);
-                setTimeout(() => {
-                    notification.remove();
-                }, 3000);
+                showError('Failed to refresh volumes');
             }
         }
     };

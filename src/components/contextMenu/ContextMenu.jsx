@@ -40,6 +40,9 @@ const ContextMenu = ({ position, items = [], onClose }) => {
             adjustedY = viewportHeight - menuRect.height - 8; // 8px padding
         }
 
+        adjustedX = Math.max(8, adjustedX);
+        adjustedY = Math.max(8, adjustedY);
+
         setAdjustedPosition({ x: adjustedX, y: adjustedY });
     }, [position, items]);
 

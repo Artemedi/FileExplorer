@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useState } from 'react';
 import Icon from '../common/Icon';
-import { convertFileSrc } from '@tauri-apps/api/core';
-import Modal from '../common/Modal';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { formatFileSize, formatErrorMessage } from '../../utils/formatters';
+import { showError } from '../../utils/NotificationSystem';
 import './PreviewModal.css';
 
 /**
@@ -10,14 +11,21 @@ import './PreviewModal.css';
  * @param {Object} props.payload - The preview payload data
  * @param {Function} props.onClose - Function to call when closing the modal
  * @param {boolean} props.isLoading - Whether the preview is loading
+ * @param {Function} [props.onOpenInDefaultApp] - Optional handler for opening item in default app
  * @returns {React.ReactElement|null} PreviewModal component or null
  */
-export function PreviewModal({ payload, onClose, isLoading }) {
+export function PreviewModal({ payload, onClose, isLoading, onOpenInDefaultApp }) {
   if (!payload && !isLoading) return null;
 
   return (
     <div className="preview-modal-backdrop" onClick={onClose}>
-      <div className="preview-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="preview-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={payload?.name ? `Preview: ${payload.name}` : 'File preview'}
+        onClick={(e) => e.stopPropagation()}
+      >
         <header className="preview-modal-header" style={{ minHeight: 32, height: 32, padding: '0 0.5rem', background: 'var(--surface, #f8f9fa)', display: 'flex', alignItems: 'center' }}>
           <button 
             onClick={onClose} 
@@ -28,7 +36,7 @@ export function PreviewModal({ payload, onClose, isLoading }) {
             <span className="icon icon-x"></span>
           </button>
           {payload?.name && payload?.kind !== 'Folder' && (
-            <div style={{ marginLeft: 12, fontSize: '1rem', color: 'var(--text-secondary, #666)', opacity: 0.35, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '60vw' }}>
+            <div style={{ marginLeft: 12, fontSize: '1rem', color: 'var(--text-primary, #1a1a1a)', fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '60vw' }}>
               {payload.name}
             </div>
           )}
@@ -41,7 +49,11 @@ export function PreviewModal({ payload, onClose, isLoading }) {
               <p>Loading preview...</p>
             </div>
           ) : (
-            <PreviewContent payload={payload} />
+            <PreviewContent
+              key={payload?.path || payload?.name || 'preview'}
+              payload={payload}
+              onOpenInDefaultApp={onOpenInDefaultApp}
+            />
           )}
         </div>
       </div>
@@ -53,10 +65,38 @@ export function PreviewModal({ payload, onClose, isLoading }) {
  * PreviewContent component - Renders the actual preview content based on payload type
  * @param {Object} props - Component props
  * @param {Object} props.payload - The preview payload data
+ * @param {Function} [props.onOpenInDefaultApp] - Optional handler for opening item in default app
  * @returns {React.ReactElement} Preview content
  */
-function PreviewContent({ payload }) {
+function PreviewContent({ payload, onOpenInDefaultApp }) {
+  const [mediaError, setMediaError] = useState(false);
+
   if (!payload) return null;
+
+  const mediaKey = payload.path || payload.name;
+
+  if (mediaError) {
+    return (
+      <div className="preview-error">
+        <div className="preview-error-icon">⚠️</div>
+        <h3>Preview Error</h3>
+        <p>Failed to load preview media for {payload.name || 'this file'}.</p>
+      </div>
+    );
+  }
+
+  const handleOpenInDefaultApp = async () => {
+    if (!payload.path) return;
+    try {
+      if (onOpenInDefaultApp) {
+        await onOpenInDefaultApp(payload.path);
+      } else {
+        await invoke('open_in_default_app', { path: payload.path });
+      }
+    } catch (error) {
+      showError(`Failed to open file: ${formatErrorMessage(error)}`);
+    }
+  };
 
   switch (payload.kind) {
     case 'Folder': {
@@ -92,9 +132,11 @@ function PreviewContent({ payload }) {
       return (
         <div className="preview-image-container">
           <img 
+            key={mediaKey}
             src={payload.data_uri} 
             alt={payload.name}
             className="preview-image"
+            onError={() => setMediaError(true)}
           />
           <div className="preview-image-info">
             <span className="preview-file-size">
@@ -108,9 +150,11 @@ function PreviewContent({ payload }) {
       return (
         <div className="preview-pdf-container" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
           <iframe
+            key={mediaKey}
             title={payload.name}
             src={payload.data_uri}
             style={{ flex: 1, width: '100%', height: 0, minHeight: 0, border: 'none' }}
+            onError={() => setMediaError(true)}
           />
           <div className="preview-image-info" style={{ alignSelf: 'flex-end', marginTop: 8 }}>
             <span className="preview-file-size">
@@ -122,14 +166,15 @@ function PreviewContent({ payload }) {
 
     case 'Video': {
       const url = convertFileSrc(payload.path);
-      console.log('Video preview URL:', url, 'Original path:', payload.path);
       return (
         <div className="preview-video-container">
           <video 
+            key={mediaKey}
             src={url} 
             controls 
             className="preview-video"
             preload="metadata"
+            onError={() => setMediaError(true)}
           >
             Your browser does not support video preview.
           </video>
@@ -143,10 +188,12 @@ function PreviewContent({ payload }) {
           <div className="preview-audio-player">
             <div className="preview-audio-icon">🎵</div>
             <audio 
+              key={mediaKey}
               src={convertFileSrc(payload.path)} 
               controls 
               className="preview-audio"
               preload="metadata"
+              onError={() => setMediaError(true)}
             >
               Your browser does not support audio preview.
             </audio>
@@ -181,10 +228,8 @@ function PreviewContent({ payload }) {
           <div className="preview-unknown-icon">📁</div>
           <p>Preview not available for this item.</p>
           <button 
-            onClick={() => {
-              // You could implement an "Open in default app" feature here
-              console.log('Open in default app:', payload.name);
-            }}
+            onClick={handleOpenInDefaultApp}
+            disabled={!payload.path}
             className="btn btn-secondary"
           >
             Open in Default App
@@ -208,21 +253,6 @@ function PreviewContent({ payload }) {
         </div>
       );
   }
-}
-
-/**
- * Format file size in human readable format
- * @param {number} bytes - File size in bytes
- * @returns {string} Formatted file size
- */
-function formatFileSize(bytes) {
-  if (bytes === 0) return '0 Bytes';
-  
-  const k = 1024;
-  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
 export default PreviewModal;

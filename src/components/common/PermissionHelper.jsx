@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import Modal from './Modal';
@@ -12,6 +12,15 @@ const PermissionHelper = ({ isOpen, onClose, directoryPath, directoryName, onDir
     const [isChecking, setIsChecking] = useState(false);
     const [hasAccess, setHasAccess] = useState(false);
     const [isBrowsing, setIsBrowsing] = useState(false);
+    const closeTimerRef = useRef(null);
+
+    useEffect(() => {
+        return () => {
+            if (closeTimerRef.current) {
+                clearTimeout(closeTimerRef.current);
+            }
+        };
+    }, []);
 
     // Check if we have access to the directory
     const checkAccess = async () => {
@@ -23,7 +32,8 @@ const PermissionHelper = ({ isOpen, onClose, directoryPath, directoryName, onDir
             setHasAccess(hasAccess);
             if (hasAccess) {
                 showSuccess(`Access granted to ${directoryName}!`);
-                setTimeout(onClose, 1000); // Close modal after success
+                if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+                closeTimerRef.current = setTimeout(onClose, 1000); // Close modal after success
             }
         } catch (error) {
             setHasAccess(false);
@@ -60,7 +70,10 @@ const PermissionHelper = ({ isOpen, onClose, directoryPath, directoryName, onDir
             let selectedPath = null;
             
             // Try to open folder picker starting from the parent directory
-            const parentPath = directoryPath ? directoryPath.substring(0, directoryPath.lastIndexOf('/')) : null;
+            const lastSep = directoryPath
+                ? Math.max(directoryPath.lastIndexOf('/'), directoryPath.lastIndexOf('\\'))
+                : -1;
+            const parentPath = lastSep > 0 ? directoryPath.substring(0, lastSep) : null;
             
             selectedPath = await open({
                 directory: true,

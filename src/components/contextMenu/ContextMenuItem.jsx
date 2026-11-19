@@ -25,6 +25,7 @@ const ContextMenuItem = ({
                          }) => {
     const [submenuPosition, setSubmenuPosition] = useState({ x: 0, y: 0, alignLeft: false });
     const itemRef = useRef(null);
+    const submenuRef = useRef(null);
     const submenuTimeoutRef = useRef(null);
 
     useEffect(() => {
@@ -42,6 +43,7 @@ const ContextMenuItem = ({
         if (isSubmenuOpen && itemRef.current && item.submenu) {
             const itemRect = itemRef.current.getBoundingClientRect();
             const viewportWidth = window.innerWidth;
+            const viewportHeight = window.innerHeight;
             const submenuWidth = 180; // min-width from CSS
             const padding = 8; // safety padding
 
@@ -61,10 +63,24 @@ const ContextMenuItem = ({
                     alignLeft = false;
                 }
             }
+            x = Math.max(padding, x);
+
+            const measuredHeight = submenuRef.current
+                ? submenuRef.current.getBoundingClientRect().height
+                : 0;
+            const submenuHeight = measuredHeight > 0
+                ? measuredHeight
+                : Math.min(item.submenu.length * 32 + 16, 320);
+
+            let y = itemRect.top;
+            if (y + submenuHeight + padding > viewportHeight) {
+                y = viewportHeight - submenuHeight - padding;
+            }
+            y = Math.max(padding, y);
 
             setSubmenuPosition({
                 x: x,
-                y: itemRect.top,
+                y: y,
                 alignLeft: alignLeft
             });
         }
@@ -155,6 +171,7 @@ const ContextMenuItem = ({
             {/* Submenu */}
             {isSubmenuOpen && item.submenu && (
                 <div
+                    ref={submenuRef}
                     className="context-submenu"
                     style={{
                         left: `${submenuPosition.x}px`,

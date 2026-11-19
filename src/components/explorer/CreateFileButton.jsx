@@ -20,16 +20,20 @@ const CreateFileButton = () => {
 
     const { createFile, createDirectory } = useFileSystem();
     const { currentPath } = useHistory();
+    const currentPathRef = useRef(currentPath);
+    currentPathRef.current = currentPath;
 
     /**
      * Sets up event listeners for custom create events
      */
     useEffect(() => {
         const handleCreateFile = () => {
+            if (!currentPathRef.current) return;
             handleOptionClick('file');
         };
 
         const handleCreateFolder = () => {
+            if (!currentPathRef.current) return;
             handleOptionClick('folder');
         };
 
@@ -46,6 +50,7 @@ const CreateFileButton = () => {
      * Toggles the dropdown menu
      */
     const toggleDropdown = () => {
+        if (!currentPath) return;
         setIsDropdownOpen(prev => !prev);
     };
 
@@ -61,6 +66,7 @@ const CreateFileButton = () => {
      * @param {string} type - The type of item to create ('file' or 'folder')
      */
     const handleOptionClick = (type) => {
+        if (!currentPathRef.current) return;
         setCreationType(type);
         setItemName(getDefaultName(type));
         setIsCreateModalOpen(true);
@@ -96,39 +102,44 @@ const CreateFileButton = () => {
      * Handles creating the file or folder
      */
     const handleCreate = async () => {
-        if (!itemName.trim()) return;
+        const trimmedName = itemName.trim();
+        if (!trimmedName || !currentPath) return;
 
         try {
             let ok = true;
             if (creationType === 'file') {
-                ok = await createFile(currentPath, itemName.trim());
+                ok = await createFile(currentPath, trimmedName);
             } else if (creationType === 'folder') {
-                ok = await createDirectory(currentPath, itemName.trim());
+                ok = await createDirectory(currentPath, trimmedName);
             }
 
             if (ok !== false) {
                 setIsCreateModalOpen(false);
                 setItemName('');
+            } else {
+                showError(`Failed to create ${creationType}`);
             }
         } catch (error) {
             console.error('Failed to create item:', error);
+            const message = error?.message || String(error);
 
             // Check for specific error types
-            if (error.message && error.message.includes('already exists')) {
+            if (message.toLowerCase().includes('already exists')) {
                 const shouldCreateCopy = await showConfirm(
-                    `An item named "${itemName}" already exists. Would you like to create a copy instead?`,
+                    `An item named "${trimmedName}" already exists. Would you like to create a copy instead?`,
                     'Item Already Exists'
                 );
 
                 if (shouldCreateCopy) {
-                    const extension = itemName.includes('.') ? '.' + itemName.split('.').pop() : '';
-                    const baseName = extension ? itemName.replace(extension, '') : itemName;
-                    const copyName = `${baseName} - Copy${extension}`;
+                    const dotIndex = trimmedName.lastIndexOf('.');
+                    const copyName = dotIndex > 0
+                        ? `${trimmedName.slice(0, dotIndex)} - Copy${trimmedName.slice(dotIndex)}`
+                        : `${trimmedName} - Copy`;
                     setItemName(copyName);
                     return; // Don't close modal, let user try again
                 }
             } else {
-                showError(`Failed to create ${creationType}: ${error.message || error}`);
+                showError(`Failed to create ${creationType}: ${message}`);
             }
         }
     };
@@ -168,6 +179,7 @@ const CreateFileButton = () => {
                 <button
                     className="create-button"
                     onClick={toggleDropdown}
+                    disabled={!currentPath}
                     aria-label="Create new item"
                     aria-expanded={isDropdownOpen}
                     aria-haspopup="true"

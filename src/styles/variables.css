@@ -41,6 +41,17 @@
     --dark-warning: #f97316;
     --dark-info: #06b6d4;
 
+    /* Semantic status backgrounds */
+    --light-warning-bg: #fff3cd;
+    --light-warning-border: #ffeaa7;
+    --light-warning-text: #856404;
+    --light-info-bg: #e3f2fd;
+
+    --dark-warning-bg: rgba(249, 115, 22, 0.15);
+    --dark-warning-border: rgba(249, 115, 22, 0.4);
+    --dark-warning-text: #fdba74;
+    --dark-info-bg: rgba(6, 182, 212, 0.15);
+
     /* Default variables - applied immediately */
     --background: var(--light-background);
     --background-secondary: var(--light-background-secondary);
@@ -59,6 +70,21 @@
     --success: var(--light-success);
     --warning: var(--light-warning);
     --info: var(--light-info);
+    --warning-bg: var(--light-warning-bg);
+    --warning-border: var(--light-warning-border);
+    --warning-text: var(--light-warning-text);
+    --info-bg: var(--light-info-bg);
+
+    /* Compatibility aliases for component/utility styles */
+    --bg-primary: var(--background);
+    --background-hover: var(--surface-hover);
+    --hover-color: var(--surface-hover);
+    --text-color: var(--text-primary);
+    --accent-color: var(--accent);
+    --danger: var(--error);
+    --border-subtle: var(--border);
+    --font-primary: var(--font-family);
+    --radius-xs: 2px;
 
     /* RGB variants for transparency effects */
     --background-rgb: 255, 255, 255;

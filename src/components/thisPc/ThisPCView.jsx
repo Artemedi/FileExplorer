@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
@@ -20,6 +20,15 @@ const ThisPCView = () => {
 
     // Common folders for different operating systems
     const [userFolders, setUserFolders] = useState([]);
+    const ejectTimerRef = useRef(null);
+
+    useEffect(() => {
+        return () => {
+            if (ejectTimerRef.current) {
+                clearTimeout(ejectTimerRef.current);
+            }
+        };
+    }, []);
 
     /**
      * Load system information on component mount
@@ -239,8 +248,10 @@ const ThisPCView = () => {
     const handleFolderClick = async (path) => {
         console.log('Clicking folder with path:', path);
         try {
-            await loadDirectory(path);
-            navigateTo(path);
+            const ok = await loadDirectory(path);
+            if (ok) {
+                navigateTo(path);
+            }
         } catch (error) {
             console.error('Failed to navigate to folder:', error);
             showError(`Cannot access ${path}. The folder may not exist or is inaccessible.`);
@@ -267,37 +278,19 @@ const ThisPCView = () => {
         if (!confirmEject) return;
 
         try {
-            let command;
-            const os = systemInfo?.current_running_os?.toLowerCase();
-            
-            if (os === 'windows') {
-                command = `eject ${volume.mount_point}`;
-            } else if (os === 'macos' || os === 'darwin') {
-                // Use diskutil for proper ejection on macOS
-                command = `diskutil eject "${volume.mount_point}"`;
-            } else {
-                // Linux and other Unix-like systems
-                command = `umount "${volume.mount_point}"`;
+            await invoke('eject_volume', { mountPoint: volume.mount_point });
+            showSuccess(`${volume.volume_name} has been safely ejected.`);
+            // Reload volumes to update the UI after ejection
+            if (ejectTimerRef.current) {
+                clearTimeout(ejectTimerRef.current);
             }
-
-            const result = await invoke('execute_command', { command });
-            
-            // Parse the command result to check for success
-            const commandResponse = JSON.parse(result);
-            
-            if (commandResponse.status === 0) {
-                showSuccess(`${volume.volume_name} has been safely ejected.`);
-                // Reload volumes to update the UI after ejection
-                setTimeout(() => {
-                    loadVolumes();
-                }, 1000);
-            } else {
-                throw new Error(commandResponse.stderr || commandResponse.stdout || 'Ejection failed');
-            }
+            ejectTimerRef.current = setTimeout(() => {
+                loadVolumes();
+            }, 1000);
         } catch (error) {
             console.error('Failed to eject volume:', error);
-            let errorMessage = error.message || error;
-            
+            let errorMessage = error?.message || String(error);
+
             // Parse error message if it's JSON
             try {
                 const parsedError = JSON.parse(errorMessage);
@@ -305,7 +298,7 @@ const ThisPCView = () => {
             } catch (e) {
                 // If not JSON, use as-is
             }
-            
+
             showError(`Failed to eject ${volume.volume_name}: ${errorMessage}`);
         }
     };
@@ -363,7 +356,7 @@ const ThisPCView = () => {
                 <div className="drives-grid">
                     {volumes.map((volume) => {
                         const usedSpace = volume.size - volume.available_space;
-                        const usedPercentage = (usedSpace / volume.size) * 100;
+                        const usedPercentage = volume.size > 0 ? (usedSpace / volume.size) * 100 : 0;
 
                         return (
                             <div

@@ -195,7 +195,7 @@
     color: var(--text-primary);
     background-color: var(--background);
     padding: 2px var(--space-xs);
-    border-radius: var(--radius-xs);
+    border-radius: var(--radius-sm);
 }
 
 /* Sort Controls */
@@ -707,7 +707,7 @@
     border-radius: var(--radius-md);
     box-shadow: var(--shadow-lg);
     overflow: hidden;
-    font-family: var(--font-primary);
+    font-family: var(--font-family);
 }
 
 .suggestion-item {
@@ -726,7 +726,7 @@
 }
 
 .suggestion-item:not(:last-child) {
-    border-bottom: 1px solid var(--border-subtle);
+    border-bottom: 1px solid var(--border);
 }
 
 .suggestion-item span:first-child {

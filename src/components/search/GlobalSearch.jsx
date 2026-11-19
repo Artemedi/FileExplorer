@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { getDirectoryPath, getFileName } from '../../utils/pathUtils';
-import { showError } from '../../utils/NotificationSystem';
+import { showError, showSuccess, showWarning, showConfirm } from '../../utils/NotificationSystem';
 import SearchBar from '../search/SearchBar';
 import EmptyState from '../explorer/EmptyState';
 import FileIcon from '../explorer/FileIcon';
@@ -11,8 +11,23 @@ import Modal from '../common/Modal';
 import Button from '../common/Button';
 import './search.css';
 
+const normalizeForCompare = (p) => (p || '').replace(/\\/g, '/').replace(/\/+$/, '');
+
+const isInCurrentDirectory = (itemPath, currentDir) => {
+    if (!itemPath || !currentDir) return false;
+    let normItem = normalizeForCompare(itemPath);
+    let normDir = normalizeForCompare(currentDir);
+    const isWindows = /^[A-Za-z]:/.test(normDir) || /^[A-Za-z]:/.test(normItem);
+    if (isWindows) {
+        normItem = normItem.toLowerCase();
+        normDir = normDir.toLowerCase();
+    }
+    return normItem === normDir || normItem.startsWith(normDir + '/');
+};
+
 const GlobalSearch = ({ isOpen, onClose }) => {
     const [query, setQuery] = useState('');
+    const [rawResults, setRawResults] = useState([]);
     const [results, setResults] = useState([]);
     const [isSearching, setIsSearching] = useState(false);
     const [searchEngineInfo, setSearchEngineInfo] = useState(null);
@@ -27,6 +42,8 @@ const GlobalSearch = ({ isOpen, onClose }) => {
         start_time: null
     });
     const progressIntervalRef = useRef(null);
+    const progressErrorCountRef = useRef(0);
+    const focusTimerRef = useRef(null);
     const searchInputRef = useRef(null);
     const [filtersExpanded, setFiltersExpanded] = useState(false);
     const [statsExpanded, setStatsExpanded] = useState(false);
@@ -74,8 +91,11 @@ const GlobalSearch = ({ isOpen, onClose }) => {
         { value: 'html', label: 'HTML Files (.html)' }
     ];
 
-    // Load search engine info when modal opens
+    // Load search engine info when modal opens, and clean up when closed
     useEffect(() => {
+        let outerTimer = null;
+        let innerTimer = null;
+
         if (isOpen) {
             loadSearchEngineInfo();
             loadSystemInfo();
@@ -90,16 +110,30 @@ const GlobalSearch = ({ isOpen, onClose }) => {
             setSelectedSuggestionIndex(-1);
             setSuppressSuggestions(false);
             setHasSearched(false); // Reset search state when modal opens
-            // Focus the search input when modal opens (with blur/focus workaround) Bugfix lol
-            setTimeout(() => {
+            outerTimer = setTimeout(() => {
                 if (searchInputRef.current) {
                     searchInputRef.current.blur();
-                    setTimeout(() => {
-                        searchInputRef.current.focus();
+                    innerTimer = setTimeout(() => {
+                        searchInputRef.current?.focus();
                     }, 50);
                 }
             }, 100);
+        } else {
+            setSuggestions([]);
+            setShowSuggestions(false);
+            setSelectedSuggestionIndex(-1);
+            setIsInputFocused(false);
+            stopProgressPolling();
         }
+
+        return () => {
+            if (outerTimer) clearTimeout(outerTimer);
+            if (innerTimer) clearTimeout(innerTimer);
+            if (focusTimerRef.current) {
+                clearTimeout(focusTimerRef.current);
+                focusTimerRef.current = null;
+            }
+        };
     }, [isOpen, currentPath]);
 
     // Update current directory when user navigates
@@ -109,16 +143,22 @@ const GlobalSearch = ({ isOpen, onClose }) => {
         }
     }, [currentPath]);
 
-    // Re-sort results when sort criteria changes
+    // Re-filter and re-sort raw results when filter/sort criteria change
     useEffect(() => {
-        if (results.length > 0) {
-            setResults(prevResults => sortResults(prevResults));
+        let filtered = rawResults;
+        if (showDirectoriesOnly) {
+            filtered = filtered.filter(result => result.isDirectory);
         }
-    }, [sortBy, showDirectoriesOnly, showHiddenFiles]);
+        if (!showHiddenFiles) {
+            filtered = filtered.filter(result => !result.name.startsWith('.'));
+        }
+        setResults(sortResults(filtered));
+    }, [rawResults, sortBy, showDirectoriesOnly, showHiddenFiles]);
 
     // Clear results when query is empty (don't auto-search on typing)
     useEffect(() => {
         if (!query.trim()) {
+            setRawResults([]);
             setResults([]);
             setHasSearched(false);
         }
@@ -201,15 +241,21 @@ const GlobalSearch = ({ isOpen, onClose }) => {
         initializeSearchEngine();
     }, [volumes, searchEngineInfo, isIndexing]);
 
-    // Cleanup polling on unmount
+    // Cleanup polling and timers on unmount
     useEffect(() => {
         return () => {
             stopProgressPolling();
+            if (focusTimerRef.current) {
+                clearTimeout(focusTimerRef.current);
+                focusTimerRef.current = null;
+            }
         };
     }, []);
 
     // Close dropdown when clicking outside
     useEffect(() => {
+        if (!isOpen) return;
+
         const handleClickOutside = (event) => {
             if (filtersExpanded && !event.target.closest('.search-input-wrapper') && !event.target.closest('.search-controls-dropdown')) {
                 setFiltersExpanded(false);
@@ -217,12 +263,11 @@ const GlobalSearch = ({ isOpen, onClose }) => {
         };
 
         const handleKeyDown = (event) => {
+            if (!isOpen) return;
             if (event.key === 'Escape' && filtersExpanded) {
                 setFiltersExpanded(false);
                 // Refocus the search input after closing dropdown
-                if (searchInputRef.current) {
-                    searchInputRef.current.focus();
-                }
+                searchInputRef.current?.focus();
             }
             // Handle suggestion navigation
             if (showSuggestions && suggestions.length > 0) {
@@ -254,9 +299,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
                         break;
                     case 'Escape':
                         setSelectedSuggestionIndex(-1);
-                        if (searchInputRef.current) {
-                            searchInputRef.current.blur();
-                        }
+                        searchInputRef.current?.blur();
                         break;
                 }
             }
@@ -268,7 +311,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
             document.removeEventListener('mousedown', handleClickOutside);
             document.removeEventListener('keydown', handleKeyDown);
         };
-    }, [filtersExpanded, showSuggestions, suggestions, selectedSuggestionIndex]);
+    }, [isOpen, filtersExpanded, showSuggestions, suggestions, selectedSuggestionIndex]);
 
     // Start polling for progress when indexing begins
     const startProgressPolling = () => {
@@ -336,9 +379,8 @@ const GlobalSearch = ({ isOpen, onClose }) => {
                 } catch (fallbackError) {
                     console.error('Fallback polling also failed:', fallbackError);
                     // On consecutive errors, stop polling to prevent infinite error loops
-                    if (!window.progressErrorCount) window.progressErrorCount = 0;
-                    window.progressErrorCount++;
-                    if (window.progressErrorCount > 10) {
+                    progressErrorCountRef.current += 1;
+                    if (progressErrorCountRef.current > 10) {
                         console.error('Too many polling errors, stopping progress polling');
                         setIsIndexing(false);
                         setIsLoadingStatus(false); // Reset loading status on error
@@ -354,8 +396,10 @@ const GlobalSearch = ({ isOpen, onClose }) => {
             clearInterval(progressIntervalRef.current);
             progressIntervalRef.current = null;
         }
-        // Reset error counter
-        window.progressErrorCount = 0;
+        progressErrorCountRef.current = 0;
+        if (typeof window !== 'undefined' && 'progressErrorCount' in window) {
+            delete window.progressErrorCount;
+        }
     };
 
     // Format time remaining
@@ -538,6 +582,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
         const wasInputFocused = isAutomatic && document.activeElement === searchInputRef.current;
 
         setIsSearching(true);
+        setRawResults([]);
         setResults([]);
         setHasSearched(true);
 
@@ -565,11 +610,16 @@ const GlobalSearch = ({ isOpen, onClose }) => {
             
             console.log(`Search completed in ${searchTime.toFixed(2)}ms with ${searchResults.length} results`);
 
-            // Convert API results to our format and apply frontend filtering
-            let formattedResults = searchResults.map(([path, score]) => {
+            // Convert API results to our format and store raw results for reactive filtering
+            const formattedResults = searchResults.map((entry) => {
+                const isTuple = Array.isArray(entry);
+                const path = isTuple ? entry[0] : entry.path;
+                const score = isTuple ? entry[1] : entry.score;
                 const fileName = getFileName(path) || path;
                 const directory = getDirectoryPath(path) || '/';
-                const isDirectory = !fileName.includes('.') || path.endsWith('/') || path.endsWith('\\');
+                const isDirectory = isTuple
+                    ? (path.endsWith('/') || path.endsWith('\\'))
+                    : Boolean(entry.isDirectory ?? entry.is_dir ?? (path.endsWith('/') || path.endsWith('\\')));
 
                 return {
                     path,
@@ -577,23 +627,11 @@ const GlobalSearch = ({ isOpen, onClose }) => {
                     directory,
                     score,
                     isDirectory,
-                    extension: isDirectory ? null : fileName.split('.').pop()?.toLowerCase()
+                    extension: isDirectory || !fileName.includes('.') ? null : fileName.split('.').pop()?.toLowerCase()
                 };
             });
 
-            // Apply frontend filters
-            if (showDirectoriesOnly) {
-                formattedResults = formattedResults.filter(result => result.isDirectory);
-            }
-
-            if (!showHiddenFiles) {
-                formattedResults = formattedResults.filter(result => !result.name.startsWith('.'));
-            }
-
-            // Apply sorting
-            formattedResults = sortResults(formattedResults);
-
-            setResults(formattedResults);
+            setRawResults(formattedResults);
             
             // Update recent searches (keep last 10) - only for queries with 3+ characters
             if (query.trim().length >= 3) {
@@ -622,8 +660,11 @@ const GlobalSearch = ({ isOpen, onClose }) => {
             
             // Restore focus to input if it was focused before automatic search
             if (wasInputFocused && searchInputRef.current) {
-                setTimeout(() => {
-                    searchInputRef.current.focus();
+                if (focusTimerRef.current) {
+                    clearTimeout(focusTimerRef.current);
+                }
+                focusTimerRef.current = setTimeout(() => {
+                    searchInputRef.current?.focus();
                 }, 0);
             }
         }
@@ -632,6 +673,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
     // Clear search
     const clearSearch = () => {
         setQuery('');
+        setRawResults([]);
         setResults([]);
         setHasSearched(false);
         setSuggestions([]);
@@ -757,7 +799,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
             onClose();
         } catch (error) {
             console.error('Failed to open item location:', error);
-            alert(`Failed to open location: ${error.message || error}`);
+            showError(`Failed to open location: ${error.message || error}`);
         }
     };
 
@@ -845,14 +887,14 @@ const GlobalSearch = ({ isOpen, onClose }) => {
             stopProgressPolling();
 
             // Show error to user
-            alert(`Failed to start indexing: ${error.message || error}`);
+            showError(`Failed to start indexing: ${error.message || error}`);
         }
     };
 
     // Manual indexing trigger
     const startManualIndexing = async () => {
         if (!systemInfo?.user_home_dir) {
-            alert('User home directory not available for indexing');
+            showWarning('User home directory not available for indexing');
             return;
         }
 
@@ -895,7 +937,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
 
         } catch (error) {
             console.error('Manual indexing failed:', error);
-            alert(`Failed to start indexing: ${error.message || error}`);
+            showError(`Failed to start indexing: ${error.message || error}`);
             setIsIndexing(false);
             stopProgressPolling();
         }
@@ -903,7 +945,11 @@ const GlobalSearch = ({ isOpen, onClose }) => {
 
     // Clear search engine index
     const clearSearchEngine = async () => {
-        if (!window.confirm('Are you sure you want to clear the entire search index? This will remove all indexed files and you will need to re-index.')) {
+        const confirmed = await showConfirm(
+            'Are you sure you want to clear the entire search index? This will remove all indexed files and you will need to re-index.',
+            'Clear Search Index'
+        );
+        if (!confirmed) {
             return;
         }
 
@@ -913,14 +959,15 @@ const GlobalSearch = ({ isOpen, onClose }) => {
             console.log('Search engine cleared successfully');
             
             // Update UI state
+            setRawResults([]);
             setResults([]);
             setQuery('');
             await loadSearchEngineInfo();
             
-            alert('Search engine index cleared successfully. You can now re-index your files.');
+            showSuccess('Search engine index cleared successfully. You can now re-index your files.');
         } catch (error) {
             console.error('Failed to clear search engine:', error);
-            alert(`Failed to clear search engine: ${error.message || error}`);
+            showError(`Failed to clear search engine: ${error.message || error}`);
         }
     };
 
@@ -1371,7 +1418,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
                                                 title={`Navigate to: ${path}`}
                                             >
                                                 <span className="path-name">
-                                                    {path.split('/').pop() || path}
+                                                    {path.split(/[/\\]/).filter(Boolean).pop() || path}
                                                 </span>
                                                 <span className="path-location">
                                                     {path}
@@ -1447,7 +1494,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
                                                 size="sm"
                                                 onClick={async () => {
                                                     if (!systemInfo?.user_home_dir) {
-                                                        alert('System info not available');
+                                                        showWarning('System info not available');
                                                         return;
                                                     }
 
@@ -1478,7 +1525,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
                                                         console.log('Test indexing result:', result);
                                                     } catch (error) {
                                                         console.error('Test indexing failed:', error);
-                                                        alert(`Test indexing failed: ${error.message || error}`);
+                                                        showError(`Test indexing failed: ${error.message || error}`);
                                                         setIsIndexing(false);
                                                         stopProgressPolling();
                                                     }
@@ -1574,7 +1621,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
                                                      indexingProgress.files_indexed === 0 ? 'Discovering:' : 'Processing:'}
                                                 </span>
                                                 <span className="current-file-path" title={indexingProgress.current_path}>
-                                                    {indexingProgress.current_path.split('/').pop() || indexingProgress.current_path}
+                                                    {indexingProgress.current_path.split(/[/\\]/).filter(Boolean).pop() || indexingProgress.current_path}
                                                 </span>
                                             </div>
                                         )}
@@ -1693,7 +1740,7 @@ const GlobalSearch = ({ isOpen, onClose }) => {
                                             >
                                                 {result.path}
                                             </div>
-                                            {currentDirectory && result.path.startsWith(currentDirectory) && (
+                                            {currentDirectory && isInCurrentDirectory(result.path, currentDirectory) && (
                                                 <div className="result-context-indicator">
                                                     <span className="context-dot">•</span> In current directory
                                                 </div>

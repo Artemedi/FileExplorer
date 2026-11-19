@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useSftp } from '../../providers/SftpProvider';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
-import { showSuccess, showError } from '../../utils/NotificationSystem';
+import { showSuccess, showError, showConfirm } from '../../utils/NotificationSystem';
 import AddSftpConnectionView from '../sidebar/AddSftpConnectionView';
 import './networkView.css';
 
@@ -11,7 +12,7 @@ import './networkView.css';
  * and provides management for SFTP connections
  */
 const NetworkView = () => {
-    const { sftpConnections, navigateToSftpConnection, createSftpUrl } = useSftp();
+    const { currentSftpConnection, disconnectSftp, createSftpUrl } = useSftp();
     const { loadDirectory } = useFileSystem();
     const { navigateTo } = useHistory();
     const [isAddSftpModalOpen, setIsAddSftpModalOpen] = useState(false);
@@ -22,7 +23,7 @@ const NetworkView = () => {
         const loadConnections = () => {
             try {
                 const saved = JSON.parse(localStorage.getItem('fileExplorerSftpConnections') || '[]');
-                setLocalSftpConnections(saved);
+                setLocalSftpConnections(Array.isArray(saved) ? saved : []);
             } catch (err) {
                 setLocalSftpConnections([]);
             }
@@ -44,31 +45,71 @@ const NetworkView = () => {
         };
     }, []);
 
-    // Add SFTP connection
+    // Add SFTP connection (never store plaintext password in localStorage)
     const addSftpConnection = (conn) => {
         try {
-            const existing = JSON.parse(localStorage.getItem('fileExplorerSftpConnections') || '[]');
-            const newConnections = [...existing, conn];
+            const { password: _omitted, ...safeConn } = conn || {};
+            let existing = [];
+            try {
+                const parsed = JSON.parse(localStorage.getItem('fileExplorerSftpConnections') || '[]');
+                existing = Array.isArray(parsed) ? parsed : [];
+            } catch {
+                existing = [];
+            }
+            const newConnections = [...existing, safeConn];
             localStorage.setItem('fileExplorerSftpConnections', JSON.stringify(newConnections));
             window.dispatchEvent(new CustomEvent('sftp-connections-updated'));
             window.dispatchEvent(new StorageEvent('storage', {
                 key: 'fileExplorerSftpConnections',
                 newValue: JSON.stringify(newConnections)
             }));
-            showSuccess(`SFTP connection "${conn.name}" added successfully`);
+            showSuccess(`SFTP connection "${safeConn.name}" added successfully`);
         } catch (err) {
             showError('Failed to add SFTP connection');
         }
         setIsAddSftpModalOpen(false);
     };
 
+    // Remove SFTP connection
+    const removeSftpConnection = async (connection) => {
+        const confirmRemove = await showConfirm(`Are you sure you want to remove the SFTP connection "${connection.name}"?`);
+        if (!confirmRemove) return;
+
+        try {
+            const connectionKey = `${connection.username}@${connection.host}:${connection.port || 22}`;
+            await invoke('remove_sftp_credentials', { connectionKey }).catch(() => {});
+
+            let existing = [];
+            try {
+                const parsed = JSON.parse(localStorage.getItem('fileExplorerSftpConnections') || '[]');
+                existing = Array.isArray(parsed) ? parsed : [];
+            } catch {
+                existing = [];
+            }
+            const newConnections = existing.filter(c => c.name !== connection.name);
+            localStorage.setItem('fileExplorerSftpConnections', JSON.stringify(newConnections));
+            window.dispatchEvent(new CustomEvent('sftp-connections-updated'));
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: 'fileExplorerSftpConnections',
+                newValue: JSON.stringify(newConnections)
+            }));
+
+            if (currentSftpConnection?.name === connection.name) {
+                disconnectSftp();
+            }
+            showSuccess(`SFTP connection "${connection.name}" removed successfully.`);
+        } catch (err) {
+            showError(`Failed to remove SFTP connection: ${err?.message || err}`);
+        }
+    };
+
     // Connect to SFTP server
     const handleConnectToSftp = async (connection) => {
         try {
-            const sftpData = await navigateToSftpConnection(connection);
-            if (sftpData) {
-                const sftpPath = createSftpUrl(connection, '.');
-                await loadDirectory(sftpPath);
+            const sftpPath = createSftpUrl(connection, '.');
+            window.dispatchEvent(new CustomEvent('force-explorer-view'));
+            const ok = await loadDirectory(sftpPath);
+            if (ok) {
                 navigateTo(sftpPath);
                 showSuccess(`Connected to ${connection.name}`);
             }
@@ -135,6 +176,14 @@ const NetworkView = () => {
                                         <span className="icon icon-play"></span>
                                         Connect
                                     </button>
+                                    <button
+                                        className="remove-connection-button"
+                                        onClick={() => removeSftpConnection(connection)}
+                                        title="Remove SFTP Connection"
+                                        aria-label={`Remove ${connection.name}`}
+                                    >
+                                        <span className="icon icon-x"></span>
+                                    </button>
                                 </div>
                             </div>
                         ))
@@ -180,6 +229,7 @@ const NetworkView = () => {
                 isOpen={isAddSftpModalOpen}
                 onClose={() => setIsAddSftpModalOpen(false)}
                 onAdd={addSftpConnection}
+                existingConnections={localSftpConnections}
             />
         </div>
     );

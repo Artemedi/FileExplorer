@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import './common.css';
 
 /**
@@ -20,17 +20,27 @@ const Tooltip = ({
                      ...rest
                  }) => {
     const [isVisible, setIsVisible] = useState(false);
-    const [timeoutId, setTimeoutId] = useState(null);
+    const timeoutRef = useRef(null);
+
+    useEffect(() => {
+        return () => {
+            if (timeoutRef.current) {
+                clearTimeout(timeoutRef.current);
+            }
+        };
+    }, []);
 
     /**
      * Shows tooltip after a delay
      * @function
      */
     const handleMouseEnter = () => {
-        const id = setTimeout(() => {
+        if (timeoutRef.current) {
+            clearTimeout(timeoutRef.current);
+        }
+        timeoutRef.current = setTimeout(() => {
             setIsVisible(true);
         }, delay);
-        setTimeoutId(id);
     };
 
     /**
@@ -38,9 +48,9 @@ const Tooltip = ({
      * @function
      */
     const handleMouseLeave = () => {
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-            setTimeoutId(null);
+        if (timeoutRef.current) {
+            clearTimeout(timeoutRef.current);
+            timeoutRef.current = null;
         }
         setIsVisible(false);
     };

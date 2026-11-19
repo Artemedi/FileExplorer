@@ -27,6 +27,7 @@ const Dropdown = ({
                       ...rest
                   }) => {
     const [isOpen, setIsOpen] = useState(false);
+    const [openSubmenuIndex, setOpenSubmenuIndex] = useState(null);
     const dropdownRef = useRef(null);
 
     /**
@@ -36,6 +37,7 @@ const Dropdown = ({
     const toggleDropdown = () => {
         if (!isOpen && onOpen) onOpen();
         if (isOpen && onClose) onClose();
+        if (isOpen) setOpenSubmenuIndex(null);
         setIsOpen(!isOpen);
     };
 
@@ -76,13 +78,19 @@ const Dropdown = ({
      * @param {Object} item - clicked item
      * @param {Function} [item.onClick] - optional callback for item click
      */
-    const handleItemClick = (item) => {
+    const handleItemClick = (item, index) => {
+        if (item.submenu) {
+            setOpenSubmenuIndex(prev => (prev === index ? null : index));
+            return;
+        }
+
         if (item.onClick) {
             item.onClick();
         }
 
         if (closeOnClick) {
             if (onClose) onClose();
+            setOpenSubmenuIndex(null);
             setIsOpen(false);
         }
     };
@@ -129,8 +137,10 @@ const Dropdown = ({
                             <li key={item.id || `item-${index}`}>
                                 <button
                                     className={`dropdown-item ${item.className || ''} ${item.disabled ? 'disabled' : ''}`}
-                                    onClick={() => handleItemClick(item)}
+                                    onClick={() => handleItemClick(item, index)}
                                     disabled={item.disabled}
+                                    aria-haspopup={item.submenu ? 'menu' : undefined}
+                                    aria-expanded={item.submenu ? (item.isOpen || openSubmenuIndex === index) : undefined}
                                 >
                                     {item.icon && (
                                         <span className="dropdown-item-icon">
@@ -152,7 +162,7 @@ const Dropdown = ({
                                 </button>
 
                                 {/* Render submenu if exists and is open */}
-                                {item.submenu && item.isOpen && (
+                                {item.submenu && (item.isOpen || openSubmenuIndex === index) && (
                                     <ul className="dropdown-submenu">
                                         {item.submenu.map((subItem, subIndex) => (
                                             <li key={subItem.id || `subitem-${subIndex}`}>

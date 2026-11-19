@@ -23,6 +23,15 @@ const PathBreadcrumb = ({ onCopyPath, isVisible = true, onSearch }) => {
     const [searchQuery, setSearchQuery] = useState('');
     const inputRef = useRef(null);
     const searchInputRef = useRef(null);
+    const searchFocusTimerRef = useRef(null);
+    const searchBlurTimerRef = useRef(null);
+
+    useEffect(() => {
+        return () => {
+            if (searchFocusTimerRef.current) clearTimeout(searchFocusTimerRef.current);
+            if (searchBlurTimerRef.current) clearTimeout(searchBlurTimerRef.current);
+        };
+    }, []);
 
     /**
      * Parses the current path into segments for breadcrumb navigation
@@ -86,6 +95,32 @@ const PathBreadcrumb = ({ onCopyPath, isVisible = true, onSearch }) => {
                         path: accum,
                     });
                 }
+            }
+        }
+        // Handle UNC paths (\\server\share\dir or //server/share/dir)
+        else if (currentPath.startsWith('\\\\') || currentPath.startsWith('//')) {
+            const normalized = currentPath.replace(/\//g, '\\');
+            const parts = normalized.replace(/^\\+/, '').split('\\').filter(Boolean);
+            if (parts.length >= 2) {
+                const shareRoot = `\\\\${parts[0]}\\${parts[1]}`;
+                segments.push({
+                    name: shareRoot,
+                    path: shareRoot,
+                });
+                let accum = shareRoot;
+                for (let i = 2; i < parts.length; i++) {
+                    accum += '\\' + parts[i];
+                    segments.push({
+                        name: parts[i],
+                        path: accum,
+                    });
+                }
+            } else if (parts.length === 1) {
+                const serverRoot = `\\\\${parts[0]}`;
+                segments.push({
+                    name: serverRoot,
+                    path: serverRoot,
+                });
             }
         }
         // Handle Unix paths (/path/to/folder)
@@ -221,9 +256,11 @@ const PathBreadcrumb = ({ onCopyPath, isVisible = true, onSearch }) => {
             setIsEditing(false); // Ensure we're not in editing mode
         } else {
             // Show search overlay and focus input
+            if (searchBlurTimerRef.current) clearTimeout(searchBlurTimerRef.current);
+            if (searchFocusTimerRef.current) clearTimeout(searchFocusTimerRef.current);
             setIsEditing(false); // Exit editing mode when starting search
             setIsSearchVisible(true);
-            setTimeout(() => {
+            searchFocusTimerRef.current = setTimeout(() => {
                 if (searchInputRef.current) {
                     searchInputRef.current.focus();
                 }
@@ -300,9 +337,10 @@ const PathBreadcrumb = ({ onCopyPath, isVisible = true, onSearch }) => {
                         value={searchQuery}
                         onChange={handleSearchChange}
                         onKeyDown={handleSearchKeyDown}
-                        onBlur={(e) => {
+                        onBlur={() => {
                             // Delay blur handler to allow click handler to run first
-                            setTimeout(() => {
+                            if (searchBlurTimerRef.current) clearTimeout(searchBlurTimerRef.current);
+                            searchBlurTimerRef.current = setTimeout(() => {
                                 if (!searchQuery.trim() && isSearchVisible) {
                                     // Clear search completely and return to breadcrumb view
                                     if (onSearch) {

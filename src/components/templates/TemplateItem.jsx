@@ -187,7 +187,7 @@ const TemplateItem = ({ template, onUse, onRemove }) => {
                         <span className="template-type">
                             {safeType === 'folder' ? 'Folder' : 'File'}
                         </span>
-                        {template.size && (
+                        {template.size > 0 && (
                             <span className="template-size">{formatSize(template.size)}</span>
                         )}
                         {template.createdAt && (

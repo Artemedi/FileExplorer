@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { getFileType } from '../../utils/formatters';
+import { joinPath, normalizePath } from '../../utils/pathUtils';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useContextMenu } from '../../providers/ContextMenuProvider';
@@ -55,6 +56,9 @@ const FileList = ({
     onOpenFile: customOpenFile,
     focusedItem: customFocusedItem,
     onSetFocusedItem: customSetFocusedItem,
+    isActive = true,
+    targetDirectory,
+    onRefresh,
 }) => {
     const fs = useFileSystem();
     const selectedItems = customSelectedItems !== undefined ? customSelectedItems : fs.selectedItems;
@@ -83,6 +87,7 @@ const FileList = ({
     const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
     const [columnsPerRow, setColumnsPerRow] = useState(4); // Dynamic column calculation
     const containerRef = useRef(null);
+    const listRef = useRef(null);
     const [lastSelectedIndex, setLastSelectedIndex] = useState(-1);
 
     /**
@@ -96,14 +101,15 @@ const FileList = ({
         }
 
         const container = containerRef.current;
+        const gridEl = listRef.current || container.querySelector('.file-list') || container;
         
-        // Try to get computed styles first
-        const computedStyle = window.getComputedStyle(container);
+        // Try to get computed styles from the CSS Grid element (.file-list)
+        const computedStyle = window.getComputedStyle(gridEl);
         const gridTemplateColumns = computedStyle.getPropertyValue('grid-template-columns');
         
         // If CSS Grid is being used, count the columns from grid-template-columns
         if (gridTemplateColumns && gridTemplateColumns !== 'none') {
-            const columns = gridTemplateColumns.split(' ').length;
+            const columns = gridTemplateColumns.trim().split(/\s+/).length;
             setColumnsPerRow(columns);
             onColumnsChange?.(columns);
             return;
@@ -124,7 +130,6 @@ const FileList = ({
         if (fileItems.length >= 2) {
             const firstItem = fileItems[0];
             const firstItemRect = firstItem.getBoundingClientRect();
-            const containerRect = container.getBoundingClientRect();
             
             let columnsInFirstRow = 1;
             for (let i = 1; i < fileItems.length; i++) {
@@ -145,8 +150,8 @@ const FileList = ({
             }
         }
         
-        // More conservative estimates for item width
-        const estimatedItemWidth = 160;
+        // Estimate based on CSS grid item min-width (120px)
+        const estimatedItemWidth = 120;
         const gap = 12;
         const padding = 32;
         
@@ -193,7 +198,7 @@ const FileList = ({
      * Returns sorted data based on current sort configuration
      * @returns {Array} Sorted array of files and directories
      */
-    const getSortedData = () => {
+    const sortedItems = useMemo(() => {
         if (!data || (!data.directories?.length && !data.files?.length)) {
             return [];
         }
@@ -207,16 +212,16 @@ const FileList = ({
         ];
 
         // Always put directories first
-        const sortedItems = [...combinedItems].sort((a, b) => {
+        return [...combinedItems].sort((a, b) => {
             // Directories always come before files
             if (a.isDirectory && !b.isDirectory) return -1;
             if (!a.isDirectory && b.isDirectory) return 1;
 
             let aValue, bValue;
             if (key === 'size_in_bytes') {
-                // Folders: always sort as 0 (or -1) so they group together and don't mix with files
-                aValue = a.isDirectory ? -1 : a.size_in_bytes || 0;
-                bValue = b.isDirectory ? -1 : b.size_in_bytes || 0;
+                // Folders: always sort as -1 so they group together and don't mix with files
+                aValue = a.isDirectory ? -1 : (a.size_in_bytes ?? a.size ?? 0);
+                bValue = b.isDirectory ? -1 : (b.size_in_bytes ?? b.size ?? 0);
             } else if (key === 'type') {
                 // Folders: always 'Folder', Files: use getFileType
                 aValue = a.isDirectory ? 'Folder' : (a.name ? getFileType(a.name) : '');
@@ -224,8 +229,12 @@ const FileList = ({
                 aValue = aValue.toLowerCase();
                 bValue = bValue.toLowerCase();
             } else if (key === 'created' || key === 'last_modified' || key === 'accessed') {
-                aValue = new Date(a[key]).getTime();
-                bValue = new Date(b[key]).getTime();
+                const aRaw = key === 'last_modified' ? (a.last_modified ?? a.modified) : a[key];
+                const bRaw = key === 'last_modified' ? (b.last_modified ?? b.modified) : b[key];
+                const aTime = aRaw ? new Date(aRaw).getTime() : 0;
+                const bTime = bRaw ? new Date(bRaw).getTime() : 0;
+                aValue = Number.isNaN(aTime) ? 0 : aTime;
+                bValue = Number.isNaN(bTime) ? 0 : bTime;
             } else {
                 aValue = a[key];
                 bValue = b[key];
@@ -239,9 +248,7 @@ const FileList = ({
             if (aValue > bValue) return direction === 'asc' ? 1 : -1;
             return 0;
         });
-
-        return sortedItems;
-    };
+    }, [data, sortConfig]);
 
     /**
      * Handles click on the container (empty space)
@@ -264,25 +271,37 @@ const FileList = ({
         e.preventDefault();
         e.stopPropagation();
 
-        const targetDir = currentPath;
+        const targetDir = targetDirectory || currentPath;
         if (!targetDir) return;
-        const separator = targetDir.includes('/') ? '/' : '\\';
+
+        const refreshTarget = () => {
+            if (onRefresh) {
+                onRefresh(targetDir);
+            } else {
+                loadDirectory(targetDir);
+            }
+        };
+
+        const isSameTarget = (src, dest) => {
+            const isSftp = src.startsWith('sftp:') || dest.startsWith('sftp:');
+            const normA = normalizePath(src);
+            const normB = normalizePath(dest);
+            return isSftp ? normA === normB : normA.toLowerCase() === normB.toLowerCase();
+        };
 
         try {
-            const raw = e.dataTransfer.getData('application/json');
+            const raw = e.dataTransfer?.getData('application/json');
             if (raw) {
                 const source = JSON.parse(raw);
                 if (source && source.path) {
-                    const dest = targetDir.endsWith(separator)
-                        ? `${targetDir}${source.name}`
-                        : `${targetDir}${separator}${source.name}`;
-                    if (source.path !== dest) {
+                    const dest = joinPath(targetDir, source.name);
+                    if (!isSameTarget(source.path, dest)) {
                         await invoke('copy_file_or_dir', {
                             sourcePath: source.path,
                             destinationPath: dest
                         });
                         showSuccess(`Copied ${source.name}`);
-                        loadDirectory(targetDir);
+                        refreshTarget();
                     }
                     return;
                 }
@@ -292,14 +311,13 @@ const FileList = ({
             showError(`Failed to drop item: ${err?.message || err}`);
         }
 
-        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
             let count = 0;
             for (let i = 0; i < e.dataTransfer.files.length; i++) {
                 const f = e.dataTransfer.files[i];
                 if (f.path) {
-                    const dest = targetDir.endsWith(separator)
-                        ? `${targetDir}${f.name}`
-                        : `${targetDir}${separator}${f.name}`;
+                    const dest = joinPath(targetDir, f.name);
+                    if (isSameTarget(f.path, dest)) continue;
                     try {
                         await invoke('copy_file_or_dir', {
                             sourcePath: f.path,
@@ -314,7 +332,7 @@ const FileList = ({
             }
             if (count > 0) {
                 showSuccess(`Copied ${count} item(s)`);
-                loadDirectory(targetDir);
+                refreshTarget();
             }
         }
     };
@@ -328,11 +346,9 @@ const FileList = ({
         e.preventDefault();
         e.stopPropagation();
 
-        const currentSortedItems = getSortedData();
-        
         // Determine if we clicked on an item or empty space
         const clickedItem = e.target.closest('[data-path]');
-        const item = clickedItem ? currentSortedItems.find(item => item.path === clickedItem.dataset.path) : null;
+        const item = clickedItem ? sortedItems.find(i => i.path === clickedItem.dataset.path) : null;
 
         let overrideSelection = null;
         if (item) {
@@ -340,7 +356,7 @@ const FileList = ({
             if (!isAlreadySelected) {
                 overrideSelection = [item];
                 selectMultiple([item]);
-                const idx = currentSortedItems.findIndex(i => i.path === item.path);
+                const idx = sortedItems.findIndex(i => i.path === item.path);
                 setLastSelectedIndex(idx);
             } else {
                 overrideSelection = selectedItems;
@@ -348,17 +364,18 @@ const FileList = ({
             setFocusedItem(item);
         }
 
-        openContextMenu(e, item, overrideSelection);
+        openContextMenu(e, item, overrideSelection, {
+            panePath: targetDirectory || currentPath,
+            onRefresh,
+        });
     };
-
-    // Get sorted data - call this before useEffects that need it
-    const sortedItems = getSortedData();
 
     /**
      * Sets up keyboard event listeners for multi-selection
      */
     useEffect(() => {
         const handleKeyDown = (e) => {
+            if (!isActive) return;
             setIsShiftKeyPressed(e.shiftKey);
             setIsCtrlKeyPressed(e.ctrlKey || e.metaKey);
 
@@ -536,6 +553,7 @@ const FileList = ({
          * @param {CustomEvent} e - The custom event
          */
         const handleSelectItem = (e) => {
+            if (!isActive) return;
             if (e.detail && e.detail.item) {
                 selectItem(e.detail.item, false);
             }
@@ -545,6 +563,7 @@ const FileList = ({
          * Handles clear selection events
          */
         const handleClearSelection = () => {
+            if (!isActive) return;
             clearSelection();
             setLastSelectedIndex(-1);
         };
@@ -564,7 +583,7 @@ const FileList = ({
             document.removeEventListener('select-item', handleSelectItem);
             document.removeEventListener('clear-selection', handleClearSelection);
         };
-    }, [selectItem, clearSelection, sortedItems, focusedItem, setFocusedItem, loadDirectory, viewMode, showError, disableArrowKeys, columnsPerRow]);
+    }, [isActive, selectItem, selectMultiple, clearSelection, sortedItems, focusedItem, setFocusedItem, selectedItems, lastSelectedIndex, loadDirectory, openFile, viewMode, showError, disableArrowKeys, columnsPerRow]);
 
     /**
      * Clears selection when displayed data changes
@@ -577,6 +596,7 @@ const FileList = ({
     useEffect(() => {
         // Only clear selection if the data object reference actually changed (navigation), not just selection
         if (prevDataRef.current !== data) {
+            isFirstMount.current = true;
             clearSelection();
             setLastSelectedIndex(-1);
             prevDataRef.current = data;
@@ -611,6 +631,8 @@ const FileList = ({
                     className="empty-state-container"
                     onClick={handleContainerClick}
                     onContextMenu={handleContextMenu}
+                    onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
+                    onDrop={handleContainerDrop}
                     style={{ height: '100%', width: '100%' }}
                 >
                     <EmptyState
@@ -653,16 +675,10 @@ const FileList = ({
         // Always set the focused item when clicking on it
         setFocusedItem(item);
 
-        const isSelectOnDoubleClick = settings?.double_click === 'SelectFilesAndFolders';
         const isDir = Boolean(item.isDirectory || 'sub_file_count' in item || item.is_directory);
 
-        // For double-click: open normally, or toggle selection when double_click setting is SelectFilesAndFolders
+        // Double-click always opens the item (including in SelectFilesAndFolders mode)
         if (isDoubleClick) {
-            if (isSelectOnDoubleClick) {
-                selectItem(item, true);
-                setLastSelectedIndex(index);
-                return;
-            }
             if (isDir) {
                 loadDirectory(item.path);
             } else {
@@ -675,15 +691,6 @@ const FileList = ({
         const isAlreadySelected = selectedItems.some(selected => selected.path === item.path);
         const isShift = Boolean(e?.shiftKey || isShiftKeyPressed);
         const isCtrl = Boolean(e?.ctrlKey || e?.metaKey || isCtrlKeyPressed);
-
-        if (isSelectOnDoubleClick && !isShift && !isCtrl) {
-            if (isDir) {
-                loadDirectory(item.path);
-            } else {
-                openFile(item.path);
-            }
-            return;
-        }
 
         if (isShift) {
             // Find anchor index for shift selection
@@ -782,7 +789,12 @@ const FileList = ({
                 )}
 
                 {/* File list content */}
-                <div className={`file-list view-mode-${viewMode.toLowerCase()} scrollable-content`}>
+                <div
+                    ref={listRef}
+                    role="listbox"
+                    aria-multiselectable="true"
+                    className={`file-list view-mode-${viewMode.toLowerCase()} scrollable-content`}
+                >
                     {sortedItems.map((item, index) => (
                         <FileItem
                             key={item.path}
@@ -790,6 +802,7 @@ const FileList = ({
                             viewMode={viewMode}
                             isSelected={selectedItems.some(selected => selected.path === item.path)}
                             isFocused={focusedItem && focusedItem.path === item.path}
+                            onRefresh={onRefresh}
                             onClick={(e) => handleItemClick(e, item, index, false)}
                             onDoubleClick={(e) => handleItemClick(e, item, index, true)}
                             onContextMenu={handleContextMenu}

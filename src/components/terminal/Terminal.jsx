@@ -6,6 +6,74 @@ import Icon from '../common/Icon';
 import { joinPath } from '../../utils/pathUtils';
 import './terminal.css';
 
+const isLocalDirectory = (path) => typeof path === 'string' && path.length > 0 && !path.startsWith('sftp:');
+
+const parseCommandArgs = (input) => {
+    const tokens = [];
+    let current = '';
+    let quote = null;
+    for (let i = 0; i < input.length; i++) {
+        const ch = input[i];
+        if (quote) {
+            if (ch === quote) {
+                quote = null;
+            } else {
+                current += ch;
+            }
+        } else if (ch === '"' || ch === "'") {
+            quote = ch;
+        } else if (/\s/.test(ch)) {
+            if (current.length > 0) {
+                tokens.push(current);
+                current = '';
+            }
+        } else {
+            current += ch;
+        }
+    }
+    if (current.length > 0) {
+        tokens.push(current);
+    }
+    return tokens;
+};
+
+const formatCommandResponse = (rawOutput, command) => {
+    let parsed = rawOutput;
+    if (typeof rawOutput === 'string') {
+        try {
+            parsed = JSON.parse(rawOutput);
+        } catch {
+            return { type: 'output', content: rawOutput || '' };
+        }
+    }
+
+    if (parsed && typeof parsed === 'object' && ('status' in parsed || 'stdout' in parsed || 'stderr' in parsed)) {
+        const stdout = (parsed.stdout || '').trim();
+        const stderr = (parsed.stderr || '').trim();
+        const status = parsed.status ?? 0;
+
+        if (status === 0) {
+            return { type: 'output', content: stdout || '' };
+        }
+
+        if (status === 1 && !stdout && !stderr) {
+            const cmdName = parseCommandArgs(command)[0] || command;
+            return { type: 'error', content: `Command not found: ${cmdName}` };
+        }
+
+        if (stderr) {
+            return { type: 'error', content: stdout ? `${stdout}\n${stderr}` : stderr };
+        }
+
+        return {
+            type: 'error',
+            content: stdout || `Command failed with status ${status}`,
+        };
+    }
+
+    return { type: 'output', content: rawOutput || '' };
+};
+
 const escapeHtml = (str) => String(str ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -219,15 +287,16 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
             const isLongRunning = longRunningCommands.some(cmd => command.toLowerCase().startsWith(cmd));
             
             // Use appropriate command execution method
+            const workingDir = isLocalDirectory(currentPath) ? currentPath : null;
             const commandPromise = isLongRunning 
                 ? invoke('execute_command_with_timeout', { 
                     command, 
-                    workingDirectory: currentPath,
+                    workingDirectory: workingDir,
                     timeoutSeconds: 30
                 })
                 : invoke('execute_command_improved', { 
                     command, 
-                    workingDirectory: currentPath 
+                    workingDirectory: workingDir 
                 });
             const cancelPromise = new Promise((_, reject) => {
                 controller.signal.addEventListener('abort', () => {
@@ -236,78 +305,7 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
             });
 
             const output = await Promise.race([commandPromise, cancelPromise]);
-
-            // Format the response properly
-            if (typeof output === 'string') {
-                try {
-                    // Check if it's JSON
-                    const parsedOutput = JSON.parse(output);
-
-                    // Handle empty results
-                    if (parsedOutput.stdout === "" && parsedOutput.stderr === "" && parsedOutput.status === 0) {
-                        return { type: 'output', content: '' };
-                    }
-
-                    // Handle status 1 with empty stdout/stderr (command not found)
-                    if (parsedOutput.status === 1) {
-                        if (parsedOutput.stdout === "" && parsedOutput.stderr === "") {
-                            return { type: 'error', content: `Command not found: ${command.split(' ')[0]}` };
-                        } else if (parsedOutput.stderr) {
-                            return { type: 'error', content: parsedOutput.stderr.trim() };
-                        }
-                    }
-
-                    // Handle actual output
-                    if (parsedOutput.stdout && parsedOutput.stdout.trim()) {
-                        return { type: 'output', content: parsedOutput.stdout.trim() };
-                    }
-
-                    // Handle error output
-                    if (parsedOutput.stderr && parsedOutput.stderr.trim()) {
-                        return { type: 'error', content: parsedOutput.stderr.trim() };
-                    }
-
-                    // Handle other output based on status
-                    return {
-                        type: parsedOutput.status === 0 ? 'output' : 'error',
-                        content: parsedOutput.status === 0 ?
-                            (output || '') :
-                            `Command failed with status ${parsedOutput.status}`
-                    };
-                } catch (e) {
-                    // Not JSON, return as is
-                    return { type: 'output', content: output || '' };
-                }
-            } else if (typeof output === 'object') {
-                // Handle object response
-                if (output.stdout === "" && output.stderr === "" && output.status === 0) {
-                    return { type: 'output', content: '' };
-                }
-
-                // Handle command not found
-                if (output.status === 1) {
-                    if (output.stdout === "" && output.stderr === "") {
-                        return { type: 'error', content: `Command not found: ${command.split(' ')[0]}` };
-                    } else if (output.stderr) {
-                        return { type: 'error', content: output.stderr };
-                    }
-                }
-
-                if (output.stdout) {
-                    return { type: 'output', content: output.stdout };
-                }
-
-                // Empty response
-                return {
-                    type: output.status === 0 ? 'output' : 'error',
-                    content: output.status === 0 ? '' : `Command failed with status ${output.status}`
-                };
-            }
-
-            return {
-                type: 'output',
-                content: output || '',
-            };
+            return formatCommandResponse(output, command);
         } catch (error) {
             // Handle command cancellation
             if (error.message === 'Command cancelled') {
@@ -440,22 +438,22 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
 
             case 'cd': {
                 console.log('[Terminal cd] Starting cd command with args:', args);
+                const getHomeDir = async () => {
+                    const homeResult = await invoke('execute_command_improved', {
+                        command: 'echo $HOME',
+                        workingDirectory: null
+                    });
+                    const parsed = typeof homeResult === 'string' ? JSON.parse(homeResult) : homeResult;
+                    return parsed?.stdout?.trim() || '';
+                };
+
                 try {
                     if (args.length === 0) {
                         // No argument provided - go to home directory
                         try {
-                            const homeResult = await invoke('execute_command_improved', {
-                                command: 'echo $HOME',
-                                workingDirectory: null
-                            });
-                            
-                            let homeDir;
-                            if (typeof homeResult === 'string') {
-                                const parsed = JSON.parse(homeResult);
-                                homeDir = parsed.stdout.trim();
-                            }
-                            
+                            const homeDir = await getHomeDir();
                             if (homeDir) {
+                                await invoke('open_directory', { path: homeDir });
                                 await navigateTo(homeDir);
                                 console.log('[Terminal cd] Successfully navigated to home');
                                 return { type: 'output', content: '' }; // Silent success - empty content
@@ -470,23 +468,30 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                         }
                     }
 
-                    let targetPath = args[0];
+                    const targetPath = args[0];
                     let finalPath;
                     
                     console.log('[Terminal cd] Input:', targetPath, 'Current path:', currentPath);
                     
-                    // Handle special cases
+                    // Handle ~ and ~/subdir
                     if (targetPath === '~') {
-                        // Handle home directory
-                        const homeResult = await invoke('execute_command_improved', {
-                            command: 'echo $HOME',
-                            workingDirectory: null
-                        });
-                        if (typeof homeResult === 'string') {
-                            const parsed = JSON.parse(homeResult);
-                            finalPath = parsed.stdout.trim();
+                        finalPath = await getHomeDir();
+                    } else if (targetPath.startsWith('~/') || targetPath.startsWith('~\\')) {
+                        const homeDir = await getHomeDir();
+                        if (!homeDir) {
+                            throw new Error('Could not resolve home directory');
                         }
+                        finalPath = resolveTerminalCdPath(targetPath.slice(2), homeDir);
                     } else {
+                        const isAbsoluteTarget = /^[A-Za-z]:/.test(targetPath) || targetPath.startsWith('/') || /^\\\\/.test(targetPath);
+                        if (!isAbsoluteTarget && !isLocalDirectory(currentPath)) {
+                            return {
+                                type: 'error',
+                                content: currentPath === null
+                                    ? 'cd: No active directory selected (This PC view). Specify an absolute path.'
+                                    : 'cd: Relative navigation is not supported on SFTP virtual paths.',
+                            };
+                        }
                         finalPath = resolveTerminalCdPath(targetPath, currentPath);
                     }
 
@@ -496,7 +501,8 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
 
                     console.log('[Terminal cd] Resolved to:', finalPath);
 
-                    // Try to navigate directly - let the file explorer handle validation
+                    // Validate directory exists and is accessible before updating navigation history
+                    await invoke('open_directory', { path: finalPath });
                     await navigateTo(finalPath);
                     console.log('[Terminal cd] Navigation succeeded');
                     return { type: 'output', content: '' }; // Silent success - empty content
@@ -530,6 +536,14 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
 
             case 'ls':
             case 'dir':
+                if (!isLocalDirectory(currentPath)) {
+                    return {
+                        type: 'error',
+                        content: currentPath === null
+                            ? 'Cannot list directory: No active directory selected (This PC view).'
+                            : 'Cannot list directory: Built-in ls is not supported on SFTP virtual paths.',
+                    };
+                }
                 try {
                     const dirContent = await invoke('open_directory', { path: currentPath });
                     const data = JSON.parse(dirContent);
@@ -561,6 +575,14 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                 }
 
             case 'tree':
+                if (!isLocalDirectory(currentPath)) {
+                    return {
+                        type: 'error',
+                        content: currentPath === null
+                            ? 'Cannot generate tree: No active directory selected (This PC view).'
+                            : 'Cannot generate tree: Built-in tree is not supported on SFTP virtual paths.',
+                    };
+                }
                 try {
                     const dirContent = await invoke('open_directory', { path: currentPath });
                     const data = JSON.parse(dirContent);
@@ -636,6 +658,14 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                         content: 'mkdir: missing operand',
                     };
                 }
+                if (!isLocalDirectory(currentPath)) {
+                    return {
+                        type: 'error',
+                        content: currentPath === null
+                            ? 'mkdir: No active directory selected (This PC view).'
+                            : 'mkdir: Not supported on SFTP virtual paths.',
+                    };
+                }
                 try {
                     await invoke('create_directory', {
                         folderPathAbs: currentPath,
@@ -657,6 +687,14 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                     return {
                         type: 'error',
                         content: 'touch: missing operand',
+                    };
+                }
+                if (!isLocalDirectory(currentPath)) {
+                    return {
+                        type: 'error',
+                        content: currentPath === null
+                            ? 'touch: No active directory selected (This PC view).'
+                            : 'touch: Not supported on SFTP virtual paths.',
                     };
                 }
                 try {
@@ -683,9 +721,18 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                     };
                 }
                 try {
-                    const filePath = (/^[A-Za-z]:/.test(args[0]) || args[0].startsWith('/'))
+                    const isAbsFile = /^[A-Za-z]:/.test(args[0]) || args[0].startsWith('/');
+                    if (!isAbsFile && !isLocalDirectory(currentPath)) {
+                        return {
+                            type: 'error',
+                            content: currentPath === null
+                                ? 'cat: No active directory selected (This PC view).'
+                                : 'cat: Not supported on SFTP virtual paths.',
+                        };
+                    }
+                    const filePath = isAbsFile
                         ? args[0]
-                        : joinPath(currentPath || '/', args[0]);
+                        : joinPath(currentPath, args[0]);
                     const content = await invoke('open_file', { path: filePath });
                     return {
                         type: 'output',
@@ -703,6 +750,14 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                     return {
                         type: 'error',
                         content: 'find: missing search pattern\nUsage: find <pattern>',
+                    };
+                }
+                if (!isLocalDirectory(currentPath)) {
+                    return {
+                        type: 'error',
+                        content: currentPath === null
+                            ? 'find: No active directory selected (This PC view).'
+                            : 'find: Not supported on SFTP virtual paths.',
                     };
                 }
                 
@@ -746,7 +801,7 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                     };
                 }
 
-            case 'which':
+            case 'which': {
                 if (args.length === 0) {
                     return {
                         type: 'error',
@@ -755,31 +810,51 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                 }
                 
                 const builtinCommands = ['help', 'clear', 'history', 'ls', 'dir', 'pwd', 'cd', 'mkdir', 'touch', 'cat', 'tree', 'echo', 'whoami', 'date', 'find', 'which', 'ping', 'exit'];
-                const searchCommand = args[0].toLowerCase();
+                const rawCommand = args[0];
+                const searchCommand = rawCommand.toLowerCase();
                 
                 if (builtinCommands.includes(searchCommand)) {
                     return {
                         type: 'output',
                         content: `${searchCommand}: built-in terminal command`,
                     };
-                } else {
-                    // Check if it's a system command by trying to execute it with --version or --help
-                    try {
-                        const testResult = await invoke('execute_command_improved', { 
-                            command: `${searchCommand} --version`, 
-                            workingDirectory: currentPath 
-                        });
+                }
+
+                if (!/^[a-zA-Z0-9._-]+$/.test(rawCommand)) {
+                    return {
+                        type: 'error',
+                        content: `which: invalid command name '${rawCommand}'`,
+                    };
+                }
+
+                try {
+                    const isWindows = navigator.userAgent?.toLowerCase().includes('win') || /^[A-Za-z]:/.test(currentPath || '');
+                    const lookupCmd = isWindows
+                        ? `Get-Command ${rawCommand} -ErrorAction Stop | Select-Object -ExpandProperty Source`
+                        : `command -v ${rawCommand}`;
+                    const testResult = await invoke('execute_command_improved', { 
+                        command: lookupCmd, 
+                        workingDirectory: isLocalDirectory(currentPath) ? currentPath : null 
+                    });
+                    const parsed = typeof testResult === 'string' ? JSON.parse(testResult) : testResult;
+                    if (parsed && parsed.status === 0) {
+                        const resolvedPath = (parsed.stdout || '').trim();
                         return {
                             type: 'output',
-                            content: `${searchCommand}: system command (use system PATH)`,
-                        };
-                    } catch {
-                        return {
-                            type: 'output',
-                            content: `${searchCommand}: command not found`,
+                            content: resolvedPath ? `${rawCommand}: ${resolvedPath}` : `${rawCommand}: system command (use system PATH)`,
                         };
                     }
+                    return {
+                        type: 'output',
+                        content: `${rawCommand}: command not found`,
+                    };
+                } catch {
+                    return {
+                        type: 'output',
+                        content: `${rawCommand}: command not found`,
+                    };
                 }
+            }
 
             case 'exit':
                 onToggle();
@@ -806,7 +881,7 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
         if (!currentCommand.trim() || isExecuting) return;
 
         const command = currentCommand.trim();
-        const [cmd, ...args] = command.split(' ');
+        const [cmd = '', ...args] = parseCommandArgs(command);
 
         // Add command to history
         const commandEntry = {
@@ -946,6 +1021,7 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                 setCommandHistory(prev => [...prev, optionsMessage]);
             }
         } else {
+            if (!isLocalDirectory(currentPath)) return;
             // Complete file/directory paths
             try {
                 const dirContent = await invoke('open_directory', { path: currentPath });
@@ -1009,16 +1085,58 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
         setSelectedSearchIndex(-1);
     };
 
+    const handleTerminalKeyDown = (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+            const selectedText = window.getSelection?.()?.toString() || '';
+            if (selectedText) {
+                e.stopPropagation();
+                navigator.clipboard?.writeText?.(selectedText).catch(() => {});
+                return;
+            }
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            if (isExecuting && abortController) {
+                abortController.abort();
+                setIsExecuting(false);
+                setAbortController(null);
+
+                setCommandHistory(prev => [...prev, {
+                    type: 'error',
+                    content: '❌ Command interrupted by user (Ctrl+C)',
+                    timestamp: new Date().toLocaleTimeString(),
+                }]);
+
+                setCurrentCommand('');
+                setHistoryIndex(-1);
+                return;
+            }
+
+            if (currentCommand.trim()) {
+                const commandEntry = {
+                    type: 'command',
+                    prompt: getPrompt(),
+                    content: currentCommand + ' ^C',
+                    timestamp: new Date().toLocaleTimeString(),
+                };
+                setCommandHistory(prev => [...prev, commandEntry]);
+                setCurrentCommand('');
+                setHistoryIndex(-1);
+            }
+        }
+    };
+
     /**
      * Handles keyboard navigation through command history and tab completion
      * Supports arrow up/down for history navigation and tab for command completion
-     * Also handles Ctrl+C for command interruption and Ctrl+R for search
+     * Also handles Ctrl+R for search
      *
      * @param {React.KeyboardEvent} e - Keyboard event
      */
     const handleKeyDown = async (e) => {
-        // Handle Ctrl+R for reverse search
-        if (e.ctrlKey && e.key === 'r') {
+        // Handle Ctrl+R for reverse search (case-insensitive)
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'r') {
             e.preventDefault();
             if (!isSearchMode) {
                 setIsSearchMode(true);
@@ -1060,42 +1178,6 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
             }
 
             return; // Let other keys be handled normally in search mode
-        }
-
-        // Handle Ctrl+C to interrupt command execution or clear current input
-        if (e.ctrlKey && e.key === 'c') {
-            e.preventDefault();
-            
-            if (isExecuting && abortController) {
-                // Interrupt running command
-                abortController.abort();
-                setIsExecuting(false);
-                setAbortController(null);
-                
-                // Add visual feedback that the command was interrupted
-                setCommandHistory(prev => [...prev, {
-                    type: 'error',
-                    content: '❌ Command interrupted by user (Ctrl+C)',
-                    timestamp: new Date().toLocaleTimeString(),
-                }]);
-                
-                // Clear the current command line
-                setCurrentCommand('');
-                setHistoryIndex(-1);
-                return;
-            } else if (currentCommand.trim()) {
-                // Clear current input and show ^C
-                const commandEntry = {
-                    type: 'command',
-                    prompt: getPrompt(),
-                    content: currentCommand + ' ^C',
-                    timestamp: new Date().toLocaleTimeString(),
-                };
-                setCommandHistory(prev => [...prev, commandEntry]);
-                setCurrentCommand('');
-                setHistoryIndex(-1);
-                return;
-            }
         }
 
         if (isExecuting) return;
@@ -1140,7 +1222,11 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
     };
 
     return (
-        <div className="enhanced-terminal" style={{ height: `${terminalHeight}px` }}>
+        <div
+            className="enhanced-terminal"
+            style={{ height: `${terminalHeight}px` }}
+            onKeyDown={handleTerminalKeyDown}
+        >
             <div className="terminal-header">
                 <div className="terminal-title">
                     <span>Terminal</span>
@@ -1219,7 +1305,7 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                         value={isSearchMode ? searchQuery : currentCommand}
                         onChange={handleChange}
                         onKeyDown={handleKeyDown}
-                        disabled={isExecuting}
+                        readOnly={isExecuting}
                         autoFocus
                         spellCheck="false"
                         autoComplete="off"
@@ -1233,6 +1319,25 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                         </span>
                     )}
                 </form>
+                {isSearchMode && searchResults.length > 0 && (
+                    <div className="terminal-search-results" role="listbox" aria-label="Command history search results">
+                        {searchResults.map((result, idx) => (
+                            <div
+                                key={`${result}-${idx}`}
+                                role="option"
+                                aria-selected={idx === selectedSearchIndex}
+                                className={`terminal-search-result-item ${idx === selectedSearchIndex ? 'selected' : ''}`}
+                                onClick={() => {
+                                    setCurrentCommand(result);
+                                    exitSearchMode();
+                                    inputRef.current?.focus();
+                                }}
+                            >
+                                {result}
+                            </div>
+                        ))}
+                    </div>
+                )}
             </div>
         </div>
     );

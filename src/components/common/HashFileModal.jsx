@@ -1,7 +1,10 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { save } from '@tauri-apps/plugin-dialog';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useFileSystem } from '../../providers/FileSystemProvider';
+import { useSftp } from '../../providers/SftpProvider';
+import { joinPath } from '../../utils/pathUtils';
 import { showError, showSuccess } from '../../utils/NotificationSystem';
 import Modal from '../common/Modal';
 import Button from '../common/Button';
@@ -22,6 +25,7 @@ const HashFileModal = ({ isOpen, onClose, item }) => {
     const inputRef = useRef(null);
     const { currentPath } = useHistory();
     const { loadDirectory } = useFileSystem();
+    const { isSftpPath } = useSftp();
 
     /**
      * Initialize filename when modal opens and focus the input field
@@ -31,7 +35,7 @@ const HashFileModal = ({ isOpen, onClose, item }) => {
             const initialName = `${item.name}.hash`;
             setFileName(initialName);
             // Focus and select filename without extension
-            setTimeout(() => {
+            const timer = setTimeout(() => {
                 if (inputRef.current) {
                     inputRef.current.focus();
                     const lastDotIndex = initialName.lastIndexOf('.');
@@ -42,6 +46,7 @@ const HashFileModal = ({ isOpen, onClose, item }) => {
                     }
                 }
             }, 100);
+            return () => clearTimeout(timer);
         }
     }, [isOpen, item]);
 
@@ -51,20 +56,41 @@ const HashFileModal = ({ isOpen, onClose, item }) => {
      */
     const handleSubmit = async (e) => {
         e.preventDefault();
-        if (!fileName.trim() || !item) return;
+        const trimmedName = fileName.trim();
+        if (!trimmedName || !item) return;
+
+        if (/[\\/]/.test(trimmedName)) {
+            showError('File name cannot contain "/" or "\\"');
+            return;
+        }
 
         setIsGenerating(true);
         try {
-            const separator = currentPath.includes('\\') ? '\\' : '/';
-            const outputPath = `${currentPath}${separator}${fileName.trim()}`;
+            const isRemoteOrUnset = !currentPath || isSftpPath(currentPath);
+            let outputPath;
+
+            if (isRemoteOrUnset) {
+                const selectedPath = await save({
+                    defaultPath: trimmedName,
+                    title: 'Save Hash File'
+                });
+                if (!selectedPath) {
+                    return;
+                }
+                outputPath = selectedPath;
+            } else {
+                outputPath = joinPath(currentPath, trimmedName);
+            }
 
             const hash = await invoke('gen_hash_and_save_to_file', {
                 sourcePath: item.path,
                 outputPath: outputPath
             });
 
-            await loadDirectory(currentPath);
-            showSuccess(`Hash generated and saved to ${fileName}: ${hash.substring(0, 16)}...`);
+            if (!isRemoteOrUnset && currentPath) {
+                await loadDirectory(currentPath);
+            }
+            showSuccess(`Hash generated and saved to ${trimmedName}: ${hash.substring(0, 16)}...`);
             onClose();
         } catch (error) {
             console.error('Hash generation to file failed:', error);
@@ -88,6 +114,11 @@ const HashFileModal = ({ isOpen, onClose, item }) => {
      */
     const handleKeyDown = (e) => {
         if (e.key === 'Escape') {
+            if (isGenerating) {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
             onClose();
         }
     };
@@ -97,7 +128,11 @@ const HashFileModal = ({ isOpen, onClose, item }) => {
     return (
         <Modal
             isOpen={isOpen}
-            onClose={onClose}
+            onClose={() => {
+                if (!isGenerating) onClose();
+            }}
+            closeOnEsc={!isGenerating}
+            closeOnOverlayClick={!isGenerating}
             title="Generate Hash to File"
             size="sm"
             footer={

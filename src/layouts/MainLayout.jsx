@@ -8,6 +8,7 @@ import { useSftp } from '../providers/SftpProvider';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { showError, showConfirm, showSuccess } from '../utils/NotificationSystem';
+import { getFileType } from '../utils/formatters';
 
 // Core Components
 import Sidebar from '../components/sidebar/Sidebar';
@@ -44,7 +45,7 @@ import SettingsApplier from '../utils/SettingsApplier.js';
 import { usePreview } from '../hooks/usePreview';
 
 import '../styles/layouts/mainLayout.css';
-import {replaceFileName} from "../utils/pathUtils.js";
+import { replaceFileName } from "../utils/pathUtils";
 
 /**
  * MainLayout component that serves as the primary layout structure for the application.
@@ -91,11 +92,6 @@ const MainLayout = () => {
     const [isRenameModalOpen, setIsRenameModalOpen] = useState(false);
     const [itemToRename, setItemToRename] = useState(null);
 
-    // Text viewer modal state
-    const [isTextViewerOpen, setIsTextViewerOpen] = useState(false);
-    const [textViewerContent, setTextViewerContent] = useState('');
-    const [textViewerFileName, setTextViewerFileName] = useState('');
-
     // Hash Modal states
     const [isHashFileModalOpen, setIsHashFileModalOpen] = useState(false);
     const [isHashCompareModalOpen, setIsHashCompareModalOpen] = useState(false);
@@ -126,6 +122,9 @@ const MainLayout = () => {
     const clipboardRef = useRef(clipboard);
     clipboardRef.current = clipboard;
 
+    const currentViewRef = useRef(currentView);
+    currentViewRef.current = currentView;
+
     // Get terminal height for padding calculations
     const terminalHeight = settings.terminal_height || 240;
 
@@ -136,113 +135,182 @@ const MainLayout = () => {
             return [];
         }
 
+        const sortBy = (settings?.sort_by || '').toLowerCase();
+        const key = sortBy === 'size'
+            ? 'size_in_bytes'
+            : (sortBy === 'modified' || sortBy === 'date')
+                ? 'last_modified'
+                : sortBy === 'type'
+                    ? 'type'
+                    : 'name';
+        const direction = settings?.sort_direction === 'Descending' ? 'desc' : 'asc';
+
         // Combine directories and files for sorting (same as FileList)
         const combinedItems = [
             ...(data.directories || []).map(dir => ({ ...dir, isDirectory: true })),
             ...(data.files || []).map(file => ({ ...file, isDirectory: false }))
         ];
 
-        // Sort by name with directories first (same as FileList default)
+        // Sort with directories first (same as FileList)
         const sortedItems = [...combinedItems].sort((a, b) => {
             // Directories always come before files
             if (a.isDirectory && !b.isDirectory) return -1;
             if (!a.isDirectory && b.isDirectory) return 1;
 
-            // Sort by name
-            const aName = a.name.toLowerCase();
-            const bName = b.name.toLowerCase();
-            return aName.localeCompare(bName);
+            let aValue, bValue;
+            if (key === 'size_in_bytes') {
+                aValue = a.isDirectory ? -1 : a.size_in_bytes || 0;
+                bValue = b.isDirectory ? -1 : b.size_in_bytes || 0;
+            } else if (key === 'type') {
+                aValue = (a.isDirectory ? 'Folder' : (a.name ? getFileType(a.name) : '')).toLowerCase();
+                bValue = (b.isDirectory ? 'Folder' : (b.name ? getFileType(b.name) : '')).toLowerCase();
+            } else if (key === 'last_modified') {
+                aValue = new Date(a[key]).getTime();
+                bValue = new Date(b[key]).getTime();
+            } else {
+                aValue = a[key];
+                bValue = b[key];
+                if (typeof aValue === 'string' && typeof bValue === 'string') {
+                    aValue = aValue.toLowerCase();
+                    bValue = bValue.toLowerCase();
+                }
+            }
+
+            if (aValue < bValue) return direction === 'asc' ? -1 : 1;
+            if (aValue > bValue) return direction === 'asc' ? 1 : -1;
+            return 0;
         });
 
         return sortedItems;
-    }, [searchResults, currentDirData]);
+    }, [searchResults, currentDirData, settings?.sort_by, settings?.sort_direction]);
 
     // Initialize preview functionality
-    const getFocusedItem = () => {
-        // For search results, use the focused item from search
-        if (searchResults && searchResults.length > 0) {
-            // This would need to be implemented in search components
-            return null; // Placeholder for now
-        }
-        
-        // For regular file list, use the focused item from FileSystemProvider
-        return focusedItem;
-    };
+    const getFocusedItem = useCallback(() => {
+        return focusedItemRef.current;
+    }, []);
 
     // 2D Grid navigation functions using sorted data
     const navigateUp = useCallback(() => {
         const sortedItems = getSortedData();
-        if (!sortedItems.length) return;
-        
-        const currentIndex = focusedItem ? sortedItems.findIndex(item => item.path === focusedItem.path) : -1;
+        if (!sortedItems.length) return null;
+
+        const currentIndex = focusedItemRef.current
+            ? sortedItems.findIndex(item => item.path === focusedItemRef.current.path)
+            : -1;
+        if (currentIndex === -1) {
+            const firstItem = sortedItems[0];
+            focusedItemRef.current = firstItem;
+            setFocusedItem(firstItem);
+            return firstItem;
+        }
+
         const newIndex = currentIndex - columnsPerRow;
-        
+        let targetIndex;
         if (newIndex >= 0) {
-            setFocusedItem(sortedItems[newIndex]);
+            targetIndex = newIndex;
         } else {
             // Wrap to bottom row
             const remainder = currentIndex % columnsPerRow;
             const totalRows = Math.ceil(sortedItems.length / columnsPerRow);
             const lastRowStartIndex = (totalRows - 1) * columnsPerRow;
-            const targetIndex = Math.min(lastRowStartIndex + remainder, sortedItems.length - 1);
-            setFocusedItem(sortedItems[targetIndex]);
+            targetIndex = Math.min(lastRowStartIndex + remainder, sortedItems.length - 1);
         }
-    }, [getSortedData, focusedItem, setFocusedItem, columnsPerRow]);
+
+        const targetItem = sortedItems[targetIndex];
+        focusedItemRef.current = targetItem;
+        setFocusedItem(targetItem);
+        return targetItem;
+    }, [getSortedData, setFocusedItem, columnsPerRow]);
 
     const navigateDown = useCallback(() => {
         const sortedItems = getSortedData();
-        if (!sortedItems.length) return;
-        
-        const currentIndex = focusedItem ? sortedItems.findIndex(item => item.path === focusedItem.path) : -1;
-        const newIndex = currentIndex + columnsPerRow;
-        
-        if (newIndex < sortedItems.length) {
-            setFocusedItem(sortedItems[newIndex]);
-        } else {
-            // Wrap to top row
-            const remainder = currentIndex % columnsPerRow;
-            setFocusedItem(sortedItems[remainder]);
+        if (!sortedItems.length) return null;
+
+        const currentIndex = focusedItemRef.current
+            ? sortedItems.findIndex(item => item.path === focusedItemRef.current.path)
+            : -1;
+        if (currentIndex === -1) {
+            const firstItem = sortedItems[0];
+            focusedItemRef.current = firstItem;
+            setFocusedItem(firstItem);
+            return firstItem;
         }
-    }, [getSortedData, focusedItem, setFocusedItem, columnsPerRow]);
+
+        const newIndex = currentIndex + columnsPerRow;
+        const targetIndex = newIndex < sortedItems.length
+            ? newIndex
+            : currentIndex % columnsPerRow;
+
+        const targetItem = sortedItems[targetIndex];
+        focusedItemRef.current = targetItem;
+        setFocusedItem(targetItem);
+        return targetItem;
+    }, [getSortedData, setFocusedItem, columnsPerRow]);
 
     const navigateLeft = useCallback(() => {
         const sortedItems = getSortedData();
-        if (!sortedItems.length) return;
-        
-        const currentIndex = focusedItem ? sortedItems.findIndex(item => item.path === focusedItem.path) : -1;
-        
-        if (currentIndex % columnsPerRow === 0) {
-            // At leftmost column, wrap to rightmost of same row or previous row
-            const currentRow = Math.floor(currentIndex / columnsPerRow);
-            const nextRowLastIndex = Math.min((currentRow + 1) * columnsPerRow - 1, sortedItems.length - 1);
-            setFocusedItem(sortedItems[nextRowLastIndex]);
-        } else {
-            setFocusedItem(sortedItems[currentIndex - 1]);
+        if (!sortedItems.length) return null;
+
+        const currentIndex = focusedItemRef.current
+            ? sortedItems.findIndex(item => item.path === focusedItemRef.current.path)
+            : -1;
+        if (currentIndex === -1) {
+            const firstItem = sortedItems[0];
+            focusedItemRef.current = firstItem;
+            setFocusedItem(firstItem);
+            return firstItem;
         }
-    }, [getSortedData, focusedItem, setFocusedItem, columnsPerRow]);
+
+        let targetIndex;
+        if (currentIndex % columnsPerRow === 0) {
+            // At leftmost column, wrap to rightmost of same row
+            const currentRow = Math.floor(currentIndex / columnsPerRow);
+            targetIndex = Math.min((currentRow + 1) * columnsPerRow - 1, sortedItems.length - 1);
+        } else {
+            targetIndex = currentIndex - 1;
+        }
+
+        const targetItem = sortedItems[targetIndex];
+        focusedItemRef.current = targetItem;
+        setFocusedItem(targetItem);
+        return targetItem;
+    }, [getSortedData, setFocusedItem, columnsPerRow]);
 
     const navigateRight = useCallback(() => {
         const sortedItems = getSortedData();
-        if (!sortedItems.length) return;
-        
-        const currentIndex = focusedItem ? sortedItems.findIndex(item => item.path === focusedItem.path) : -1;
-        
+        if (!sortedItems.length) return null;
+
+        const currentIndex = focusedItemRef.current
+            ? sortedItems.findIndex(item => item.path === focusedItemRef.current.path)
+            : -1;
+        if (currentIndex === -1) {
+            const firstItem = sortedItems[0];
+            focusedItemRef.current = firstItem;
+            setFocusedItem(firstItem);
+            return firstItem;
+        }
+
+        let targetIndex;
         if ((currentIndex + 1) % columnsPerRow === 0 || currentIndex === sortedItems.length - 1) {
             // At rightmost column or last item, wrap to leftmost of same row
             const currentRow = Math.floor(currentIndex / columnsPerRow);
-            const rowStartIndex = currentRow * columnsPerRow;
-            setFocusedItem(sortedItems[rowStartIndex]);
+            targetIndex = currentRow * columnsPerRow;
         } else {
-            setFocusedItem(sortedItems[currentIndex + 1]);
+            targetIndex = currentIndex + 1;
         }
-    }, [getSortedData, focusedItem, setFocusedItem, columnsPerRow]);
+
+        const targetItem = sortedItems[targetIndex];
+        focusedItemRef.current = targetItem;
+        setFocusedItem(targetItem);
+        return targetItem;
+    }, [getSortedData, setFocusedItem, columnsPerRow]);
 
     const { 
         open: isPreviewOpen, 
         payload: previewPayload, 
         isLoading: isPreviewLoading,
         closePreview 
-    } = usePreview(getFocusedItem, navigateUp, navigateDown, navigateLeft, navigateRight);
+    } = usePreview(getFocusedItem, navigateUp, navigateDown, navigateLeft, navigateRight, currentView === 'explorer');
 
     /**
      * Effect to update UI state when settings change
@@ -283,10 +351,20 @@ const MainLayout = () => {
     }, [currentView]);
 
     /**
+     * Effect to sync current directory with backend search engine context
+     */
+    useEffect(() => {
+        invoke('set_search_current_directory', { path: currentPath || null }).catch(() => {});
+    }, [currentPath]);
+
+    /**
      * Effect to auto-start indexing when app loads
      */
     useEffect(() => {
         const initializeSearchEngine = async () => {
+            if (!settings?.search_engine_enabled) {
+                return;
+            }
             if (volumes.length > 0) {
                 try {
                     console.log('MainLayout: Checking search engine status for auto-indexing...');
@@ -328,11 +406,11 @@ const MainLayout = () => {
             }
         };
 
-        // Only run once when volumes are first loaded
-        if (volumes.length > 0) {
+        // Only run when volumes are loaded and search engine is enabled
+        if (volumes.length > 0 && settings?.search_engine_enabled) {
             initializeSearchEngine();
         }
-    }, [volumes.length]); // Only depend on volumes.length to avoid re-running
+    }, [volumes.length, settings?.search_engine_enabled]);
 
     /**
      * Effect to listen for custom events
@@ -445,17 +523,6 @@ const MainLayout = () => {
             }
         };
 
-        // SFTP File Opened Handler
-        const handleSftpFileOpened = (e) => {
-            console.log('SFTP File Opened:', e.detail);
-            if (e.detail?.path && e.detail?.content !== undefined) {
-                const fileName = e.detail.path.split('/').pop() || 'Unknown File';
-                setTextViewerFileName(fileName);
-                setTextViewerContent(e.detail.content);
-                setIsTextViewerOpen(true);
-            }
-        };
-
         // Register event listeners
     document.addEventListener('open-templates', handleOpenTemplates);
     document.addEventListener('show-properties', handleShowProperties);
@@ -467,40 +534,54 @@ const MainLayout = () => {
     document.addEventListener('open-hash-file-modal', handleOpenHashFileModal);
     document.addEventListener('open-hash-compare-modal', handleOpenHashCompareModal);
     document.addEventListener('open-hash-display-modal', handleOpenHashDisplayModal);
-    document.addEventListener('sftp-file-opened', handleSftpFileOpened);
     const handleForceExplorerView = () => setCurrentView('explorer');
     document.addEventListener('force-explorer-view', handleForceExplorerView);
     window.addEventListener('force-explorer-view', handleForceExplorerView);
 
     // Handle external files dragged and dropped into the app window
+    let isMounted = true;
     let unlistenTauriDrop = null;
     listen('tauri://drag-drop', async (event) => {
+        if (!isMounted) return;
         const paths = event.payload?.paths;
-        if (paths && paths.length > 0 && currentPath) {
-            const separator = currentPath.includes('/') ? '/' : '\\';
-            let count = 0;
-            for (const p of paths) {
-                const name = p.split(/[\\/]/).pop();
-                const dest = currentPath.endsWith(separator)
-                    ? `${currentPath}${name}`
-                    : `${currentPath}${separator}${name}`;
-                try {
-                    await invoke('copy_file_or_dir', { sourcePath: p, destinationPath: dest });
-                    count++;
-                } catch (e) {
-                    console.error('Failed to copy dropped file:', e);
-                }
-            }
-            if (count > 0) {
-                showSuccess(`Copied ${count} item(s)`);
-                loadDirectory(currentPath);
+        const targetDir = currentPathRef.current;
+        if (!paths || paths.length === 0 || !targetDir) return;
+
+        if (isSftpPath(targetDir)) {
+            showError('Drag-and-drop into SFTP directories is not supported');
+            return;
+        }
+
+        const separator = targetDir.includes('/') ? '/' : '\\';
+        let count = 0;
+        for (const p of paths) {
+            const name = p.split(/[\\/]/).pop();
+            const dest = targetDir.endsWith(separator)
+                ? `${targetDir}${name}`
+                : `${targetDir}${separator}${name}`;
+            try {
+                await invoke('copy_file_or_dir', { sourcePath: p, destinationPath: dest });
+                count++;
+            } catch (e) {
+                console.error('Failed to copy dropped file:', e);
             }
         }
-    }).then(unlisten => { unlistenTauriDrop = unlisten; }).catch(() => {});
+        if (count > 0 && isMounted) {
+            showSuccess(`Copied ${count} item(s)`);
+            loadDirectory(targetDir);
+        }
+    }).then(unlisten => {
+        if (!isMounted) {
+            unlisten();
+        } else {
+            unlistenTauriDrop = unlisten;
+        }
+    }).catch(() => {});
 
         console.log('MainLayout: All event listeners registered');
 
         return () => {
+            isMounted = false;
             if (unlistenTauriDrop) unlistenTauriDrop();
             document.removeEventListener('open-templates', handleOpenTemplates);
             document.removeEventListener('show-properties', handleShowProperties);
@@ -512,7 +593,6 @@ const MainLayout = () => {
             document.removeEventListener('open-hash-file-modal', handleOpenHashFileModal);
             document.removeEventListener('open-hash-compare-modal', handleOpenHashCompareModal);
             document.removeEventListener('open-hash-display-modal', handleOpenHashDisplayModal);
-            document.removeEventListener('sftp-file-opened', handleSftpFileOpened);
             document.removeEventListener('force-explorer-view', handleForceExplorerView);
             window.removeEventListener('force-explorer-view', handleForceExplorerView);
             console.log('MainLayout: All event listeners removed');
@@ -542,13 +622,13 @@ const MainLayout = () => {
 
         // Simple local search for now
         if (currentDirData) {
-            const filteredFiles = currentDirData.files.filter(file =>
+            const filteredFiles = currentDirData?.files?.filter(file =>
                 file.name.toLowerCase().includes(value.toLowerCase())
-            );
+            ) || [];
 
-            const filteredDirs = currentDirData.directories.filter(dir =>
+            const filteredDirs = currentDirData?.directories?.filter(dir =>
                 dir.name.toLowerCase().includes(value.toLowerCase())
-            );
+            ) || [];
 
             setSearchResults({
                 directories: filteredDirs,
@@ -621,7 +701,7 @@ const MainLayout = () => {
             if (target.isContentEditable) {
                 return true;
             }
-            if (target.closest && target.closest('input, textarea, select, [contenteditable="true"], .terminal-input, .xterm')) {
+            if (target.closest && target.closest('input, textarea, select, [contenteditable="true"], .terminal-input, .xterm, .enhanced-terminal, .details-panel')) {
                 return true;
             }
             return false;
@@ -653,8 +733,14 @@ const MainLayout = () => {
                 return;
             }
 
-            // If user is currently typing in an input/textarea/terminal, DO NOT intercept editing keys
+            // If user is currently typing in an input/textarea/terminal/details panel, DO NOT intercept editing keys
             if (isEditingText(e.target)) {
+                return;
+            }
+
+            // Disable explorer shortcuts whenever any modal is open or not in explorer view
+            const hasOpenModal = !!document.querySelector('[role="dialog"], .modal-overlay, .preview-modal-backdrop');
+            if (hasOpenModal || currentViewRef.current !== 'explorer') {
                 return;
             }
 
@@ -672,11 +758,14 @@ const MainLayout = () => {
                 return;
             }
 
-            // F6: Toggle Dual Pane view
-            if (e.key === 'F6' && !isDualPaneRef.current) {
+            // F6: Always toggle Dual Pane view on/off
+            if (e.key === 'F6' && !e.shiftKey) {
                 e.preventDefault();
-                setIsDualPane(true);
-                localStorage.setItem('explr_dual_pane', 'true');
+                setIsDualPane(prev => {
+                    const next = !prev;
+                    localStorage.setItem('explr_dual_pane', next.toString());
+                    return next;
+                });
                 return;
             }
 
@@ -722,8 +811,12 @@ const MainLayout = () => {
                 return;
             }
 
-            // Select all: Ctrl+A
+            // Select all: Ctrl+A (respect non-empty text selection)
             if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+                const selectedText = window.getSelection?.()?.toString();
+                if (selectedText && selectedText.length > 0) {
+                    return;
+                }
                 e.preventDefault();
                 const allItems = getSortedData();
                 if (allItems && allItems.length > 0) {
@@ -732,8 +825,12 @@ const MainLayout = () => {
                 return;
             }
 
-            // Copy: Ctrl+C
+            // Copy: Ctrl+C (respect non-empty text selection)
             if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
+                const selectedText = window.getSelection?.()?.toString();
+                if (selectedText && selectedText.length > 0) {
+                    return;
+                }
                 const targetItems = selectedItemsRef.current.length > 0
                     ? selectedItemsRef.current
                     : (focusedItemRef.current ? [focusedItemRef.current] : []);
@@ -835,26 +932,10 @@ const MainLayout = () => {
             }
             
             await navigator.clipboard.writeText(pathToCopy);
-            // Show temporary notification
-            const notification = document.createElement('div');
-            notification.textContent = 'Path copied to clipboard';
-            notification.style.cssText = `
-                position: fixed;
-                top: 20px;
-                right: 20px;
-                background: var(--accent);
-                color: white;
-                padding: 12px 20px;
-                border-radius: 6px;
-                z-index: 10000;
-                animation: slideIn 0.3s ease-out;
-            `;
-            document.body.appendChild(notification);
-            setTimeout(() => {
-                notification.remove();
-            }, 2000);
+            showSuccess('Path copied to clipboard');
         } catch (error) {
             console.error('Failed to copy path:', error);
+            showError('Failed to copy path to clipboard');
         }
     }, [currentPath, isSftpPath, parseSftpPath]);
 
@@ -864,41 +945,29 @@ const MainLayout = () => {
      * @param {string} newName - The new name
      */
     const handleRename = async (item, newName) => {
-        console.log('handleRename called with:', { item, newName });
-        
         if (!newName || newName === item.name) {
-            console.log('handleRename: Early return - newName is empty or same as current name');
             return;
         }
 
-        console.log(`Renaming "${replaceFileName(item.path, newName)}"`);
+        const newPath = replaceFileName(item.path, newName);
 
         try {
-            const separator = item.path.includes('\\') ? '\\' : '/';
-
-            console.log("Debug - separator detected:", separator);
-            console.log("Debug - original path:", item.path);
-
-            const pathParts = item.path.split(separator);
-            pathParts[pathParts.length - 1] = newName;
-            const newPath = pathParts.join(separator);
-
-            console.log("Debug - new path:", newPath);
-
             // Use FileSystemProvider's renameItem which handles both local and SFTP paths
             await fsRenameItem(item.path, newPath);
         } catch (error) {
             console.error('Rename operation failed:', error);
-            if (error.message && error.message.includes('already exists')) {
+            const message = error?.message || String(error);
+            if (message.toLowerCase().includes('already exists')) {
                 const shouldCreateCopy = await showConfirm(`A file named "${newName}" already exists. Create a copy instead?`, 'File Exists');
                 if (shouldCreateCopy) {
-                    const extension = newName.includes('.') ? newName.split('.').pop() : '';
-                    const baseName = extension ? newName.replace(`.${extension}`, '') : newName;
-                    const copyName = extension ? `${baseName} - Copy.${extension}` : `${baseName} - Copy`;
-                    handleRename(item, copyName);
+                    const dotIndex = newName.lastIndexOf('.');
+                    const copyName = dotIndex > 0
+                        ? `${newName.slice(0, dotIndex)} - Copy${newName.slice(dotIndex)}`
+                        : `${newName} - Copy`;
+                    await handleRename(item, copyName);
                 }
             } else {
-                showError(`Failed to rename: ${error.message || error}`);
+                showError(`Failed to rename: ${message}`);
             }
         }
     };
@@ -910,13 +979,13 @@ const MainLayout = () => {
     const handleViewModeChange = useCallback(async (newMode) => {
         setViewMode(newMode);
 
-        // Save to settings
+        // Save via SettingsProvider so settings state stays in sync
         try {
-            await invoke('update_settings_field', { key: 'default_view', value: newMode });
+            await updateSetting('default_view', newMode);
         } catch (error) {
             console.error('Failed to save view mode setting:', error);
         }
-    }, []);
+    }, [updateSetting]);
 
     /**
      * Handles details panel toggle with settings persistence
@@ -925,13 +994,13 @@ const MainLayout = () => {
         const newState = !isDetailsPanelOpen;
         setIsDetailsPanelOpen(newState);
 
-        // Save to settings
+        // Save via SettingsProvider so settings state stays in sync
         try {
-            await invoke('update_settings_field', { key: 'show_details_panel', value: newState });
+            await updateSetting('show_details_panel', newState);
         } catch (error) {
             console.error('Failed to save details panel setting:', error);
         }
-    }, [isDetailsPanelOpen]);
+    }, [isDetailsPanelOpen, updateSetting]);
 
     /**
      * Handles hidden files visibility toggle with settings persistence
@@ -1229,13 +1298,10 @@ const MainLayout = () => {
 
                             {/* Details panel (when selected) */}
                             {isDetailsPanelOpen && (
-                                <>
-                                    <div className="panel-resize-handle"></div>
-                                    <DetailsPanel
-                                        item={activeSelectedItems[0] || null}
-                                        isMultipleSelection={activeSelectedItems.length > 1}
-                                    />
-                                </>
+                                <DetailsPanel
+                                    item={activeSelectedItems[0] || null}
+                                    isMultipleSelection={activeSelectedItems.length > 1}
+                                />
                             )}
                         </div>
 
