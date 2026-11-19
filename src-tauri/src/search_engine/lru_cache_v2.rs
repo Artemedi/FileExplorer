@@ -159,10 +159,10 @@ where
     /// ```
     #[inline]
     #[allow(dead_code)]
-    pub fn check_ttl<Q: ?Sized>(&self, key: &Q) -> bool
+    pub fn check_ttl<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
-        Q: Eq + Hash,
+        Q: Eq + Hash + ?Sized,
     {
         if let Some(&node_ptr) = self.map.get(key) {
             // SAFETY: The pointer is valid as it's managed by the cache
@@ -210,10 +210,10 @@ where
     /// }
     /// ```
     #[inline]
-    pub fn get<Q: ?Sized>(&mut self, key: &Q) -> Option<V>
+    pub fn get<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
-        Q: Eq + Hash,
+        Q: Eq + Hash + ?Sized,
     {
         let node_ptr = *self.map.get(key)?;
 
@@ -223,7 +223,7 @@ where
             let node = unsafe { &mut *node_ptr.as_ptr() };
             let expired = self
                 .ttl
-                .map_or(false, |ttl| node.last_accessed.elapsed() > ttl);
+                .is_some_and(|ttl| node.last_accessed.elapsed() > ttl);
             if expired {
                 (true, None)
             } else {
@@ -273,10 +273,10 @@ where
     /// }
     /// ```
     #[inline]
-    pub fn remove<Q: ?Sized>(&mut self, key: &Q) -> bool
+    pub fn remove<Q>(&mut self, key: &Q) -> bool
     where
         K: Borrow<Q>,
-        Q: Eq + Hash,
+        Q: Eq + Hash + ?Sized,
     {
         if let Some(node_ptr) = self.map.remove(key) {
             self.detach_node(node_ptr);
@@ -464,10 +464,10 @@ where
     /// * `None` - If the key does not exist or the entry has expired.
     #[inline]
     #[allow(dead_code)]
-    pub fn get_immutable<Q: ?Sized>(&self, key: &Q) -> Option<V>
+    pub fn get_immutable<Q>(&self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
-        Q: Eq + Hash,
+        Q: Eq + Hash + ?Sized,
     {
         if let Some(&node_ptr) = self.map.get(key) {
             // SAFETY: The pointer is valid as it's managed by the cache
@@ -773,7 +773,7 @@ mod tests_lru_cache_v2 {
 
         // Populate cache with sample paths
         for i in 0..500 {
-            let path = base_path.join(format!("folder_{}", i));
+            let path = base_path.join(format!("folder_{i}"));
             let metadata = format!("size: {}, modified: 2023-01-01", i * 1000);
             cache.insert(path.to_string_lossy().to_string(), metadata);
         }
@@ -783,7 +783,7 @@ mod tests_lru_cache_v2 {
         // Benchmark getting existing paths
         let start = Instant::now();
         for i in 0..500 {
-            let path = base_path.join(format!("folder_{}", i));
+            let path = base_path.join(format!("folder_{i}"));
             let _ = cache.get(&path.to_string_lossy().to_string());
         }
         let elapsed = start.elapsed();
@@ -797,7 +797,7 @@ mod tests_lru_cache_v2 {
         // Benchmark getting non-existent paths
         let start = Instant::now();
         for i in 1000..1500 {
-            let path = base_path.join(format!("folder_{}", i));
+            let path = base_path.join(format!("folder_{i}"));
             let _ = cache.get(&path.to_string_lossy().to_string());
         }
         let elapsed = start.elapsed();
@@ -820,14 +820,14 @@ mod tests_lru_cache_v2 {
 
             // Fill the cache to capacity
             for i in 0..size {
-                let path = format!("/path/to/file_{}", i);
-                cache.insert(path.clone(), format!("metadata_{}", i));
+                let path = format!("/path/to/file_{i}");
+                cache.insert(path.clone(), format!("metadata_{i}"));
             }
 
             // Measure retrieval time (mixed hits and misses)
             let start = Instant::now();
             for i in size / 2..(size / 2 + 1000).min(size + 500) {
-                let path = format!("/path/to/file_{}", i);
+                let path = format!("/path/to/file_{i}");
                 let _ = cache.get(&path);
             }
             let elapsed = start.elapsed();
@@ -849,18 +849,18 @@ mod tests_lru_cache_v2 {
 
         // Fill cache
         for i in 0..100 {
-            cache.insert(format!("key_{}", i), format!("value_{}", i));
+            cache.insert(format!("key_{i}"), format!("value_{i}"));
         }
 
         // Access first 20 items to make them recently used
         for i in 0..20 {
-            let _ = cache.get(&format!("key_{}", i));
+            let _ = cache.get(&format!("key_{i}"));
         }
 
         // Insert 20 new items, which should evict the least recently used
         let start = Instant::now();
         for i in 100..120 {
-            cache.insert(format!("key_{}", i), format!("value_{}", i));
+            cache.insert(format!("key_{i}"), format!("value_{i}"));
         }
         let elapsed = start.elapsed();
 
@@ -868,13 +868,13 @@ mod tests_lru_cache_v2 {
 
         // Verify the first 20 items are still there (recently used)
         for i in 0..20 {
-            assert!(cache.get(&format!("key_{}", i)).is_some());
+            assert!(cache.get(&format!("key_{i}")).is_some());
         }
 
         // Verify some of the middle items were evicted
         let mut evicted_count = 0;
         for i in 20..100 {
-            if cache.get(&format!("key_{}", i)).is_none() {
+            if cache.get(&format!("key_{i}")).is_none() {
                 evicted_count += 1;
             }
         }

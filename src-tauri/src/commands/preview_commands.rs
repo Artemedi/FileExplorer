@@ -356,18 +356,18 @@ mod preview_tests {
 
         if let Err(e) = fs::create_dir(&test_dir) {
             log_error!("Failed to create test directory: {}", e);
-            panic!("Failed to create test directory: {}", e);
+            panic!("Failed to create test directory: {e}");
         }
 
         // Create some test files
         if let Err(e) = fs::write(test_dir.join("file1.txt"), "content") {
             log_error!("Failed to create test file: {}", e);
-            panic!("Failed to create test file: {}", e);
+            panic!("Failed to create test file: {e}");
         }
 
         if let Err(e) = fs::create_dir(test_dir.join("subfolder")) {
             log_error!("Failed to create test subfolder: {}", e);
-            panic!("Failed to create test subfolder: {}", e);
+            panic!("Failed to create test subfolder: {e}");
         }
 
         log_info!("Test folder structure created successfully");
@@ -399,7 +399,7 @@ mod preview_tests {
             }
             Err(e) => {
                 log_error!("Failed to build folder preview: {}", e);
-                panic!("Failed to build folder preview: {}", e);
+                panic!("Failed to build folder preview: {e}");
             }
         }
 
@@ -416,7 +416,7 @@ mod preview_tests {
 
         if let Err(e) = fs::write(&test_file, content) {
             log_error!("Failed to create test text file: {}", e);
-            panic!("Failed to create test text file: {}", e);
+            panic!("Failed to create test text file: {e}");
         }
 
         log_info!("Test text file created successfully");
@@ -446,7 +446,7 @@ mod preview_tests {
             }
             Err(e) => {
                 log_error!("Failed to build text preview: {}", e);
-                panic!("Failed to build text preview: {}", e);
+                panic!("Failed to build text preview: {e}");
             }
         }
 
@@ -464,7 +464,7 @@ mod preview_tests {
 
         if let Err(e) = fs::write(&test_file, &png_data) {
             log_error!("Failed to create test PNG file: {}", e);
-            panic!("Failed to create test PNG file: {}", e);
+            panic!("Failed to create test PNG file: {e}");
         }
 
         log_info!("Test PNG file created successfully");
@@ -489,7 +489,7 @@ mod preview_tests {
             }
             Err(e) => {
                 log_error!("Failed to build image preview: {}", e);
-                panic!("Failed to build image preview: {}", e);
+                panic!("Failed to build image preview: {e}");
             }
         }
 
@@ -505,7 +505,7 @@ mod preview_tests {
 
         if let Err(e) = fs::write(&test_file, "dummy pdf content") {
             log_error!("Failed to create test PDF file: {}", e);
-            panic!("Failed to create test PDF file: {}", e);
+            panic!("Failed to create test PDF file: {e}");
         }
 
         log_info!("Test PDF file created successfully");
@@ -530,7 +530,7 @@ mod preview_tests {
             }
             Err(e) => {
                 log_error!("Failed to build PDF preview: {}", e);
-                panic!("Failed to build PDF preview: {}", e);
+                panic!("Failed to build PDF preview: {e}");
             }
         }
 
@@ -568,7 +568,7 @@ mod preview_tests {
 
         if let Err(e) = fs::write(&test_file, &large_content) {
             log_error!("Failed to create large test file: {}", e);
-            panic!("Failed to create large test file: {}", e);
+            panic!("Failed to create large test file: {e}");
         }
 
         log_info!("Large test file created successfully (300,000 characters)");
@@ -599,7 +599,7 @@ mod preview_tests {
             }
             Err(e) => {
                 log_error!("Failed to build large text preview: {}", e);
-                panic!("Failed to build large text preview: {}", e);
+                panic!("Failed to build large text preview: {e}");
             }
         }
 
@@ -615,14 +615,14 @@ mod preview_tests {
 
         if let Err(e) = fs::create_dir(&test_dir) {
             log_error!("Failed to create large test directory: {}", e);
-            panic!("Failed to create large test directory: {}", e);
+            panic!("Failed to create large test directory: {e}");
         }
 
         // Create more than 200 files to test truncation
         for i in 0..250 {
-            if let Err(e) = fs::write(test_dir.join(format!("file{}.txt", i)), "content") {
+            if let Err(e) = fs::write(test_dir.join(format!("file{i}.txt")), "content") {
                 log_error!("Failed to create test file {}: {}", i, e);
-                panic!("Failed to create test file {}: {}", i, e);
+                panic!("Failed to create test file {i}: {e}");
             }
         }
 
@@ -649,7 +649,7 @@ mod preview_tests {
             }
             Err(e) => {
                 log_error!("Failed to build large folder preview: {}", e);
-                panic!("Failed to build large folder preview: {}", e);
+                panic!("Failed to build large folder preview: {e}");
             }
         }
 
@@ -668,7 +668,7 @@ mod preview_tests {
         let result = build_preview_impl(exe_path.to_string_lossy().to_string()).unwrap();
         match result {
             PreviewPayload::Unknown { name } => assert_eq!(name, "app.exe"),
-            other => panic!("Expected Unknown for binary file <=2MB, got {:?}", other),
+            other => panic!("Expected Unknown for binary file <=2MB, got {other:?}"),
         }
     }
 
@@ -686,7 +686,7 @@ mod preview_tests {
 
         match build_preview_impl(img_path.to_string_lossy().to_string()).unwrap() {
             PreviewPayload::Unknown { name } => assert_eq!(name, "huge.png"),
-            other => panic!("Expected Unknown for oversized image, got {:?}", other),
+            other => panic!("Expected Unknown for oversized image, got {other:?}"),
         }
 
         // PDF > 12 MB
@@ -698,7 +698,7 @@ mod preview_tests {
 
         match build_preview_impl(pdf_path.to_string_lossy().to_string()).unwrap() {
             PreviewPayload::Unknown { name } => assert_eq!(name, "huge.pdf"),
-            other => panic!("Expected Unknown for oversized PDF, got {:?}", other),
+            other => panic!("Expected Unknown for oversized PDF, got {other:?}"),
         }
     }
 
@@ -728,7 +728,7 @@ mod preview_tests {
                 );
                 assert!(text.ends_with("…(truncated)"));
             }
-            other => panic!("Expected Text preview for UTF-16 file, got {:?}", other),
+            other => panic!("Expected Text preview for UTF-16 file, got {other:?}"),
         }
     }
 }

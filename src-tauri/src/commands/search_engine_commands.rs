@@ -164,7 +164,7 @@ pub fn add_paths_recursive_impl(
 
     // Verify the path exists before starting
     if !path.exists() {
-        let error_msg = format!("Path does not exist: {}", folder);
+        let error_msg = format!("Path does not exist: {folder}");
         log_error!("{}", error_msg);
         return Err(error_msg);
     }
@@ -485,7 +485,7 @@ mod tests_autocomplete_commands {
     fn create_temp_file(dir: &TempDir, filename: &str, content: &str) -> PathBuf {
         let file_path = dir.path().join(filename);
         let mut file = File::create(&file_path).unwrap();
-        write!(file, "{}", content).unwrap();
+        write!(file, "{content}").unwrap();
         file_path
     }
 
@@ -583,13 +583,11 @@ mod tests_autocomplete_commands {
         let results = search_result.unwrap();
         assert!(
             results.iter().any(|(path, _)| path.contains("test1.txt")),
-            "Expected test1.txt in recursive search results: {:?}",
-            results
+            "Expected test1.txt in recursive search results: {results:?}"
         );
         assert!(
             results.iter().any(|(path, _)| path.contains("test2.txt")),
-            "Expected test2.txt in recursive search results: {:?}",
-            results
+            "Expected test2.txt in recursive search results: {results:?}"
         );
 
         // Remove all files recursively
@@ -726,15 +724,13 @@ mod tests_autocomplete_commands {
             results
                 .iter()
                 .any(|(path, _)| path.contains("chunked_test1.txt")),
-            "Expected chunked_test1.txt in results: {:?}",
-            results
+            "Expected chunked_test1.txt in results: {results:?}"
         );
         assert!(
             results
                 .iter()
                 .any(|(path, _)| path.contains("chunked_test2.txt")),
-            "Expected chunked_test2.txt in results: {:?}",
-            results
+            "Expected chunked_test2.txt in results: {results:?}"
         );
     }
 
@@ -770,13 +766,11 @@ mod tests_autocomplete_commands {
         let results = search_result.unwrap();
         assert!(
             results.iter().any(|(path, _)| path.contains("test1.txt")),
-            "Expected test1.txt in results: {:?}",
-            results
+            "Expected test1.txt in results: {results:?}"
         );
         assert!(
             results.iter().any(|(path, _)| path.contains("test2.txt")),
-            "Expected test2.txt in results: {:?}",
-            results
+            "Expected test2.txt in results: {results:?}"
         );
 
         // Remove all files recursively
@@ -915,7 +909,7 @@ pub fn get_suggestions_impl(
                 // Get more results to filter from
 
                 // Extract filename suggestions
-                if let Some(filename) = path.split(&['/', '\\'][..]).last() {
+                if let Some(filename) = path.split(&['/', '\\'][..]).next_back() {
                     // Only suggest if filename starts with prefix (case-insensitive)
                     if filename.to_lowercase().starts_with(&prefix.to_lowercase())
                         && !seen_suggestions.contains(filename)
@@ -981,7 +975,7 @@ pub fn get_suggestions_impl(
         }
         Err(e) => {
             log_error!("Search failed for suggestions: {}", e);
-            Err(format!("Search failed: {}", e))
+            Err(format!("Search failed: {e}"))
         }
     }
 }

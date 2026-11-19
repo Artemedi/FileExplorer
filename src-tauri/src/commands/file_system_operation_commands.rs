@@ -1620,7 +1620,7 @@ mod tests_file_system_operation_commands {
         let result = open_file(test_path.to_str().unwrap()).await;
 
         // Verify that the operation was successful
-        assert!(result.is_ok(), "Failed to open file: {:?}", result);
+        assert!(result.is_ok(), "Failed to open file: {result:?}");
 
         // Verify the file contents
         assert_eq!(
@@ -1675,8 +1675,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
         assert!(
             result.clone().unwrap_err().contains("File does not exist"),
@@ -1717,8 +1716,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -1777,19 +1775,16 @@ mod tests_file_system_operation_commands {
         let result = move_to_trash("").await;
         assert!(
             result.is_err(),
-            "Empty path should fail when moving to trash: {:?}",
-            result
+            "Empty path should fail when moving to trash: {result:?}"
         );
         let err = result.unwrap_err();
         assert!(
             err.contains("Failed to move file or directory to trash"),
-            "Unexpected error message: {}",
-            err
+            "Unexpected error message: {err}"
         );
         assert!(
             err.contains("InternalError"),
-            "Unexpected error code: {}",
-            err
+            "Unexpected error code: {err}"
         );
     }
 
@@ -1810,7 +1805,7 @@ mod tests_file_system_operation_commands {
             "Test file should not exist before deletion"
         );
 
-        eprintln!("Test file exists: {:?}", invalid_test_path);
+        eprintln!("Test file exists: {invalid_test_path:?}");
 
         // Move the file to the trash
         let result = move_to_trash(invalid_test_path.to_str().unwrap()).await;
@@ -1818,8 +1813,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -1855,7 +1849,7 @@ mod tests_file_system_operation_commands {
         let result = create_file(temp_dir.path().to_str().unwrap(), "create_file_test.txt").await;
 
         // Verify that the operation was successful
-        assert!(result.is_ok(), "Failed to create file: {:?}", result);
+        assert!(result.is_ok(), "Failed to create file: {result:?}");
 
         // Verify that the file exists at the specified pat´ßp0
         assert!(test_path.exists(), "File should exist after creation");
@@ -1876,8 +1870,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -1915,8 +1908,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -1950,7 +1942,7 @@ mod tests_file_system_operation_commands {
             create_directory(temp_dir.path().to_str().unwrap(), "create_directory_test").await;
 
         // Verify that the operation was successful
-        assert!(result.is_ok(), "Failed to create directory: {:?}", result);
+        assert!(result.is_ok(), "Failed to create directory: {result:?}");
 
         // Verify that the directory exists at the specified path
         assert!(test_path.exists(), "Directory should exist after creation");
@@ -1976,8 +1968,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2011,35 +2002,35 @@ mod tests_file_system_operation_commands {
         // Create a subdirectory
         let sub_dir_path = temp_dir.path().join("subdir");
         fs::create_dir(&sub_dir_path).expect("Failed to create subdirectory");
-        println!("Temporary subdirectory created: {:?}", sub_dir_path);
+        println!("Temporary subdirectory created: {sub_dir_path:?}");
 
         // Create files in the root directory
         let file1_path = temp_dir.path().join("file1.txt");
         let mut file1 = fs::File::create(&file1_path).expect("Failed to create file1");
         writeln!(file1, "File 1 content").expect("Failed to write to file1");
-        println!("File 1 created: {:?}", file1_path);
+        println!("File 1 created: {file1_path:?}");
 
         let file2_path = temp_dir.path().join("file2.txt");
         let mut file2 = fs::File::create(&file2_path).expect("Failed to create file2");
         writeln!(file2, "File 2 content").expect("Failed to write to file2");
-        println!("File 2 created: {:?}", file2_path);
+        println!("File 2 created: {file2_path:?}");
 
         // Create files in the subdirectory
         let sub_file1_path = sub_dir_path.join("sub_file1.txt");
         let mut sub_file1 = fs::File::create(&sub_file1_path).expect("Failed to create sub_file1");
         writeln!(sub_file1, "Sub File 1 content").expect("Failed to write to sub_file1");
-        println!("Sub File 1 created: {:?}", sub_file1_path);
+        println!("Sub File 1 created: {sub_file1_path:?}");
 
         let sub_file2_path = sub_dir_path.join("sub_file2.txt");
         let mut sub_file2 = fs::File::create(&sub_file2_path).expect("Failed to create sub_file2");
         writeln!(sub_file2, "Sub File 2 content").expect("Failed to write to sub_file2");
-        println!("Sub File 2 created: {:?}", sub_file2_path);
+        println!("Sub File 2 created: {sub_file2_path:?}");
 
         // Call the open_directory function
         let result = open_directory(temp_dir.path().to_str().unwrap().to_string()).await;
 
         // Verify that the operation was successful
-        assert!(result.is_ok(), "Failed to open directory: {:?}", result);
+        assert!(result.is_ok(), "Failed to open directory: {result:?}");
 
         let entries = result.unwrap();
         let entries: Entries = serde_json::from_str(&entries).expect("Failed to parse JSON");
@@ -2071,8 +2062,7 @@ mod tests_file_system_operation_commands {
         let subdir_result = open_directory(sub_dir_path.to_str().unwrap().to_string()).await;
         assert!(
             subdir_result.is_ok(),
-            "Failed to open subdirectory: {:?}",
-            subdir_result
+            "Failed to open subdirectory: {subdir_result:?}"
         );
 
         let subdir_entries = subdir_result.unwrap();
@@ -2115,8 +2105,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2161,8 +2150,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2207,7 +2195,7 @@ mod tests_file_system_operation_commands {
         let result = rename(test_path.to_str().unwrap(), new_path.to_str().unwrap()).await;
 
         // Verify that the operation was successful
-        assert!(result.is_ok(), "Failed to rename file: {:?}", result);
+        assert!(result.is_ok(), "Failed to rename file: {result:?}");
 
         // Verify that the file exists at the new path
         assert!(new_path.exists(), "File should exist at the new path");
@@ -2232,8 +2220,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2279,8 +2266,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2328,7 +2314,7 @@ mod tests_file_system_operation_commands {
         let result = rename(test_path.to_str().unwrap(), new_path.to_str().unwrap()).await;
 
         // Verify that the operation was successful
-        assert!(result.is_ok(), "Failed to rename directory: {:?}", result);
+        assert!(result.is_ok(), "Failed to rename directory: {result:?}");
 
         // Verify that the directory exists at the new path
         assert!(new_path.exists(), "Directory should exist at the new path");
@@ -2358,7 +2344,7 @@ mod tests_file_system_operation_commands {
             copy_file_or_dir(test_path.to_str().unwrap(), new_path.to_str().unwrap()).await;
 
         // Verify that the operation was successful
-        assert!(result.is_ok(), "Failed to copy file: {:?}", result);
+        assert!(result.is_ok(), "Failed to copy file: {result:?}");
 
         // Verify that the copied file exists at the new path
         assert!(
@@ -2427,7 +2413,7 @@ mod tests_file_system_operation_commands {
         .await;
 
         // Verify that the operation was successful
-        assert!(result.is_ok(), "Failed to copy directory: {:?}", result);
+        assert!(result.is_ok(), "Failed to copy directory: {result:?}");
 
         // Verify that the copied directory exists
         assert!(copied_dir_path.exists(), "Copied directory should exist");
@@ -2490,8 +2476,7 @@ mod tests_file_system_operation_commands {
         // Verify that the operation was successful
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2527,7 +2512,7 @@ mod tests_file_system_operation_commands {
 
         // Zip the file
         let result = zip(vec![test_file_path.to_str().unwrap().to_string()], None).await;
-        assert!(result.is_ok(), "Failed to zip file: {:?}", result);
+        assert!(result.is_ok(), "Failed to zip file: {result:?}");
 
         // Check if zip file was created
         let zip_path = test_file_path.with_extension("zip");
@@ -2548,8 +2533,7 @@ mod tests_file_system_operation_commands {
 
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2593,8 +2577,7 @@ mod tests_file_system_operation_commands {
 
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
         assert!(
             result
@@ -2645,8 +2628,7 @@ mod tests_file_system_operation_commands {
 
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2684,7 +2666,7 @@ mod tests_file_system_operation_commands {
         // Test extraction without specifying destination
         let result = unzip(vec![zip_path.to_str().unwrap().to_string()], None).await;
 
-        assert!(result.is_ok(), "Failed to extract zip: {:?}", result);
+        assert!(result.is_ok(), "Failed to extract zip: {result:?}");
 
         // Verify extracted contents
         // For single file, the file is extracted to the parent directory of the zip
@@ -2704,8 +2686,7 @@ mod tests_file_system_operation_commands {
 
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2739,8 +2720,7 @@ mod tests_file_system_operation_commands {
 
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2796,8 +2776,7 @@ mod tests_file_system_operation_commands {
 
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(
@@ -2852,8 +2831,7 @@ mod tests_file_system_operation_commands {
 
         assert!(
             result.is_err(),
-            "Failed test (should throw an error): {:?}",
-            result
+            "Failed test (should throw an error): {result:?}"
         );
 
         assert!(

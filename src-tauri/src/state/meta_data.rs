@@ -63,14 +63,14 @@ fn load_templates_from(templates_path: &Path) -> Vec<PathBuf> {
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.path())
                 .collect(),
-            Err(e) => {
-                log_error!("Failed to read templates folder: {e}");
+            Err(_e) => {
+                log_error!("Failed to read templates folder: {_e}");
                 vec![]
             }
         }
     } else {
-        if let Err(e) = fs::create_dir_all(templates_path) {
-            log_error!("Failed to create templates folder. Error: {e}");
+        if let Err(_e) = fs::create_dir_all(templates_path) {
+            log_error!("Failed to create templates folder. Error: {_e}");
         }
         vec![]
     }

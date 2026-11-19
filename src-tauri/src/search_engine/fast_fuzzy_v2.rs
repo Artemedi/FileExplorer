@@ -378,10 +378,8 @@ impl PathMatcher {
 
         // Sigmoid function: 1 - MIN_FACTOR/(1 + e^(-STEEPNESS * (x - MIDPOINT)))
         let length_f32 = path_length as f32;
-        let sigmoid =
-            1.0 - (1.0 - MIN_FACTOR) / (1.0 + (-STEEPNESS * (length_f32 - MIDPOINT)).exp());
 
-        sigmoid
+        1.0 - (1.0 - MIN_FACTOR) / (1.0 + (-STEEPNESS * (length_f32 - MIDPOINT)).exp())
     }
 
     /// Searches for paths matching the given query string, supporting fuzzy matching.
@@ -495,7 +493,7 @@ impl PathMatcher {
             let hits = hits as f32;
             let path_lower = path.to_lowercase();
 
-            let filename = path.split(&['/', '\\'][..]).last().unwrap_or("");
+            let filename = path.split(&['/', '\\'][..]).next_back().unwrap_or("");
             let filename_lower = filename.to_lowercase();
             let mut score = hits / query_trigram_count;
 
@@ -646,7 +644,7 @@ impl PathMatcher {
                             let Some(path) = self.paths[idx].as_deref() else {
                                 continue;
                             };
-                            let filename = path.split(&['/', '\\'][..]).last().unwrap_or(path);
+                            let filename = path.split(&['/', '\\'][..]).next_back().unwrap_or(path);
                             let filename_lower = filename.to_lowercase();
                             let variation_index = variation_idx as f32 / variations.len() as f32;
                             let mut score = 0.9 - (variation_index * 0.2);
@@ -1009,7 +1007,7 @@ mod tests_fast_fuzzy_v2 {
 
         // Add many paths
         for i in 0..100 {
-            matcher.add_path(&format!("/path/to/file{}.txt", i));
+            matcher.add_path(&format!("/path/to/file{i}.txt"));
         }
 
         // Test that max_results is respected
@@ -1076,7 +1074,7 @@ mod tests_fast_fuzzy_v2 {
 
         // Add a small number of paths
         for i in 0..100 {
-            matcher.add_path(&format!("/path/to/file{}.txt", i));
+            matcher.add_path(&format!("/path/to/file{i}.txt"));
         }
 
         let (results, elapsed) =
@@ -1092,7 +1090,7 @@ mod tests_fast_fuzzy_v2 {
 
         // Add a medium number of paths
         for i in 0..1000 {
-            matcher.add_path(&format!("/path/to/file{}.txt", i));
+            matcher.add_path(&format!("/path/to/file{i}.txt"));
         }
 
         let (results, elapsed) =
@@ -1108,7 +1106,7 @@ mod tests_fast_fuzzy_v2 {
 
         // Add a large number of paths
         for i in 0..10000 {
-            matcher.add_path(&format!("/path/to/file{}.txt", i));
+            matcher.add_path(&format!("/path/to/file{i}.txt"));
         }
 
         let (results, elapsed) =
@@ -1353,7 +1351,11 @@ mod tests_fast_fuzzy_v2 {
         let realistic_terms: Vec<String> = if !test_paths.is_empty() {
             let mut terms = Vec::new();
             for path in test_paths.iter().take(5) {
-                if let Some(filename) = path.split('/').last().or_else(|| path.split('\\').last()) {
+                if let Some(filename) = path
+                    .split('/')
+                    .next_back()
+                    .or_else(|| path.split('\\').next_back())
+                {
                     if filename.len() >= 3 {
                         terms.push(filename[0..3].to_string());
                     }
@@ -1419,7 +1421,7 @@ mod tests_fast_fuzzy_v2 {
 
         for query in &misspelled_terms {
             let (results, elapsed) =
-                run_benchmark(&format!("misspelled query '{}'", query), 5, || {
+                run_benchmark(&format!("misspelled query '{query}'"), 5, || {
                     matcher.search(query, 10)
                 });
 
@@ -1493,8 +1495,7 @@ mod tests_fast_fuzzy_v2 {
             // Verify we have some results
             assert!(
                 !results.is_empty(),
-                "Misspelled query '{}' should find results",
-                misspelled
+                "Misspelled query '{misspelled}' should find results"
             );
 
             // Check if the result contains the path with the correct spelling
@@ -1504,9 +1505,7 @@ mod tests_fast_fuzzy_v2 {
 
             assert!(
                 expected_path.is_some(),
-                "Misspelled query '{}' should have found a path containing '{}'",
-                misspelled,
-                correct
+                "Misspelled query '{misspelled}' should have found a path containing '{correct}'"
             );
 
             // Log the score to help with tuning
@@ -2089,12 +2088,12 @@ mod tests_fast_fuzzy_v2 {
         assert_eq!(matcher.path_to_idx.len(), 1);
 
         for i in 0..500 {
-            matcher.add_path(&format!("/bulk/dir/item_{}.txt", i));
+            matcher.add_path(&format!("/bulk/dir/item_{i}.txt"));
         }
         assert_eq!(matcher.path_to_idx.len(), 501);
 
         for i in 0..500 {
-            assert!(matcher.remove_path(&format!("/bulk/dir/item_{}.txt", i)));
+            assert!(matcher.remove_path(&format!("/bulk/dir/item_{i}.txt")));
         }
         assert_eq!(matcher.path_to_idx.len(), 1);
         assert!(matcher.remove_path("/dup/file.txt"));

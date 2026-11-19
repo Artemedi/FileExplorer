@@ -55,7 +55,7 @@ impl Default for IndexingProgress {
 ///
 /// Collects statistics about search engine performance to help users
 /// understand system behavior and identify potential optimizations.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct SearchEngineMetrics {
     pub last_indexing_duration_ms: Option<u64>,
     pub average_search_time_ms: Option<f32>,
@@ -64,35 +64,14 @@ pub struct SearchEngineMetrics {
     pub cache_hits: usize,
 }
 
-impl Default for SearchEngineMetrics {
-    fn default() -> Self {
-        Self {
-            last_indexing_duration_ms: None,
-            average_search_time_ms: None,
-            cache_hit_rate: None,
-            total_searches: 0,
-            cache_hits: 0,
-        }
-    }
-}
-
 /// User activity data related to search operations.
 ///
 /// Tracks recent user interactions with the search system to provide
 /// history features and improve result relevance through usage patterns.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct RecentActivity {
     pub recent_searches: Vec<String>,
     pub most_accessed_paths: Vec<String>,
-}
-
-impl Default for RecentActivity {
-    fn default() -> Self {
-        Self {
-            recent_searches: Vec::new(),
-            most_accessed_paths: Vec::new(),
-        }
-    }
 }
 
 /// Serializable version of engine statistics.
@@ -280,8 +259,10 @@ impl SearchEngineState {
     ///
     /// A SearchEngine instance with default settings.
     fn save_default_search_engine_in_state(config: SearchEngineConfig) -> SearchEngine {
-        let mut defaults = SearchEngine::default();
-        defaults.config = config;
+        let defaults = SearchEngine {
+            config,
+            ..SearchEngine::default()
+        };
         Self::save_search_engine_in_state(defaults)
     }
 
@@ -627,7 +608,7 @@ impl SearchEngineState {
     /// Optimized to prevent stack overflow using iterative traversal
     fn index_directory_streaming(
         &self,
-        dir: &PathBuf,
+        dir: &std::path::Path,
         excluded_patterns: &[String],
         chunk_size: usize,
     ) -> Result<(), String> {
@@ -695,9 +676,10 @@ impl SearchEngineState {
 
     /// Iteratively process directory to prevent stack overflow on deep directory structures
     /// Uses a queue-based approach instead of recursion for memory safety
+    #[allow(clippy::too_many_arguments)]
     fn process_directory_iterative(
         &self,
-        root_dir: &PathBuf,
+        root_dir: &std::path::Path,
         excluded_patterns: &[String],
         discovered_files: &mut usize,
         indexed_files: &mut usize,
@@ -709,7 +691,7 @@ impl SearchEngineState {
 
         // Use a queue for iterative traversal instead of recursion
         let mut dir_queue = VecDeque::new();
-        dir_queue.push_back((root_dir.clone(), 0));
+        dir_queue.push_back((root_dir.to_path_buf(), 0));
 
         const MAX_DEPTH: usize = 12;
         const MAX_FILES: usize = 100000;
@@ -1028,7 +1010,7 @@ impl SearchEngineState {
             let hit_rate =
                 (data.metrics.cache_hits as f32 / data.metrics.total_searches as f32) * 100.0;
             // Ensure cache hit rate is reasonable (between 0% and 100%)
-            let clamped_hit_rate = hit_rate.min(100.0).max(0.0);
+            let clamped_hit_rate = hit_rate.clamp(0.0, 100.0);
 
             #[cfg(debug_assertions)]
             if hit_rate > 100.0 {
@@ -1208,7 +1190,7 @@ impl SearchEngineState {
             let hit_rate =
                 (data.metrics.cache_hits as f32 / data.metrics.total_searches as f32) * 100.0;
             // Ensure cache hit rate is reasonable (between 0% and 100%)
-            let clamped_hit_rate = hit_rate.min(100.0).max(0.0);
+            let clamped_hit_rate = hit_rate.clamp(0.0, 100.0);
 
             #[cfg(debug_assertions)]
             if hit_rate > 100.0 {
@@ -1392,6 +1374,7 @@ impl SearchEngineState {
     /// # Performance
     ///
     /// O(1) plus cache invalidation cost for changed preferences
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn update_config(&self, path: Option<String>) -> Result<(), String> {
         let mut data = self
             .data
@@ -1781,8 +1764,8 @@ mod tests_searchengine_state {
 
         // Create test files inside isolated TempDir
         for i in 0..200 {
-            let file_path = test_path.join(format!("testfile_{}.txt", i));
-            let _ = fs::write(&file_path, format!("Test content {}", i));
+            let file_path = test_path.join(format!("testfile_{i}.txt"));
+            let _ = fs::write(&file_path, format!("Test content {i}"));
         }
 
         // Synchronize deterministically: hold Indexing state until main thread stops it
@@ -1846,8 +1829,8 @@ mod tests_searchengine_state {
 
         // Create test files inside isolated TempDir
         for i in 0..200 {
-            let file_path = test_path.join(format!("cancel_test_file_{}.txt", i));
-            let _ = fs::write(&file_path, format!("Test content {}", i));
+            let file_path = test_path.join(format!("cancel_test_file_{i}.txt"));
+            let _ = fs::write(&file_path, format!("Test content {i}"));
         }
 
         // Synchronize deterministically: hold Indexing state until main thread cancels it
@@ -2003,8 +1986,8 @@ mod tests_searchengine_state {
 
         // Create test files inside isolated TempDir
         for i in 0..200 {
-            let file_path = test_dir.join(format!("concurrent_test_{}.txt", i));
-            let _ = fs::write(&file_path, format!("Test content {}", i));
+            let file_path = test_dir.join(format!("concurrent_test_{i}.txt"));
+            let _ = fs::write(&file_path, format!("Test content {i}"));
         }
 
         // Synchronize deterministically:
@@ -2103,8 +2086,7 @@ mod tests_searchengine_state {
 
         assert!(
             success,
-            "Failed to verify index folder was updated to '{}' within timeout",
-            expected_name
+            "Failed to verify index folder was updated to '{expected_name}' within timeout"
         );
     }
 
@@ -2419,8 +2401,8 @@ mod tests_searchengine_state {
 
         // Create test files inside isolated TempDir
         for i in 0..200 {
-            let file_path = test_path.join(format!("thread_safety_test_{}.txt", i));
-            let _ = fs::write(&file_path, format!("Test content {}", i));
+            let file_path = test_path.join(format!("thread_safety_test_{i}.txt"));
+            let _ = fs::write(&file_path, format!("Test content {i}"));
         }
 
         // Synchronize deterministically: hold Indexing state while main thread tests rejection and stop
@@ -2776,8 +2758,8 @@ mod tests_searchengine_state {
 
         // Create test files to ensure we have enough for multiple chunks
         for i in 0..100 {
-            let file_path = test_path.join(format!("chunked_test_{}.txt", i));
-            let _ = fs::write(&file_path, format!("Test content {}", i));
+            let file_path = test_path.join(format!("chunked_test_{i}.txt"));
+            let _ = fs::write(&file_path, format!("Test content {i}"));
         }
 
         // Use a small chunk size to ensure multiple chunks
@@ -2833,10 +2815,10 @@ mod tests_searchengine_state {
             tempfile::tempdir().expect("Failed to create temp dir for chunked cancel fixture");
         let test_path = test_dir.path();
         for dir_idx in 0..25 {
-            let sub = test_path.join(format!("sub_{}", dir_idx));
+            let sub = test_path.join(format!("sub_{dir_idx}"));
             fs::create_dir_all(&sub).unwrap();
             for file_idx in 0..120 {
-                let file_path = sub.join(format!("{}_{}_{}.txt", prefix, dir_idx, file_idx));
+                let file_path = sub.join(format!("{prefix}_{dir_idx}_{file_idx}.txt"));
                 fs::write(&file_path, "chunked cancel test").unwrap();
             }
         }
@@ -3566,7 +3548,7 @@ mod tests_searchengine_state {
 
         for file_name in &test_files {
             let file_path = test_dir.join(file_name);
-            fs::write(&file_path, format!("Content for {}", file_name)).unwrap();
+            fs::write(&file_path, format!("Content for {file_name}")).unwrap();
         }
 
         // Index with traditional method
@@ -3611,10 +3593,7 @@ mod tests_searchengine_state {
             assert_eq!(
                 traditional_results.len(),
                 chunked_results.len(),
-                "Traditional and chunked indexing should find same number of results for '{}' (traditional={:?}, chunked={:?})",
-                term,
-                traditional_results,
-                chunked_results
+                "Traditional and chunked indexing should find same number of results for '{term}' (traditional={traditional_results:?}, chunked={chunked_results:?})"
             );
 
             // Top results should be the same files (though scores might differ slightly)
@@ -4171,7 +4150,7 @@ mod bench_indexing_methods {
                     // Search succeeded
                 }
                 Err(ref err) => {
-                    println!("Concurrent search {} failed with error: {}", i, err);
+                    println!("Concurrent search {i} failed with error: {err}");
                 }
             }
             assert!(

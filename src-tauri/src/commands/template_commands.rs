@@ -624,13 +624,11 @@ mod tests_template_commands {
 
         assert!(
             json.contains("template1"),
-            "JSON should contain template1: {}",
-            json
+            "JSON should contain template1: {json}"
         );
         assert!(
             json.contains("template2"),
-            "JSON should contain template2: {}",
-            json
+            "JSON should contain template2: {json}"
         );
     }
 
@@ -665,8 +663,7 @@ mod tests_template_commands {
         log_info!("Expected template path: {:?}", expected_template_path);
         assert!(
             expected_template_path.exists(),
-            "Template should exist at destination: {:?}",
-            expected_template_path
+            "Template should exist at destination: {expected_template_path:?}"
         );
 
         // Verify the template file was copied correctly
@@ -934,8 +931,7 @@ mod tests_template_commands {
 
         assert!(
             copied_file1.exists(),
-            "file1.txt should be copied: {:?}",
-            copied_file1
+            "file1.txt should be copied: {copied_file1:?}"
         );
         assert!(copied_subdir.exists(), "subdir should be copied");
         assert!(copied_file2.exists(), "file2.txt should be copied");
@@ -980,8 +976,7 @@ mod tests_template_commands {
 
         assert!(
             expected_template_path.exists(),
-            "Template file should exist at destination: {:?}",
-            expected_template_path
+            "Template file should exist at destination: {expected_template_path:?}"
         );
 
         // Verify the file content was preserved

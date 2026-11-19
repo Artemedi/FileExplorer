@@ -245,6 +245,7 @@ impl SearchCore {
     }
 
     /// Shares an external `AtomicBool` stop flag with `SearchEngineState`.
+    #[allow(dead_code)]
     pub fn set_stop_flag(&mut self, flag: Arc<AtomicBool>) {
         self.stop_indexing = flag;
     }
@@ -277,6 +278,7 @@ impl SearchCore {
     /// # Performance
     /// O(n*m) where n is number of paths and m is average path length
     /// More efficient than multiple single add_path calls due to reduced overhead
+    #[allow(dead_code)]
     pub fn add_paths_batch(&mut self, paths: Vec<&str>, excluded_patterns: Option<&Vec<String>>) {
         let with_meta: Vec<(&str, bool)> = paths
             .into_iter()
@@ -422,7 +424,7 @@ impl SearchCore {
 
         // Check if path should be excluded
         if let Some(patterns) = excluded_patterns {
-            if self.should_exclude_path(path, &patterns) {
+            if self.should_exclude_path(path, patterns) {
                 #[cfg(feature = "index-progress-logging")]
                 log_info!("Path excluded by pattern: '{}'", path);
 
@@ -443,6 +445,7 @@ impl SearchCore {
     ///
     /// # Performance
     /// O(1) - Simple atomic flag operation
+    #[allow(dead_code)]
     pub fn stop_indexing(&mut self) {
         #[cfg(feature = "index-progress-logging")]
         log_info!("Signal received to stop indexing operation");
@@ -497,7 +500,7 @@ impl SearchCore {
     ///
     /// # Performance
     /// O(n) where n is the number of excluded patterns
-    pub fn should_exclude_path(&mut self, path: &str, excluded_patterns: &Vec<String>) -> bool {
+    pub fn should_exclude_path(&mut self, path: &str, excluded_patterns: &[String]) -> bool {
         let excluded = Self::path_matches_excluded_patterns(path, excluded_patterns);
         #[cfg(feature = "index-progress-logging")]
         if excluded {
@@ -948,6 +951,7 @@ impl SearchCore {
     ///
     /// # Performance
     /// O(1) - Simple reference return
+    #[allow(dead_code)]
     pub fn get_preferred_extensions(&self) -> &Vec<String> {
         &self.preferred_extensions
     }
@@ -1033,7 +1037,7 @@ impl SearchCore {
         // 3. ART prefix search
         //let current_dir_ref = self.current_directory.as_deref();
         let prefix_results = self.trie.search(
-            &normalized_query,
+            normalized_query,
             None, // should add current_dif_ref, but rn not very performant
             false,
         );
@@ -1063,7 +1067,7 @@ impl SearchCore {
             );
 
             let fuzzy_results = self.fuzzy_matcher.search(
-                &normalized_query,
+                normalized_query,
                 self.max_results - self.results_buffer.len(),
             );
 
@@ -1119,7 +1123,7 @@ impl SearchCore {
 
         // Clone buffer temporarily to avoid borrowing conflicts
         let mut temp_results = self.results_buffer.clone();
-        self.rank_results(&mut temp_results, &normalized_query);
+        self.rank_results(&mut temp_results, normalized_query);
         self.results_buffer = temp_results;
 
         #[cfg(feature = "search-progress-logging")]
@@ -1223,7 +1227,7 @@ impl SearchCore {
         }
     }
 
-    fn rank_results(&self, results: &mut Vec<(String, f32)>, query: &str) {
+    fn rank_results(&self, results: &mut [(String, f32)], query: &str) {
         #[cfg(feature = "search-progress-logging")]
         let ranking_detailed_start = Instant::now();
 
@@ -1764,7 +1768,7 @@ mod tests_search_core {
 
         // Add some paths
         for i in 0..5 {
-            engine.add_path(&format!("/path/file{}.txt", i));
+            engine.add_path(&format!("/path/file{i}.txt"));
         }
 
         // Search to populate cache
@@ -1790,7 +1794,7 @@ mod tests_search_core {
                 .as_millis()
         );
 
-        let temp_dir = std::env::temp_dir().join(format!("search_core_test_{}", unique_id));
+        let temp_dir = std::env::temp_dir().join(format!("search_core_test_{unique_id}"));
 
         // Clean up any previous test directories
         if temp_dir.exists() {
@@ -1847,8 +1851,7 @@ mod tests_search_core {
         assert!(!results.is_empty(), "Should find train files");
         assert!(
             results.iter().any(|(path, _)| path.contains("train")),
-            "Expected train files in results: {:?}",
-            results
+            "Expected train files in results: {results:?}"
         );
     }
 
@@ -2157,7 +2160,11 @@ mod tests_search_core {
         // Extract some filename terms to search for from the data
         let mut filename_terms = Vec::new();
         for path in paths.iter().take(20) {
-            if let Some(filename) = path.split('/').last().or_else(|| path.split('\\').last()) {
+            if let Some(filename) = path
+                .split('/')
+                .next_back()
+                .or_else(|| path.split('\\').next_back())
+            {
                 if filename.len() >= 3 {
                     filename_terms.push(filename[..3].to_string());
                 }
@@ -2240,13 +2247,13 @@ mod tests_search_core {
         // 4. Test with usage frequency and recency tracking
         if !paths.is_empty() {
             // Record usage for some paths to affect ranking
-            for i in 0..paths.len().min(5) {
-                engine.record_path_usage(&paths[i]);
+            for (i, path) in paths.iter().take(5).enumerate() {
+                engine.record_path_usage(path);
 
                 // Record multiple usages for the first path
                 if i == 0 {
-                    engine.record_path_usage(&paths[i]);
-                    engine.record_path_usage(&paths[i]);
+                    engine.record_path_usage(path);
+                    engine.record_path_usage(path);
                 }
             }
 
@@ -2307,7 +2314,11 @@ mod tests_search_core {
         // 6. Test cache behavior by repeating a search
         if !paths.is_empty() {
             let repeat_term = if let Some(path) = paths.first() {
-                if let Some(filename) = path.split('/').last().or_else(|| path.split('\\').last()) {
+                if let Some(filename) = path
+                    .split('/')
+                    .next_back()
+                    .or_else(|| path.split('\\').next_back())
+                {
                     if filename.len() >= 3 {
                         &filename[..3]
                     } else {

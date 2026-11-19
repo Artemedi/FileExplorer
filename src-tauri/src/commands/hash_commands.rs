@@ -490,9 +490,9 @@ mod tests_hash_commands {
             )
             .await;
 
-            assert!(result.is_ok(), "Hash generation failed for {:?}", method);
+            assert!(result.is_ok(), "Hash generation failed for {method:?}");
             let hash = result.unwrap();
-            assert_eq!(hash, expected_hash, "Hash mismatch for {:?}", method);
+            assert_eq!(hash, expected_hash, "Hash mismatch for {method:?}");
         }
     }
 
@@ -508,8 +508,7 @@ mod tests_hash_commands {
         let err = result.unwrap_err();
         assert!(
             err.contains("File operation failed"),
-            "unexpected error: {}",
-            err
+            "unexpected error: {err}"
         );
     }
 
@@ -531,7 +530,7 @@ mod tests_hash_commands {
 
         assert!(res.is_err(), "existing output file must not be overwritten");
         let err = res.unwrap_err();
-        assert!(err.contains("already exists"), "unexpected error: {}", err);
+        assert!(err.contains("already exists"), "unexpected error: {err}");
         assert_eq!(
             std::fs::read_to_string(&out_path).unwrap(),
             "ORIGINAL_DO_NOT_OVERWRITE"
@@ -552,8 +551,7 @@ mod tests_hash_commands {
         let err = res.unwrap_err();
         assert!(
             err.contains("Directory hashing is not supported"),
-            "unexpected error: {}",
-            err
+            "unexpected error: {err}"
         );
     }
 
@@ -661,7 +659,7 @@ mod tests_hash_commands {
 
             let result = gen_hash_and_return_string_impl(file_path.clone(), state.clone()).await;
 
-            assert!(result.is_ok(), "Hash generation failed for {:?}", method);
+            assert!(result.is_ok(), "Hash generation failed for {method:?}");
         }
     }
 

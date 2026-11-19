@@ -1,3 +1,5 @@
+#![allow(clippy::borrowed_box)]
+
 #[cfg(test)]
 use crate::log_info;
 use crate::{log_error, log_warn};
@@ -5,6 +7,7 @@ use smallvec::SmallVec;
 use std::cmp;
 use std::mem;
 
+#[allow(clippy::upper_case_acronyms)]
 pub struct ART {
     root: Option<Box<ARTNode>>,
     path_count: usize,
@@ -20,6 +23,7 @@ type KeyType = u8;
 
 type Prefix = SmallVec<[KeyType; 8]>;
 
+#[allow(clippy::large_enum_variant)]
 enum ARTNode {
     Node4(Node4),
     Node16(Node16),
@@ -123,8 +127,8 @@ impl ARTNode {
                             return false;
                         }
                     }
-                    let added = self.add_child(key, child.take());
-                    added
+
+                    self.add_child(key, child.take())
                 } else {
                     n.add_child(key, child.take())
                 }
@@ -141,8 +145,8 @@ impl ARTNode {
                             return false;
                         }
                     }
-                    let added = self.add_child(key, child.take());
-                    added
+
+                    self.add_child(key, child.take())
                 } else {
                     n.add_child(key, child.take())
                 }
@@ -159,8 +163,8 @@ impl ARTNode {
                             return false;
                         }
                     }
-                    let added = self.add_child(key, child.take());
-                    added
+
+                    self.add_child(key, child.take())
                 } else {
                     n.add_child(key, child.take())
                 }
@@ -617,7 +621,7 @@ impl Node48 {
 
         if let Some(idx) = self.child_index[key_idx] {
             let idx = idx as usize;
-            let removed = mem::replace(&mut self.children[idx], None);
+            let removed = self.children[idx].take();
 
             self.child_index[key_idx] = None;
 
@@ -694,7 +698,7 @@ impl Node256 {
         let key_idx = key as usize;
 
         if self.children[key_idx].is_some() {
-            let removed = mem::replace(&mut self.children[key_idx], None);
+            let removed = self.children[key_idx].take();
             self.size -= 1;
             removed
         } else {
@@ -892,11 +896,10 @@ impl ART {
         // header line
         if is_term {
             lines.push(format!(
-                "{}{} [{}] (terminal, score={:?})",
-                pad, node_type, prefix_str, score
+                "{pad}{node_type} [{prefix_str}] (terminal, score={score:?})"
             ));
         } else {
-            lines.push(format!("{}{} [{}]", pad, node_type, prefix_str));
+            lines.push(format!("{pad}{node_type} [{prefix_str}]"));
         }
 
         // recurse into children
@@ -906,7 +909,7 @@ impl ART {
             } else {
                 '.'
             };
-            lines.push(format!("{}  ├─ key={} ('{}') →", pad, key, key_char));
+            lines.push(format!("{pad}  ├─ key={key} ('{key_char}') →"));
             Self::collect_node_lines(child, indent + 2, lines);
         }
     }
@@ -1204,7 +1207,7 @@ impl ART {
                 let rem = normalized_bytes.len() - depth;
                 // Case A: the search prefix ends inside this node's prefix
                 if rem < prefix_len {
-                    if &node_prefix[..rem] != &normalized_bytes[depth..] {
+                    if node_prefix[..rem] != normalized_bytes[depth..] {
                         return Vec::new();
                     }
                     path_acc.extend_from_slice(node_prefix);
@@ -1216,7 +1219,7 @@ impl ART {
                     return results;
                 }
                 // Case B: need to match the entire node_prefix
-                if &node_prefix[..] != &normalized_bytes[depth..depth + prefix_len] {
+                if node_prefix != &normalized_bytes[depth..depth + prefix_len] {
                     return Vec::new();
                 }
                 path_acc.extend_from_slice(node_prefix);
@@ -1341,7 +1344,7 @@ impl ART {
                     }
                 }
 
-                if !(!parent.is_terminal() && parent.num_children() == 0) {
+                if parent.is_terminal() || parent.num_children() != 0 {
                     let prefix = parent.get_prefix().to_vec();
                     let is_term = parent.is_terminal();
                     let score = parent.get_score();
@@ -1434,8 +1437,7 @@ impl ART {
         // Sort by score in descending order (highest scores first)
         results.sort_by(|a, b| {
             // Use partial_cmp with a fallback to ensure stable sorting
-            b.1.partial_cmp(&a.1)
-                .unwrap_or_else(|| cmp::Ordering::Equal)
+            b.1.partial_cmp(&a.1).unwrap_or(cmp::Ordering::Equal)
         });
 
         // Deduplicate results if needed
@@ -1500,9 +1502,9 @@ impl ART {
             let norm_dir = self.normalize_path(dir);
             // Combine directory and query
             let combined_prefix = if norm_dir.ends_with('/') {
-                format!("{}{}", norm_dir, query_norm)
+                format!("{norm_dir}{query_norm}")
             } else {
-                format!("{}/{}", norm_dir, query_norm)
+                format!("{norm_dir}/{query_norm}")
             };
 
             // 1) Direct prefix matches under combined path
@@ -1774,7 +1776,7 @@ mod tests_art_v5 {
         // Each original path should be in the results - EXACT match
         for path in &paths {
             let found = results.iter().any(|(p, _)| p == path);
-            assert!(found, "Complete path should be found: {}", path);
+            assert!(found, "Complete path should be found: {path}");
         }
 
         // Check that filenames still start with 'a'
@@ -1783,8 +1785,7 @@ mod tests_art_v5 {
             let filename = &path[last_slash + 1..];
             assert!(
                 filename.starts_with('a'),
-                "Filename should start with 'a': {}",
-                filename
+                "Filename should start with 'a': {filename}"
             );
         }
     }
@@ -1998,7 +1999,7 @@ mod tests_art_v5 {
             before_completions.len(),
             path1
         );
-        log_info!("is_in_trie: {}", trie.find_completions(path1).len() > 0);
+        log_info!("is_in_trie: {}", !trie.find_completions(path1).is_empty());
         assert_eq!(
             before_completions.len(),
             1,
@@ -2071,8 +2072,7 @@ mod tests_art_v5 {
             assert_eq!(
                 completions.len(),
                 expected_count,
-                "Failed for prefix: {}",
-                prefix
+                "Failed for prefix: {prefix}"
             );
             log_info!(
                 "Prefix '{}' returned {} completions",
@@ -2252,7 +2252,7 @@ mod tests_art_v5 {
                 elapsed
             );
 
-            if completions.len() > 0 {
+            if !completions.is_empty() {
                 log_info!(
                     "First completion: {} (score: {:.1})",
                     completions[0].0,
@@ -2272,7 +2272,7 @@ mod tests_art_v5 {
 
         // Insert each file path
         for file in &files {
-            let full_path = format!("{}{}", base_path, file);
+            let full_path = format!("{base_path}{file}");
             trie.insert(&full_path, 1.0);
 
             // Immediately verify it was added correctly
@@ -2289,19 +2289,15 @@ mod tests_art_v5 {
 
         // Check each completion against expected paths
         for (i, file) in files.iter().enumerate() {
-            let expected_path = format!("{}{}", base_path, file);
+            let expected_path = format!("{base_path}{file}");
             let found = completions.iter().any(|(path, _)| path == &expected_path);
 
-            assert!(
-                found,
-                "Path {} should be found in completions",
-                expected_path
-            );
+            assert!(found, "Path {expected_path} should be found in completions");
             log_info!("Found expected path {}: {}", i, expected_path);
         }
 
         // Test partially matching path
-        let partial_path = format!("{}/a", base_path);
+        let partial_path = format!("{base_path}/a");
         let partial_completions = trie.find_completions(&partial_path);
 
         assert!(
@@ -2336,12 +2332,12 @@ mod tests_art_v5 {
         for i in 0..100 {
             // Create paths with the same prefix but different last bytes
             // to force node growth at the same level
-            let path = format!("{}{:03}", prefix, i);
+            let path = format!("{prefix}{i:03}");
             trie.insert(&path, 1.0);
             if i == 3 || i == 4 || i == 5 || i == 6 || i == 7 || i == 8 || i == 9 || i == 10 {
                 trie.debug_print();
             }
-            assert!(trie.find_completions(&path).len() > 0);
+            assert!(!trie.find_completions(&path).is_empty());
         }
 
         log_info!("Inserted {} paths with common prefix", trie.len());
@@ -2352,7 +2348,7 @@ mod tests_art_v5 {
         let completions = trie.find_completions(&prefix);
         // Debug: compare inserted vs. found completions
         let expected: std::collections::HashSet<_> =
-            (0..100).map(|i| format!("{}{:03}", prefix, i)).collect();
+            (0..100).map(|i| format!("{prefix}{i:03}")).collect();
         let found_set: std::collections::HashSet<_> =
             completions.iter().map(|(p, _)| p.clone()).collect();
         for missing in expected.difference(&found_set) {
@@ -2363,7 +2359,7 @@ mod tests_art_v5 {
 
         // Now remove paths to force node shrinking
         for i in 0..90 {
-            let path = format!("{}{:03}", prefix, i);
+            let path = format!("{prefix}{i:03}");
             assert!(trie.remove(&path));
         }
 
@@ -2531,7 +2527,7 @@ mod tests_art_v5 {
                 let components: Vec<&str> = path.split(MAIN_SEPARATOR).collect();
                 for (i, component) in components.iter().enumerate() {
                     if !component.is_empty() {
-                        let prefix_path = components[0..=i].join(&MAIN_SEPARATOR.to_string());
+                        let prefix_path = components[0..=i].join(std::path::MAIN_SEPARATOR_STR);
                         *common_dirs.entry(prefix_path).or_insert(0) += 1;
                     }
                 }
@@ -2624,9 +2620,7 @@ mod tests_art_v5 {
 
                 assert!(
                     valid_matches > 0,
-                    "No valid matches found for prefix '{}' (normalized: '{}')",
-                    original_prefix,
-                    normalized_prefix
+                    "No valid matches found for prefix '{original_prefix}' (normalized: '{normalized_prefix}')"
                 );
             }
         }
@@ -2635,8 +2629,8 @@ mod tests_art_v5 {
         let to_remove = paths.len().min(50);
         let mut removed = 0;
 
-        for i in 0..to_remove {
-            if trie.remove(&paths[i]) {
+        for path in paths.iter().take(to_remove) {
+            if trie.remove(path) {
                 removed += 1;
             }
         }
@@ -3042,13 +3036,12 @@ mod tests_art_v5 {
             assert_eq!(
                 found.len(),
                 1,
-                "Path should be found after insertion: {}",
-                path
+                "Path should be found after insertion: {path}"
             );
         }
 
         // Test searches with escaped spaces
-        let searches = vec![
+        let searches = [
             "./test-data-for-fuzzy-search\\ coconut",
             "./test-data-for-fuzzy-search\\ blueberry",
             "./test-data-for-fuzzy-search\\ truck\\banana\\ raspberry",
@@ -3059,8 +3052,7 @@ mod tests_art_v5 {
             let results = trie.find_completions(search);
             assert!(
                 !results.is_empty(),
-                "Search '{}' should find at least one result",
-                search
+                "Search '{search}' should find at least one result"
             );
 
             // The corresponding path should be found
@@ -3068,8 +3060,7 @@ mod tests_art_v5 {
             let found = results.iter().any(|(p, _)| p.starts_with(expected_path));
             assert!(
                 found,
-                "Path '{}' should be found for search '{}'",
-                expected_path, search
+                "Path '{expected_path}' should be found for search '{search}'"
             );
         }
     }
@@ -3147,8 +3138,7 @@ mod tests_art_v5 {
             assert_eq!(
                 found.len(),
                 1,
-                "Path should be found after insertion: {}",
-                path
+                "Path should be found after insertion: {path}"
             );
         }
 
@@ -3158,8 +3148,7 @@ mod tests_art_v5 {
             assert_eq!(
                 normalized,
                 normalize_path(path),
-                "Normalization failed for path: {}",
-                path
+                "Normalization failed for path: {path}"
             );
         }
     }
@@ -3172,7 +3161,7 @@ mod tests_art_v5 {
         // 50 distinct 1-byte branches after "dir/sub/" to trigger Node256
         for i in 0..50u8 {
             let ch = (b'!' + i) as char;
-            let p = format!("dir/sub/{}.txt", ch);
+            let p = format!("dir/sub/{ch}.txt");
             trie.insert(&p, 1.0);
             paths.push(p);
         }
@@ -3182,7 +3171,7 @@ mod tests_art_v5 {
         paths.push("dir/sub".to_string());
 
         for c in 'A'..='F' {
-            let p = format!("dir/sub{}", c);
+            let p = format!("dir/sub{c}");
             trie.insert(&p, 1.0);
             paths.push(p);
         }
@@ -3197,12 +3186,12 @@ mod tests_art_v5 {
 
         // Remove 48+ paths one by one
         for p in paths.iter().take(49) {
-            assert!(trie.remove(p), "Expected removal of {}", p);
+            assert!(trie.remove(p), "Expected removal of {p}");
         }
         assert_eq!(trie.len(), 9);
         for p in paths.iter().skip(49) {
             let found = trie.find_completions(p);
-            assert!(found.iter().any(|(res, _)| res == p), "Missing {}", p);
+            assert!(found.iter().any(|(res, _)| res == p), "Missing {p}");
         }
     }
 
@@ -3231,13 +3220,11 @@ mod tests_art_v5 {
         for expected in [p1, p2, p3, p4] {
             assert!(
                 completions.contains(&expected.to_string()),
-                "Missing valid UTF-8 path {} in {:?}",
-                expected,
-                completions
+                "Missing valid UTF-8 path {expected} in {completions:?}"
             );
         }
         for path in &completions {
-            assert!(!path.contains('\u{FFFD}'), "Corrupted UTF-8 in {}", path);
+            assert!(!path.contains('\u{FFFD}'), "Corrupted UTF-8 in {path}");
         }
     }
 
@@ -3246,7 +3233,7 @@ mod tests_art_v5 {
         let mut trie = ART::new(10);
         let mut deep_path = String::from("C:");
         for i in 0..1100 {
-            deep_path.push_str(&format!("/seg{:04}", i));
+            deep_path.push_str(&format!("/seg{i:04}"));
         }
         assert!(deep_path.len() > 8192);
         assert!(trie.insert(&deep_path, 1.0));

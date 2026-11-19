@@ -24,6 +24,7 @@ pub struct PathData {
 impl PathCache {
     #[cfg(test)]
     #[inline]
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(RwLock::new(LruPathCache::new(capacity))),
@@ -31,6 +32,7 @@ impl PathCache {
     }
 
     #[inline]
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn with_ttl(capacity: usize, ttl: Duration) -> Self {
         Self {
             inner: Arc::new(RwLock::new(LruPathCache::with_ttl(capacity, ttl))),
@@ -43,6 +45,7 @@ impl PathCache {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn insert(&mut self, query: String, results: Vec<(String, f32)>) {
         let data = PathData { results };
         self.put_data(query, data);
@@ -222,7 +225,7 @@ mod tests_path_cache {
 
         // Populate cache with sample paths
         for i in 0..500 {
-            let path = format!("/home/user/documents/folder_{}/file.txt", i);
+            let path = format!("/home/user/documents/folder_{i}/file.txt");
             cache.insert(path.clone(), vec![(path, i as f32 / 100.0)]);
         }
 
@@ -231,7 +234,7 @@ mod tests_path_cache {
         // Benchmark getting existing paths
         let start = Instant::now();
         for i in 0..500 {
-            let path = format!("/home/user/documents/folder_{}/file.txt", i);
+            let path = format!("/home/user/documents/folder_{i}/file.txt");
             let _ = cache.get(&path);
         }
         let elapsed = start.elapsed();
@@ -245,7 +248,7 @@ mod tests_path_cache {
         // Benchmark getting non-existent paths
         let start = Instant::now();
         for i in 1000..1500 {
-            let path = format!("/home/user/documents/folder_{}/file.txt", i);
+            let path = format!("/home/user/documents/folder_{i}/file.txt");
             let _ = cache.get(&path);
         }
         let elapsed = start.elapsed();
@@ -268,14 +271,14 @@ mod tests_path_cache {
 
             // Fill the cache to capacity
             for i in 0..size {
-                let path = format!("/path/to/file_{}", i);
+                let path = format!("/path/to/file_{i}");
                 cache.insert(path.clone(), vec![(path, (i % 10) as f32)]);
             }
 
             // Measure retrieval time (mixed hits and misses)
             let start = Instant::now();
             for i in size / 2..(size / 2 + 1000).min(size + 500) {
-                let path = format!("/path/to/file_{}", i);
+                let path = format!("/path/to/file_{i}");
                 let _ = cache.get(&path);
             }
             let elapsed = start.elapsed();
@@ -300,12 +303,12 @@ mod tests_path_cache {
 
             // Fill the cache to capacity
             for i in 0..size {
-                let path = format!("/path/to/file_{}", i);
+                let path = format!("/path/to/file_{i}");
                 cache.insert(
                     path.clone(),
                     vec![(
                         path.clone(),
-                        format!("metadata_{}", i).parse::<f32>().unwrap_or(1.0),
+                        format!("metadata_{i}").parse::<f32>().unwrap_or(1.0),
                     )],
                 );
             }
@@ -313,7 +316,7 @@ mod tests_path_cache {
             // Measure retrieval time (mixed hits and misses)
             let start = Instant::now();
             for i in size / 2..(size / 2 + 1000).min(size + 500) {
-                let path = format!("/path/to/file_{}", i);
+                let path = format!("/path/to/file_{i}");
                 let _ = cache.get(&path);
             }
             let elapsed = start.elapsed();
@@ -336,22 +339,22 @@ mod tests_path_cache {
         // Fill cache
         for i in 0..100 {
             cache.insert(
-                format!("/path/to/file_{}", i),
-                vec![(format!("/path/to/file_{}", i), i as f32)],
+                format!("/path/to/file_{i}"),
+                vec![(format!("/path/to/file_{i}"), i as f32)],
             );
         }
 
         // Access first 20 items to make them recently used
         for i in 0..20 {
-            let _ = cache.get(&format!("/path/to/file_{}", i));
+            let _ = cache.get(&format!("/path/to/file_{i}"));
         }
 
         // Insert 20 new items, which should evict the least recently used
         let start = Instant::now();
         for i in 100..120 {
             cache.insert(
-                format!("/path/to/file_{}", i),
-                vec![(format!("/path/to/file_{}", i), i as f32)],
+                format!("/path/to/file_{i}"),
+                vec![(format!("/path/to/file_{i}"), i as f32)],
             );
         }
         let elapsed = start.elapsed();
@@ -360,13 +363,13 @@ mod tests_path_cache {
 
         // Verify the first 20 items are still there (recently used)
         for i in 0..20 {
-            assert!(cache.get(&format!("/path/to/file_{}", i)).is_some());
+            assert!(cache.get(&format!("/path/to/file_{i}")).is_some());
         }
 
         // Verify some of the middle items were evicted
         let mut evicted_count = 0;
         for i in 20..100 {
-            if cache.get(&format!("/path/to/file_{}", i)).is_none() {
+            if cache.get(&format!("/path/to/file_{i}")).is_none() {
                 evicted_count += 1;
             }
         }

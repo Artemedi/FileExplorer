@@ -99,6 +99,7 @@ pub mod test_generate_test_data {
         let entry_count = Arc::new(Mutex::new(0usize));
 
         // Recursive function to create the folder structure
+        #[allow(clippy::too_many_arguments)]
         fn create_structure(
             path: &Path,
             depth: usize,
@@ -226,7 +227,7 @@ pub mod test_generate_test_data {
         for file_name in &seed_files {
             std::fs::write(
                 root.join(file_name),
-                format!("seed content for {}", file_name),
+                format!("seed content for {file_name}"),
             )?;
         }
 
@@ -243,7 +244,7 @@ pub mod test_generate_test_data {
         ] {
             std::fs::write(
                 subdir_alpha.join(file_name),
-                format!("alpha content for {}", file_name),
+                format!("alpha content for {file_name}"),
             )?;
         }
 
@@ -255,7 +256,7 @@ pub mod test_generate_test_data {
         ] {
             std::fs::write(
                 subdir_beta.join(file_name),
-                format!("beta content for {}", file_name),
+                format!("beta content for {file_name}"),
             )?;
         }
 
