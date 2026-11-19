@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { formatErrorMessage } from '../utils/formatters';
 
 // Default settings - using exact backend keys and supported values
 const defaultSettings = {
@@ -79,10 +80,33 @@ export default function SettingsProvider({ children }) {
     const [settings, setSettings] = useState(defaultSettings);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState(null);
+    const hasLoadedRef = useRef(false);
+    const isMountedRef = useRef(true);
+
+    useEffect(() => {
+        isMountedRef.current = true;
+        return () => {
+            isMountedRef.current = false;
+        };
+    }, []);
+
+    // Keep settings.darkmode synchronized when ThemeProvider changes theme
+    useEffect(() => {
+        const handleThemeProviderChanged = (e) => {
+            if (typeof e?.detail?.isDark === 'boolean') {
+                const isDark = e.detail.isDark;
+                setSettings(prev => (prev.darkmode === isDark ? prev : { ...prev, darkmode: isDark }));
+            }
+        };
+        window.addEventListener('theme-provider-changed', handleThemeProviderChanged);
+        return () => window.removeEventListener('theme-provider-changed', handleThemeProviderChanged);
+    }, []);
 
     // Load settings from backend
-    const loadSettings = async () => {
-        setIsLoading(true);
+    const loadSettings = useCallback(async () => {
+        if (!hasLoadedRef.current) {
+            setIsLoading(true);
+        }
         setError(null);
 
         try {
@@ -90,13 +114,19 @@ export default function SettingsProvider({ children }) {
             const settingsJson = await invoke('get_settings_as_json');
             const loadedSettings = JSON.parse(settingsJson);
 
+            if (!loadedSettings || typeof loadedSettings !== 'object' || ('code' in loadedSettings && 'custom_message' in loadedSettings)) {
+                throw new Error(loadedSettings?.custom_message || loadedSettings?.message_from_code || 'Failed to load settings from backend');
+            }
+
             console.log('Loaded settings:', loadedSettings);
 
+            if (!isMountedRef.current) return;
             setSettings(normalizeSettingsPayload(loadedSettings));
             console.log('Settings loaded successfully');
-        } catch (error) {
-            console.error('Failed to load settings:', error);
-            setError('Failed to load settings from backend');
+        } catch (err) {
+            console.error('Failed to load settings:', err);
+            if (!isMountedRef.current) return;
+            setError(formatErrorMessage(err));
 
             // Use default settings if loading fails
             setSettings(defaultSettings);
@@ -110,17 +140,22 @@ export default function SettingsProvider({ children }) {
                 console.log('Default settings saved successfully');
             } catch (saveError) {
                 console.error('Failed to save default settings:', saveError);
-                setError('Failed to load and save default settings');
+                if (isMountedRef.current) {
+                    setError(formatErrorMessage(saveError));
+                }
             }
         } finally {
-            setIsLoading(false);
+            if (isMountedRef.current) {
+                hasLoadedRef.current = true;
+                setIsLoading(false);
+            }
         }
-    };
+    }, []);
 
     // Load settings on mount
     useEffect(() => {
         loadSettings();
-    }, []);
+    }, [loadSettings]);
 
     // Update a single setting
     const updateSetting = async (key, value) => {
@@ -135,9 +170,15 @@ export default function SettingsProvider({ children }) {
 
             // Parse the response to get the updated settings
             if (updatedSettingsJson) {
-                const updatedSettings = normalizeSettingsPayload(JSON.parse(updatedSettingsJson));
-                setSettings(updatedSettings);
-            } else {
+                const parsed = JSON.parse(updatedSettingsJson);
+                if (parsed && typeof parsed === 'object' && 'code' in parsed && 'custom_message' in parsed) {
+                    throw new Error(parsed.custom_message || parsed.message_from_code || `Failed to update ${key}`);
+                }
+                const updatedSettings = normalizeSettingsPayload(parsed);
+                if (isMountedRef.current) {
+                    setSettings(updatedSettings);
+                }
+            } else if (isMountedRef.current) {
                 // Fallback: just update the local state
                 setSettings(prev => ({
                     ...prev,
@@ -152,18 +193,14 @@ export default function SettingsProvider({ children }) {
             }
 
             console.log(`Setting ${key} updated successfully`);
-        } catch (error) {
-            console.error(`Failed to update setting ${key}:`, error);
-            setError(`Failed to update ${key}: ${error.message || error}`);
-
-            // Update local state anyway for better UX, but show the error
-            setSettings(prev => ({
-                ...prev,
-                [key]: value,
-            }));
-
-            // Clear error after a few seconds
-            setTimeout(() => setError(null), 5000);
+        } catch (err) {
+            console.error(`Failed to update setting ${key}:`, err);
+            if (isMountedRef.current) {
+                setError(`Failed to update ${key}: ${formatErrorMessage(err)}`);
+                setTimeout(() => {
+                    if (isMountedRef.current) setError(null);
+                }, 5000);
+            }
         }
     };
 
@@ -179,9 +216,15 @@ export default function SettingsProvider({ children }) {
 
             // Parse the response to get the updated settings
             if (updatedSettingsJson) {
-                const updatedSettings = normalizeSettingsPayload(JSON.parse(updatedSettingsJson));
-                setSettings(updatedSettings);
-            } else {
+                const parsed = JSON.parse(updatedSettingsJson);
+                if (parsed && typeof parsed === 'object' && 'code' in parsed && 'custom_message' in parsed) {
+                    throw new Error(parsed.custom_message || parsed.message_from_code || 'Failed to update settings');
+                }
+                const updatedSettings = normalizeSettingsPayload(parsed);
+                if (isMountedRef.current) {
+                    setSettings(updatedSettings);
+                }
+            } else if (isMountedRef.current) {
                 // Fallback: just update the local state
                 setSettings(prev => ({
                     ...prev,
@@ -196,18 +239,14 @@ export default function SettingsProvider({ children }) {
             }
 
             console.log('Multiple settings updated successfully');
-        } catch (error) {
-            console.error('Failed to update multiple settings:', error);
-            setError(`Failed to update settings: ${error.message || error}`);
-
-            // Update local state anyway for better UX, but show the error
-            setSettings(prev => ({
-                ...prev,
-                ...updates,
-            }));
-
-            // Clear error after a few seconds
-            setTimeout(() => setError(null), 5000);
+        } catch (err) {
+            console.error('Failed to update multiple settings:', err);
+            if (isMountedRef.current) {
+                setError(`Failed to update settings: ${formatErrorMessage(err)}`);
+                setTimeout(() => {
+                    if (isMountedRef.current) setError(null);
+                }, 5000);
+            }
         }
     };
 
@@ -220,28 +259,29 @@ export default function SettingsProvider({ children }) {
             await invoke('reset_settings_command');
 
             // Update local state
-            setSettings(defaultSettings);
+            if (isMountedRef.current) {
+                setSettings(defaultSettings);
+            }
             window.dispatchEvent(new CustomEvent('theme-setting-changed', {
                 detail: { isDark: Boolean(defaultSettings.darkmode) }
             }));
 
             console.log('Settings reset successfully');
-        } catch (error) {
-            console.error('Failed to reset settings:', error);
-            setError(`Failed to reset settings: ${error.message || error}`);
-
-            // Update local state anyway for better UX, but show the error
-            setSettings(defaultSettings);
-
-            // Clear error after a few seconds
-            setTimeout(() => setError(null), 5000);
+        } catch (err) {
+            console.error('Failed to reset settings:', err);
+            if (isMountedRef.current) {
+                setError(`Failed to reset settings: ${formatErrorMessage(err)}`);
+                setTimeout(() => {
+                    if (isMountedRef.current) setError(null);
+                }, 5000);
+            }
         }
     };
 
     // Reload settings from backend
-    const reloadSettings = () => {
-        loadSettings();
-    };
+    const reloadSettings = useCallback(() => {
+        return loadSettings();
+    }, [loadSettings]);
 
     const contextValue = {
         settings,
@@ -253,8 +293,8 @@ export default function SettingsProvider({ children }) {
         reloadSettings,
     };
 
-    // Show loading state if settings are not loaded yet
-    if (isLoading) {
+    // Show loading state ONLY on initial load, never on reloadSettings()
+    if (isLoading && !hasLoadedRef.current) {
         return (
             <div style={{
                 display: 'flex',

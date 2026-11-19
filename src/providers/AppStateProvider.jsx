@@ -21,14 +21,12 @@ export default function AppStateProvider({ children }) {
 
     // Toggle template view
     const toggleTemplateView = useCallback(() => {
-        setIsTemplateViewOpen(prev => !prev);
-
-        if (!isTemplateViewOpen) {
-            setCurrentView('template-view');
-        } else {
-            setCurrentView('explorer');
-        }
-    }, [isTemplateViewOpen]);
+        setIsTemplateViewOpen(prev => {
+            const next = !prev;
+            setCurrentView(next ? 'template-view' : 'explorer');
+            return next;
+        });
+    }, []);
 
     // Toggle sidebar
     const toggleSidebar = useCallback(() => {

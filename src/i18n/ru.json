@@ -16,7 +16,14 @@
     "refresh": "Обновить",
     "error": "Ошибка",
     "success": "Успешно",
+    "confirm": "Подтвердить",
     "items": "элементов",
+    "itemsPlural": {
+      "one": "{count} элемент",
+      "few": "{count} элемента",
+      "many": "{count} элементов",
+      "other": "{count} элементов"
+    },
     "selected": "выбрано"
   },
   "nav": {

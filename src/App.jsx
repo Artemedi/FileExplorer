@@ -23,7 +23,7 @@ function ErrorFallback() {
             borderRadius: '8px',
             boxShadow: '0 2px 8px rgba(0,0,0,0.1)'
         }}>
-            <h1 style={{ color: '#d32f2f' }}>Fast File Explorer</h1>
+            <h1 style={{ color: '#d32f2f' }}>Explr</h1>
             <p>The application could not be loaded properly. Try refreshing the page.</p>
             <p>If the problem persists, check the console (F12) for error messages.</p>
             <button

@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { getFileName, joinPath, normalizePath } from './pathUtils.ts';
 
 /**
  * Search options for configuring search behavior.
@@ -36,141 +37,49 @@ export const searchFiles = async (query, options = DEFAULT_SEARCH_OPTIONS) => {
     }
 
     try {
-        // This is a placeholder since we don't have a direct search API in the docs
-        // In a real implementation, this would call a Tauri backend function
-        console.log('Searching for:', query, 'with options:', options);
+        const parsed = parseSearchQuery(query);
+        const effectiveQuery = parsed.query || query.trim();
+        const extensions = Array.isArray(options?.fileTypes) && options.fileTypes.length > 0
+            ? options.fileTypes
+            : parsed.options.fileTypes;
 
-        // For now, return mock data based on the query
-        return mockSearchResults(query, options);
+        const rawResults = extensions.length > 0
+            ? await invoke('search_with_extension', { query: effectiveQuery, extensions })
+            : await invoke('search', { query: effectiveQuery });
+
+        const entries = Array.isArray(rawResults) ? rawResults : [];
+        const includeHidden = Boolean(options?.includeHidden ?? parsed.options.includeHidden);
+
+        const files = [];
+        for (const item of entries) {
+            const rawPath = Array.isArray(item) ? item[0] : item?.path;
+            const score = Array.isArray(item) ? item[1] : (item?.score ?? 0);
+            if (!rawPath || typeof rawPath !== 'string') continue;
+
+            const normalizedItemPath = rawPath.includes('/') || rawPath.includes('\\')
+                ? normalizePath(rawPath)
+                : (options?.searchIn ? joinPath(options.searchIn, rawPath) : rawPath);
+            const name = getFileName(normalizedItemPath) || normalizedItemPath;
+
+            if (!includeHidden && name.startsWith('.')) {
+                continue;
+            }
+
+            files.push({
+                name,
+                path: normalizedItemPath,
+                score,
+                is_symlink: false,
+                size_in_bytes: 0,
+                isDirectory: false,
+            });
+        }
+
+        return { files, directories: [] };
     } catch (error) {
         console.error('Search error:', error);
-        throw new Error(`Search failed: ${error.message}`);
+        throw new Error(`Search failed: ${error?.message || error}`);
     }
-};
-
-/**
- * Generate mock search results for testing.
- * @param {string} query - The search query.
- * @param {SearchOptions} options - Search options.
- * @returns {Object} - Mock search results.
- */
-const mockSearchResults = (query, options) => {
-    const { caseSensitive, matchWholeWord, searchIn } = options;
-
-    // Normalize query for comparison based on options
-    const normalizedQuery = caseSensitive ? query : query.toLowerCase();
-
-    // Mock file and directory data
-    const mockData = [
-        {
-            name: 'Document.pdf',
-            path: `${searchIn}/Document.pdf`,
-            is_symlink: false,
-            access_rights_as_string: 'rw-r--r--',
-            access_rights_as_number: 33188,
-            size_in_bytes: 1503745,
-            created: '2023-05-15 10:30:00',
-            last_modified: '2023-05-15 10:30:00',
-            accessed: '2023-05-15 10:30:00',
-            isDirectory: false,
-        },
-        {
-            name: 'Readme.txt',
-            path: `${searchIn}/Readme.txt`,
-            is_symlink: false,
-            access_rights_as_string: 'rw-r--r--',
-            access_rights_as_number: 33188,
-            size_in_bytes: 2345,
-            created: '2023-04-10 08:15:00',
-            last_modified: '2023-04-10 08:15:00',
-            accessed: '2023-04-10 08:15:00',
-            isDirectory: false,
-        },
-        {
-            name: 'Projects',
-            path: `${searchIn}/Projects`,
-            is_symlink: false,
-            access_rights_as_string: 'rwxr-xr-x',
-            access_rights_as_number: 16877,
-            size_in_bytes: 4096,
-            sub_file_count: 12,
-            sub_dir_count: 3,
-            created: '2023-03-20 14:45:00',
-            last_modified: '2023-03-20 14:45:00',
-            accessed: '2023-03-20 14:45:00',
-            isDirectory: true,
-        },
-        {
-            name: 'image.png',
-            path: `${searchIn}/image.png`,
-            is_symlink: false,
-            access_rights_as_string: 'rw-r--r--',
-            access_rights_as_number: 33188,
-            size_in_bytes: 245760,
-            created: '2023-05-02 11:20:00',
-            last_modified: '2023-05-02 11:20:00',
-            accessed: '2023-05-02 11:20:00',
-            isDirectory: false,
-        },
-        {
-            name: 'Documents',
-            path: `${searchIn}/Documents`,
-            is_symlink: false,
-            access_rights_as_string: 'rwxr-xr-x',
-            access_rights_as_number: 16877,
-            size_in_bytes: 4096,
-            sub_file_count: 8,
-            sub_dir_count: 2,
-            created: '2023-02-15 09:30:00',
-            last_modified: '2023-02-15 09:30:00',
-            accessed: '2023-02-15 09:30:00',
-            isDirectory: true,
-        },
-        {
-            name: 'project_documentation.md',
-            path: `${searchIn}/project_documentation.md`,
-            is_symlink: false,
-            access_rights_as_string: 'rw-r--r--',
-            access_rights_as_number: 33188,
-            size_in_bytes: 8976,
-            created: '2023-04-25 16:40:00',
-            last_modified: '2023-04-25 16:40:00',
-            accessed: '2023-04-25 16:40:00',
-            isDirectory: false,
-        },
-        {
-            name: 'todo.txt',
-            path: `${searchIn}/todo.txt`,
-            is_symlink: false,
-            access_rights_as_string: 'rw-r--r--',
-            access_rights_as_number: 33188,
-            size_in_bytes: 567,
-            created: '2023-05-08 13:10:00',
-            last_modified: '2023-05-08 13:10:00',
-            accessed: '2023-05-08 13:10:00',
-            isDirectory: false,
-        },
-    ];
-
-    // Filter based on the search query
-    const filteredData = mockData.filter(item => {
-        const itemName = caseSensitive ? item.name : item.name.toLowerCase();
-
-        if (matchWholeWord) {
-            // Split the name into words and check if any whole word matches
-            const words = itemName.split(/\W+/);
-            return words.some(word => word === normalizedQuery);
-        } else {
-            // Check if the name contains the query
-            return itemName.includes(normalizedQuery);
-        }
-    });
-
-    // Separate files and directories
-    const files = filteredData.filter(item => !item.isDirectory);
-    const directories = filteredData.filter(item => item.isDirectory);
-
-    return { files, directories };
 };
 
 /**

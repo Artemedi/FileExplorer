@@ -60,7 +60,7 @@ export default function ThemeProvider({ children }) {
     }, []);
 
     // Function to set theme and update settings
-    const setTheme = async (newTheme) => {
+    const setTheme = useCallback(async (newTheme) => {
         if (newTheme === theme) return;
 
         console.log(`Setting theme to: ${newTheme}`);
@@ -71,25 +71,31 @@ export default function ThemeProvider({ children }) {
         // Update state
         setThemeState(newTheme);
 
+        const isDark = newTheme === 'dark';
+        window.dispatchEvent(new CustomEvent('theme-provider-changed', {
+            detail: { isDark }
+        }));
+
         try {
             // Save to settings using the correct key 'darkmode'
-            const isDark = newTheme === 'dark';
             await invoke('update_settings_field', { key: 'darkmode', value: isDark });
             console.log('Theme saved to settings successfully');
         } catch (error) {
             console.error('Failed to save theme setting:', error);
             // Don't revert the theme change since it's already applied and might work
         }
-    };
+    }, [theme, applyThemeToDOM]);
 
     // Toggle between light and dark theme
-    const toggleTheme = () => {
+    const toggleTheme = useCallback(() => {
         const newTheme = theme === 'light' ? 'dark' : 'light';
         setTheme(newTheme);
-    };
+    }, [theme, setTheme]);
 
     // Load theme from settings on mount
     useEffect(() => {
+        let isMounted = true;
+
         const loadTheme = async () => {
             setIsLoading(true);
 
@@ -97,6 +103,7 @@ export default function ThemeProvider({ children }) {
                 // Try to get theme from settings using the correct key 'darkmode'
                 console.log('Loading theme from settings...');
                 const isDarkMode = await invoke('get_setting_field', { key: 'darkmode' });
+                if (!isMounted) return;
 
                 if (isDarkMode !== null && isDarkMode !== undefined) {
                     const themeValue = isDarkMode ? 'dark' : 'light';
@@ -117,6 +124,7 @@ export default function ThemeProvider({ children }) {
                     }
                 }
             } catch (error) {
+                if (!isMounted) return;
                 console.warn('Could not load theme from settings:', error);
 
                 // Fallback to system preference
@@ -128,25 +136,29 @@ export default function ThemeProvider({ children }) {
                     applyThemeToDOM('light');
                 }
             } finally {
-                setIsLoading(false);
+                if (isMounted) {
+                    setIsLoading(false);
+                }
             }
         };
 
         loadTheme();
 
         // Listen for system theme changes only if no saved theme
-        const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+        const mediaQuery = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
 
         const handleSystemThemeChange = async (e) => {
             try {
                 // Only auto-update if user hasn't explicitly set a theme
                 const savedDarkMode = await invoke('get_setting_field', { key: 'darkmode' });
+                if (!isMounted) return;
                 if (savedDarkMode === null || savedDarkMode === undefined) {
                     const newTheme = e.matches ? 'dark' : 'light';
                     setThemeState(newTheme);
                     applyThemeToDOM(newTheme);
                 }
             } catch (error) {
+                if (!isMounted) return;
                 // If we can't check saved theme, just update based on system
                 const newTheme = e.matches ? 'dark' : 'light';
                 setThemeState(newTheme);
@@ -154,9 +166,12 @@ export default function ThemeProvider({ children }) {
             }
         };
 
-        mediaQuery.addEventListener('change', handleSystemThemeChange);
+        if (mediaQuery) {
+            mediaQuery.addEventListener('change', handleSystemThemeChange);
+        }
 
         const handleThemeSettingChanged = (e) => {
+            if (!isMounted) return;
             if (typeof e?.detail?.isDark === 'boolean') {
                 const nextTheme = e.detail.isDark ? 'dark' : 'light';
                 setThemeState(nextTheme);
@@ -166,7 +181,10 @@ export default function ThemeProvider({ children }) {
         window.addEventListener('theme-setting-changed', handleThemeSettingChanged);
 
         return () => {
-            mediaQuery.removeEventListener('change', handleSystemThemeChange);
+            isMounted = false;
+            if (mediaQuery) {
+                mediaQuery.removeEventListener('change', handleSystemThemeChange);
+            }
             window.removeEventListener('theme-setting-changed', handleThemeSettingChanged);
         };
     }, [applyThemeToDOM]);

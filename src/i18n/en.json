@@ -16,7 +16,14 @@
     "refresh": "Refresh",
     "error": "Error",
     "success": "Success",
+    "confirm": "Confirm",
     "items": "items",
+    "itemsPlural": {
+      "one": "{count} item",
+      "few": "{count} items",
+      "many": "{count} items",
+      "other": "{count} items"
+    },
     "selected": "selected"
   },
   "nav": {

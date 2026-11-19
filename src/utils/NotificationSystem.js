@@ -7,7 +7,7 @@ let notificationContainer = null;
 
 // Initialize notification container
 const initNotificationContainer = () => {
-    if (!notificationContainer) {
+    if (!notificationContainer || !document.body.contains(notificationContainer)) {
         notificationContainer = document.createElement('div');
         notificationContainer.id = 'notification-container';
         notificationContainer.style.cssText = `
@@ -135,9 +135,9 @@ export const showConfirm = (message, title = 'Confirm') => {
 
         const dialog = document.createElement('div');
         dialog.style.cssText = `
-            background: var(--bg-primary, #ffffff);
+            background: var(--surface, #ffffff);
             color: var(--text-primary, #1a1c1e);
-            border: 1px solid var(--border-color, #e0e4e8);
+            border: 1px solid var(--border, #e0e4e8);
             border-radius: 8px;
             padding: 24px;
             max-width: 400px;
@@ -172,7 +172,7 @@ export const showConfirm = (message, title = 'Confirm') => {
         cancelBtn.textContent = 'Cancel';
         cancelBtn.style.cssText = `
             padding: 8px 16px;
-            border: 1px solid var(--border-color, #e0e4e8);
+            border: 1px solid var(--border, #e0e4e8);
             background: transparent;
             color: var(--text-primary, #1a1c1e);
             border-radius: 6px;
@@ -184,7 +184,7 @@ export const showConfirm = (message, title = 'Confirm') => {
         confirmBtn.style.cssText = `
             padding: 8px 16px;
             border: none;
-            background: var(--accent-primary, #0672ef);
+            background: var(--accent, #0672ef);
             color: white;
             border-radius: 6px;
             cursor: pointer;
@@ -192,13 +192,15 @@ export const showConfirm = (message, title = 'Confirm') => {
 
         const handleKeyDown = (e) => {
             if (e.key === 'Escape') {
+                e.preventDefault();
+                e.stopPropagation();
                 cleanup();
                 resolve(false);
             }
         };
 
         const cleanup = () => {
-            document.removeEventListener('keydown', handleKeyDown);
+            document.removeEventListener('keydown', handleKeyDown, { capture: true });
             if (modal.parentNode) {
                 modal.parentNode.removeChild(modal);
             }
@@ -222,7 +224,7 @@ export const showConfirm = (message, title = 'Confirm') => {
         });
 
         // ESC key to cancel
-        document.addEventListener('keydown', handleKeyDown);
+        document.addEventListener('keydown', handleKeyDown, { capture: true });
 
         buttonContainer.appendChild(cancelBtn);
         buttonContainer.appendChild(confirmBtn);

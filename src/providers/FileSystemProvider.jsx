@@ -1,121 +1,110 @@
-import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useHistory } from './HistoryProvider';
 import { useSettings } from './SettingsProvider';
 import { useSftp } from './SftpProvider';
-import { getDirectoryPath, getFileName } from '../utils/pathUtils';
+import { getDirectoryPath, getFileName, normalizePath } from '../utils/pathUtils';
 import { formatErrorMessage } from '../utils/formatters';
 import { showError } from '../utils/NotificationSystem';
 
 // Create file system context
-export const FileSystemContext = createContext({
-    currentDirData: null,
-    isLoading: false,
-    selectedItems: [],
-    focusedItem: null,
-    volumes: [],
-    error: null,
-    loadDirectory: () => {},
-    openFile: () => {},
-    createFile: () => {},
-    createDirectory: () => {},
-    renameItem: () => {},
-    moveToTrash: () => {},
-    selectItem: () => {},
-    selectMultiple: () => {},
-    clearSelection: () => {},
-    setFocusedItem: () => {},
-    zipItems: () => {},
-    unzipItem: () => {},
-    loadVolumes: () => {},
-});
+export const FileSystemContext = createContext(null);
+
+const isPathOrDescendant = (candidatePath, targetPath) => {
+    if (!candidatePath || !targetPath) return false;
+    if (candidatePath === targetPath) return true;
+    const normCandidate = normalizePath(candidatePath);
+    const normTarget = normalizePath(targetPath);
+    if (normCandidate === normTarget) return true;
+    return (
+        normCandidate.startsWith(`${normTarget}/`) ||
+        normCandidate.startsWith(`${normTarget}\\`)
+    );
+};
+
+const isSameDirectoryPath = (a, b) => {
+    if (!a || !b) return false;
+    const normA = normalizePath(a);
+    const normB = normalizePath(b);
+    if (normA === normB) return true;
+    // Windows drive paths are case-insensitive
+    if (/^[A-Za-z]:[/\\]/.test(normA) || normA.startsWith('\\\\')) {
+        return normA.toLowerCase() === normB.toLowerCase();
+    }
+    return false;
+};
 
 export default function FileSystemProvider({ children }) {
-    const [currentDirData, setCurrentDirData] = useState(null);
-    const [isLoading, setIsLoading] = useState(true); // Starten Sie mit isLoading=true
+    const [rawDirData, setRawDirData] = useState(null);
+    const [isLoading, setIsLoading] = useState(true);
     const [selectedItems, setSelectedItems] = useState([]);
     const [focusedItem, setFocusedItem] = useState(null);
     const [volumes, setVolumes] = useState([]);
     const [error, setError] = useState(null);
+
     const lastLoadedPathRef = useRef(null);
-    const hasMountedHiddenRef = useRef(false);
-    const { navigateTo, currentPath } = useHistory();
+    const loadRequestIdRef = useRef(0);
+    const activeMountTokenRef = useRef(0);
+    const watchedPathRef = useRef(null);
+    const initInFlightRef = useRef(false);
+
+    const { navigateTo, revertToPath, currentPath } = useHistory();
     const { settings } = useSettings();
-    const { 
-        isSftpPath, 
-        loadSftpDirectory, 
-        createSftpFile, 
-        createSftpDirectory, 
-        deleteSftpItem, 
-        renameSftpItem, 
-        downloadAndOpenSftpFile 
+    const {
+        isSftpPath,
+        loadSftpDirectory,
+        createSftpFile,
+        createSftpDirectory,
+        deleteSftpItem,
+        renameSftpItem,
+        downloadAndOpenSftpFile
     } = useSftp();
 
-    // Helper function to check if a file or directory is hidden
-    const isHiddenItem = useCallback((name) => {
-        // Files/folders starting with a dot are considered hidden on Unix-like systems
-        return name.startsWith('.');
-    }, []);
-
-    // Helper function to filter directory data based on hidden files setting
-    const filterDirectoryData = useCallback((dirData) => {
-        if (!dirData) return dirData;
-        
-        // If show_hidden_files_and_folders is true, return data as-is
+    // Derive filtered directory data without triggering extra IPC reloads
+    const currentDirData = useMemo(() => {
+        if (!rawDirData) return rawDirData;
         if (settings.show_hidden_files_and_folders) {
-            return dirData;
+            return rawDirData;
         }
-
-        // Filter out hidden files and directories
-        const filteredDirectories = dirData.directories ? 
-            dirData.directories.filter(dir => !isHiddenItem(dir.name)) : [];
-        const filteredFiles = dirData.files ? 
-            dirData.files.filter(file => !isHiddenItem(file.name)) : [];
-
         return {
-            ...dirData,
-            directories: filteredDirectories,
-            files: filteredFiles
+            ...rawDirData,
+            directories: rawDirData.directories
+                ? rawDirData.directories.filter(dir => !dir.name.startsWith('.'))
+                : [],
+            files: rawDirData.files
+                ? rawDirData.files.filter(file => !file.name.startsWith('.'))
+                : [],
         };
-    }, [settings.show_hidden_files_and_folders, isHiddenItem]);
+    }, [rawDirData, settings.show_hidden_files_and_folders]);
 
     // Load system volumes information
     const loadVolumes = useCallback(async () => {
         try {
             const volumesJson = await invoke('get_system_volumes_information_as_json');
             const volumesData = JSON.parse(volumesJson);
-            setVolumes(volumesData);
-            return volumesData; // Zurückgeben zur weiteren Verwendung
+            const list = Array.isArray(volumesData) ? volumesData : [];
+            setVolumes(list);
+            return list;
         } catch (err) {
             console.error('Failed to load volumes:', err);
             setError(`Failed to load volumes: ${formatErrorMessage(err)}`);
-            // Fallback to mock data for development
-            const mockVolumes = [
-                {
-                    volume_name: "Local Disk (C:)",
-                    mount_point: "C:\\",
-                    file_system: "NTFS",
-                    size: 500107862016,
-                    available_space: 158148874240,
-                    is_removable: false,
-                    total_written_bytes: 0,
-                    total_read_bytes: 0
-                }
-            ];
-            setVolumes(mockVolumes);
-            return mockVolumes;
+            setVolumes([]);
+            return [];
         }
     }, []);
 
-    // Load directory contents - enhanced with SFTP support
+    // Load directory contents - enhanced with SFTP support and stale-request protection
     const loadDirectory = useCallback(async (path, options = {}) => {
         const silent = Boolean(options?.silent);
         if (!path) {
-            console.error("Cannot load directory: path is empty");
+            console.error('Cannot load directory: path is empty');
             if (!silent) setIsLoading(false);
             return false;
         }
+
+        const requestId = ++loadRequestIdRef.current;
+        let timeoutId = null;
 
         console.log(`Attempting to load directory: ${path}`);
         if (!silent) {
@@ -128,12 +117,17 @@ export default function FileSystemProvider({ children }) {
             if (isSftpPath(path)) {
                 console.log(`Loading SFTP directory: ${path}`);
                 const sftpData = await loadSftpDirectory(path);
+                if (requestId !== loadRequestIdRef.current) {
+                    return false;
+                }
                 if (sftpData) {
-                    const filteredData = filterDirectoryData(sftpData);
-                    setCurrentDirData(filteredData);
+                    setRawDirData(sftpData);
                     lastLoadedPathRef.current = path;
                     navigateTo(path);
-                    invoke('unwatch_directory').catch(() => {});
+                    if (watchedPathRef.current) {
+                        watchedPathRef.current = null;
+                        invoke('unwatch_directory').catch(() => {});
+                    }
                     console.log(`Successfully loaded SFTP directory: ${path}`);
                     return true;
                 } else {
@@ -143,41 +137,57 @@ export default function FileSystemProvider({ children }) {
 
             // Regular file system path
             const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new Error(`Directory loading timed out: ${path}`)), 10000);
+                timeoutId = setTimeout(
+                    () => reject(new Error(`Directory loading timed out: ${path}`)),
+                    10000
+                );
             });
 
             const loadPromise = invoke('open_directory', { path });
             const dirContent = await Promise.race([loadPromise, timeoutPromise]);
 
+            if (requestId !== loadRequestIdRef.current) {
+                return false;
+            }
+
             if (!dirContent) {
                 throw new Error(`Empty response from open_directory: ${path}`);
             }
 
+            let dirData;
             try {
-                const dirData = JSON.parse(dirContent);
-                const filteredData = filterDirectoryData(dirData);
-                setCurrentDirData(filteredData);
-                lastLoadedPathRef.current = path;
-                navigateTo(path);
-                invoke('watch_directory', { path }).catch((err) => {
-                    console.warn(`Failed to watch directory: ${path}`, err);
-                });
-                console.log(`Successfully loaded directory: ${path}`);
-                return true;
+                dirData = JSON.parse(dirContent);
             } catch (parseError) {
                 throw new Error(`Failed to parse directory data: ${parseError.message}`);
             }
+
+            if (requestId !== loadRequestIdRef.current) {
+                return false;
+            }
+
+            setRawDirData(dirData);
+            lastLoadedPathRef.current = path;
+            navigateTo(path);
+            watchedPathRef.current = path;
+            invoke('watch_directory', { path }).catch((err) => {
+                console.warn(`Failed to watch directory: ${path}`, err);
+            });
+            console.log(`Successfully loaded directory: ${path}`);
+            return true;
         } catch (err) {
+            if (requestId !== loadRequestIdRef.current) {
+                return false;
+            }
+
             console.error(`Failed to load directory: ${path}`, err);
-            
-            // Handle permission errors specifically for user directories
+
             const errorMessage = formatErrorMessage(err);
             if (errorMessage.toLowerCase().includes('permission denied') || errorMessage.toLowerCase().includes('unauthorized')) {
                 const folderName = getFileName(path) || path;
-                const isUserDir = ['Desktop', 'Documents', 'Downloads', 'Pictures', 'Movies', 'Music'].some(dir => 
+                const isUserDir = ['Desktop', 'Documents', 'Downloads', 'Pictures', 'Movies', 'Music'].some(dir =>
                     path.toLowerCase().includes(dir.toLowerCase())
                 );
-                
+
                 if (isUserDir) {
                     setError(`Access denied to "${folderName}". This app needs permission to access your ${folderName} folder. Please grant permission in System Preferences > Security & Privacy > Privacy > Files and Folders.`);
                 } else {
@@ -188,19 +198,19 @@ export default function FileSystemProvider({ children }) {
             }
             return false;
         } finally {
-            if (!silent) {
+            if (timeoutId !== null) {
+                clearTimeout(timeoutId);
+            }
+            if (!silent && requestId === loadRequestIdRef.current) {
                 setIsLoading(false);
             }
         }
-    }, [navigateTo, filterDirectoryData, isSftpPath, loadSftpDirectory]);
+    }, [navigateTo, isSftpPath, loadSftpDirectory]);
 
-// Verbesserte getDefaultDirectory-Funktion
     const getDefaultDirectory = useCallback(async () => {
-        // Setze isLoading auf true, um den Ladezustand anzuzeigen
         setIsLoading(true);
 
         try {
-            // 0. Check if a folder was passed via CLI argument (e.g. explr.exe "C:\Folder")
             try {
                 const initialCliPath = await invoke('get_initial_cli_path');
                 if (initialCliPath) {
@@ -211,13 +221,11 @@ export default function FileSystemProvider({ children }) {
                 console.warn('Could not retrieve CLI path:', cliErr);
             }
 
-            // 0.5. Respect configured default opening folder if set
             if (settings.default_folder_path_on_opening && settings.default_folder_path_on_opening.trim()) {
                 return settings.default_folder_path_on_opening.trim();
             }
 
-            // 1. Versuche zuerst, die Volumes zu laden
-            console.log("Attempting to load volumes...");
+            console.log('Attempting to load volumes...');
             const volumesList = await loadVolumes();
 
             if (volumesList && volumesList.length > 0) {
@@ -226,69 +234,60 @@ export default function FileSystemProvider({ children }) {
             }
 
             console.warn('No volumes available, trying common paths instead');
-
-            // 2. Liste gängiger Pfade für verschiedene Betriebssysteme
-            //const commonPaths = ['/', 'C:\\', '/home', '/Users', '/tmp', '/var', '/opt'];
             const commonPaths = ['C:\\', '/Users', '/home'];
 
-            // 3. Prüfe jeden Pfad einzeln
             for (const path of commonPaths) {
                 console.log(`Checking if path is accessible: ${path}`);
                 try {
-                    // Verwende einen separaten try-catch für jeden Pfad
                     const result = await invoke('open_directory', { path });
                     if (result) {
                         console.log(`Successfully found accessible path: ${path}`);
                         return path;
                     }
-                } catch (e) {
+                } catch {
                     console.log(`Path ${path} not accessible`);
-                    // Fehler ignorieren und mit dem nächsten Pfad fortfahren
                 }
             }
 
-            // 4. Hartcodierter Fallback als letzte Möglichkeit
             console.warn('All paths failed, using hardcoded default');
             return '/';
-        } catch (error) {
-            console.error('Error in getDefaultDirectory:', error);
+        } catch (err) {
+            console.error('Error in getDefaultDirectory:', err);
             return '/';
-        } finally {
-            // Stelle sicher, dass ein Ladeindikator nicht nur wegen dieser Funktion aktiv bleibt
-            // setIsLoading(false); -- Dies sollte in loadDirectory gesetzt werden, nicht hier
         }
     }, [loadVolumes, settings.default_folder_path_on_opening]);
 
-// Verbesserte initializeFirstDirectory-Funktion
     const initializeFirstDirectory = useCallback(async () => {
-        console.log("Initializing first directory...");
+        if (initInFlightRef.current) return;
+        initInFlightRef.current = true;
+        console.log('Initializing first directory...');
 
-        // 1. Start mit einem Timeout-Mechanismus
-        let timeoutId = setTimeout(() => {
-            console.error("Directory initialization timed out");
+        const timeoutId = setTimeout(() => {
+            console.error('Directory initialization timed out');
             setIsLoading(false);
-            setError("Failed to initialize directory within the time limit");
+            setError('Failed to initialize directory within the time limit');
         }, 10000);
 
         try {
-            // 2. Versuche ein Standardverzeichnis zu bekommen
             const defaultDir = await getDefaultDirectory();
             console.log(`Got default directory: ${defaultDir}`);
 
-            // 3. Versuche das Verzeichnis zu laden
+            const reqBefore = loadRequestIdRef.current;
             const success = await loadDirectory(defaultDir);
 
-            if (!success) {
-                // 4. Wenn der erste Versuch fehlschlägt, versuche absolute Fallback-Pfade
-                console.warn("First directory load failed, trying fallbacks...");
+            if (!success && loadRequestIdRef.current === reqBefore + 1) {
+                console.warn('First directory load failed, trying fallbacks...');
                 const fallbacks = ['/', 'C:\\', '/tmp'];
-                //const fallbacks = ['C:\\', '/Users', '/home'];
 
                 for (const fallback of fallbacks) {
                     if (fallback !== defaultDir) {
+                        const fallbackReqBefore = loadRequestIdRef.current;
                         console.log(`Trying fallback directory: ${fallback}`);
                         if (await loadDirectory(fallback)) {
                             console.log(`Successfully loaded fallback directory: ${fallback}`);
+                            break;
+                        }
+                        if (loadRequestIdRef.current !== fallbackReqBefore + 1) {
                             break;
                         }
                     }
@@ -298,22 +297,19 @@ export default function FileSystemProvider({ children }) {
             console.error('Failed to initialize directory:', err);
             setError('Failed to load any directory. Please check file system permissions.');
         } finally {
-            // Cleanup Timeout und stelle sicher, dass der Ladezustand beendet wird
+            initInFlightRef.current = false;
             clearTimeout(timeoutId);
             setIsLoading(false);
         }
     }, [getDefaultDirectory, loadDirectory]);
 
-// Rufe initializeFirstDirectory nur einmal beim Laden auf
+    // Initialize only when no directory or restored history path exists
     useEffect(() => {
-        // Nur initialisieren, wenn noch kein Verzeichnis geladen wurde
-        if (!currentDirData && !currentPath) {
-            console.log("No directory data or current path, initializing first directory...");
+        if (!rawDirData && !currentPath) {
+            console.log('No directory data or current path, initializing first directory...');
             initializeFirstDirectory();
-        } else {
-            console.log("Directory already loaded or path set, skipping initialization");
         }
-    }, [initializeFirstDirectory, currentDirData, currentPath]);
+    }, [initializeFirstDirectory, rawDirData, currentPath]);
 
     const currentPathRef = useRef(currentPath);
     useEffect(() => {
@@ -335,11 +331,12 @@ export default function FileSystemProvider({ children }) {
         autoRefreshRef.current = settings.auto_refresh_dir !== false;
     }, [settings.auto_refresh_dir]);
 
-    // Live directory update via file watcher
+    // Live directory update via file watcher (StrictMode-safe cleanup)
     useEffect(() => {
         let isMounted = true;
         let unlisten = null;
         let debounceTimer = null;
+        const mountToken = ++activeMountTokenRef.current;
 
         const setupWatcher = async () => {
             try {
@@ -372,7 +369,13 @@ export default function FileSystemProvider({ children }) {
             isMounted = false;
             if (debounceTimer) clearTimeout(debounceTimer);
             if (unlisten) unlisten();
-            invoke('unwatch_directory').catch(() => {});
+            // Defer unwatch so React 19 StrictMode synchronous remount increments activeMountTokenRef first
+            setTimeout(() => {
+                if (activeMountTokenRef.current === mountToken && watchedPathRef.current) {
+                    watchedPathRef.current = null;
+                    invoke('unwatch_directory').catch(() => {});
+                }
+            }, 0);
         };
     }, []);
 
@@ -382,10 +385,8 @@ export default function FileSystemProvider({ children }) {
 
         try {
             if (isSftpPath(filePath)) {
-                // Download and open SFTP file with default application
                 await downloadAndOpenSftpFile(filePath);
             } else {
-                // Open local file with default application
                 await invoke('open_in_default_app', { path: filePath });
             }
         } catch (err) {
@@ -413,19 +414,20 @@ export default function FileSystemProvider({ children }) {
                     folderPathAbs: folderPath,
                     fileName: fileName
                 });
-                await loadDirectory(folderPath);
+                if (!currentPath || isSameDirectoryPath(folderPath, currentPath)) {
+                    await loadDirectory(folderPath);
+                }
                 return true;
             }
         } catch (err) {
             console.error(`Failed to create file: ${fileName}`, err);
             const msg = formatErrorMessage(err);
             setError(`Failed to create file: ${msg}`);
-            showError(`Failed to create file: ${msg}`);
-            return false;
+            throw new Error(msg);
         } finally {
             setIsLoading(false);
         }
-    }, [loadDirectory, isSftpPath, createSftpFile]);
+    }, [loadDirectory, isSftpPath, createSftpFile, currentPath]);
 
     // Create a new directory - enhanced with SFTP support
     const createDirectory = useCallback(async (folderPath, directoryName) => {
@@ -444,19 +446,20 @@ export default function FileSystemProvider({ children }) {
                     folderPathAbs: folderPath,
                     folderName: directoryName
                 });
-                await loadDirectory(folderPath);
+                if (!currentPath || isSameDirectoryPath(folderPath, currentPath)) {
+                    await loadDirectory(folderPath);
+                }
                 return true;
             }
         } catch (err) {
             console.error(`Failed to create directory: ${directoryName}`, err);
             const msg = formatErrorMessage(err);
             setError(`Failed to create directory: ${msg}`);
-            showError(`Failed to create directory: ${msg}`);
-            return false;
+            throw new Error(msg);
         } finally {
             setIsLoading(false);
         }
-    }, [loadDirectory, isSftpPath, createSftpDirectory]);
+    }, [loadDirectory, isSftpPath, createSftpDirectory, currentPath]);
 
     // Rename an item - enhanced with SFTP support
     const renameItem = useCallback(async (oldPath, newPath) => {
@@ -471,29 +474,32 @@ export default function FileSystemProvider({ children }) {
                 const newName = pathParts[pathParts.length - 1];
                 const success = await renameSftpItem(oldPath, newName);
                 if (success && currentPath) {
-                    // For SFTP paths, reload the current directory instead of trying to extract parent path
                     await loadDirectory(currentPath);
                 }
                 return success;
             } else {
                 await invoke('rename', { oldPath, newPath });
                 const dirPath = getDirectoryPath(oldPath);
-                await loadDirectory(dirPath);
+                if (currentPath && isSameDirectoryPath(dirPath, currentPath)) {
+                    await loadDirectory(currentPath);
+                } else if (!currentPath && dirPath) {
+                    await loadDirectory(dirPath);
+                }
                 return true;
             }
         } catch (err) {
             console.error(`Failed to rename item: ${oldPath}`, err);
             const msg = formatErrorMessage(err);
             setError(`Failed to rename item: ${msg}`);
-            showError(`Failed to rename item: ${msg}`);
-            return false;
+            throw new Error(msg);
         } finally {
             setIsLoading(false);
         }
     }, [loadDirectory, isSftpPath, renameSftpItem, currentPath]);
 
-    // Move item to trash - enhanced with SFTP support
-    const moveToTrash = useCallback(async (path) => {
+    // Move item to trash - enhanced with SFTP support and optional skipReload for batch deletes
+    const moveToTrash = useCallback(async (path, options = {}) => {
+        const skipReload = Boolean(options?.skipReload);
         setIsLoading(true);
         setError(null);
 
@@ -501,20 +507,23 @@ export default function FileSystemProvider({ children }) {
             if (isSftpPath(path)) {
                 const success = await deleteSftpItem(path);
                 if (success) {
-                    // For SFTP paths, reload the current directory instead of trying to extract parent path
-                    if (currentPath) {
+                    if (!skipReload && currentPath) {
                         await loadDirectory(currentPath);
                     }
-                    // Clear selection if the deleted item was selected
-                    setSelectedItems(prev => prev.filter(item => !item.path.startsWith(path)));
+                    setSelectedItems(prev => prev.filter(item => !isPathOrDescendant(item.path, path)));
                 }
                 return success;
             } else {
                 await invoke('move_to_trash', { path });
                 const dirPath = getDirectoryPath(path);
-                await loadDirectory(dirPath);
-                // Clear selection if the deleted item was selected
-                setSelectedItems(prev => prev.filter(item => !item.path.startsWith(path)));
+                if (!skipReload) {
+                    if (currentPath && isSameDirectoryPath(dirPath, currentPath)) {
+                        await loadDirectory(currentPath);
+                    } else if (!currentPath && dirPath) {
+                        await loadDirectory(dirPath);
+                    }
+                }
+                setSelectedItems(prev => prev.filter(item => !isPathOrDescendant(item.path, path)));
                 return true;
             }
         } catch (err) {
@@ -539,7 +548,6 @@ export default function FileSystemProvider({ children }) {
                 destinationPath
             });
 
-            // Reload current directory to show the new zip file
             if (currentPath) {
                 await loadDirectory(currentPath);
             }
@@ -566,7 +574,6 @@ export default function FileSystemProvider({ children }) {
                 destinationPath
             });
 
-            // Reload current directory to show the extracted files
             if (currentPath) {
                 await loadDirectory(currentPath);
             }
@@ -585,18 +592,15 @@ export default function FileSystemProvider({ children }) {
     // Select an item
     const selectItem = useCallback((item, isMultiSelect = false) => {
         setSelectedItems(prevSelected => {
-            // Check if the item is already selected
             const isAlreadySelected = prevSelected.some(
                 selected => selected.path === item.path
             );
 
             if (isAlreadySelected) {
-                // If multi-select, toggle selection
                 return isMultiSelect
                     ? prevSelected.filter(selected => selected.path !== item.path)
-                    : [item]; // Otherwise, make it the only selection
+                    : [item];
             } else {
-                // Add to selection for multi-select, replace for single select
                 return isMultiSelect ? [...prevSelected, item] : [item];
             }
         });
@@ -623,7 +627,7 @@ export default function FileSystemProvider({ children }) {
         loadVolumes();
     }, [loadVolumes]);
 
-    // Listen for open-path requests from single-instance launches (e.g. user opens a folder from Windows)
+    // Listen for open-path requests from single-instance launches
     useEffect(() => {
         let isMounted = true;
         let unlisten = null;
@@ -647,23 +651,17 @@ export default function FileSystemProvider({ children }) {
         };
     }, [loadDirectory]);
 
-    // Reload current directory when navigating back/forward
+    // Reload current directory when navigating back/forward or restoring from sessionStorage
     useEffect(() => {
         if (currentPath && lastLoadedPathRef.current !== currentPath) {
-            loadDirectory(currentPath);
+            const targetPath = currentPath;
+            loadDirectory(targetPath).then((ok) => {
+                if (!ok && lastLoadedPathRef.current && currentPathRef.current === targetPath) {
+                    revertToPath(lastLoadedPathRef.current);
+                }
+            });
         }
-    }, [currentPath, loadDirectory]);
-
-    // Reload current directory when hidden files setting changes
-    useEffect(() => {
-        if (!hasMountedHiddenRef.current) {
-            hasMountedHiddenRef.current = true;
-            return;
-        }
-        if (currentPath) {
-            loadDirectory(currentPath, { silent: true });
-        }
-    }, [settings.show_hidden_files_and_folders, currentPath, loadDirectory]);
+    }, [currentPath, loadDirectory, revertToPath]);
 
     const contextValue = {
         currentDirData,
@@ -695,4 +693,10 @@ export default function FileSystemProvider({ children }) {
 }
 
 // Custom hook for using the file system context
-export const useFileSystem = () => useContext(FileSystemContext);
+export const useFileSystem = () => {
+    const context = useContext(FileSystemContext);
+    if (!context) {
+        throw new Error('useFileSystem must be used within a FileSystemProvider');
+    }
+    return context;
+};

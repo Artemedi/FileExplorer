@@ -36,7 +36,19 @@ export const isRangeSelectKey = (event) => {
  * // Later, to clean up
  * cleanup();
  */
+const normalizeCombo = (combo) => {
+    const parts = String(combo || '').split('+');
+    const key = parts.pop();
+    const normalizedKey = key && key.length === 1 ? key.toLowerCase() : key;
+    return [...parts, normalizedKey].join('+');
+};
+
 export const registerShortcuts = (handlers) => {
+    const normalizedHandlers = Object.entries(handlers || {}).reduce((acc, [combo, handler]) => {
+        acc[normalizeCombo(combo)] = handler;
+        return acc;
+    }, {});
+
     const handleKeyDown = (event) => {
         // Build the key combination string
         let combo = '';
@@ -49,10 +61,11 @@ export const registerShortcuts = (handlers) => {
         // Add the key itself
         combo += event.key;
 
-        // Check if we have a handler for this combination
-        if (handlers[combo]) {
+        // Check if we have a handler for this combination (exact or normalized case)
+        const handler = handlers?.[combo] || normalizedHandlers[normalizeCombo(combo)];
+        if (handler) {
             event.preventDefault();
-            handlers[combo](event);
+            handler(event);
         }
     };
 
@@ -167,6 +180,10 @@ export const handleNavigation = (event, items, currentIndex, options = {}) => {
 
         default:
             return currentIndex;
+    }
+
+    if (currentIndex < 0) {
+        return 0;
     }
 
     // Apply wraparound if enabled

@@ -16,23 +16,48 @@ export const formatFileSize = (bytes: number, decimals: number = 1): string => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 };
 
+const normalizeUtcTimestamp = (dateString: string): string => {
+    const trimmed = dateString.trim();
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(trimmed)) {
+        return `${trimmed.replace(' ', 'T')}Z`;
+    }
+    return trimmed;
+};
+
+const getActiveLocale = (overrideLocale?: string): string => {
+    if (overrideLocale) return overrideLocale;
+    const docLang = typeof document !== 'undefined' ? document.documentElement?.lang : '';
+    let storedLang = '';
+    try {
+        storedLang = typeof localStorage !== 'undefined' ? (localStorage.getItem('explr_language') || '') : '';
+    } catch {
+        storedLang = '';
+    }
+    const lang = docLang || storedLang || (typeof navigator !== 'undefined' ? navigator.language : '') || 'en-US';
+    if (lang === 'ru') return 'ru-RU';
+    if (lang === 'en') return 'en-US';
+    return lang;
+};
+
 /**
  * Format a date string to a human-readable format.
  * @param dateString - The date string to format.
  * @param includeTime - Whether to include the time.
+ * @param locale - Optional BCP 47 locale override.
  * @returns The formatted date.
  */
-export const formatDate = (dateString?: string | null, includeTime: boolean = false): string => {
+export const formatDate = (dateString?: string | null, includeTime: boolean = false, locale?: string): string => {
     if (!dateString) return 'Unknown';
 
     try {
-        const date = new Date(dateString);
+        const date = new Date(normalizeUtcTimestamp(dateString));
 
         // Check if the date is valid
         if (isNaN(date.getTime())) {
             return 'Invalid date';
         }
 
+        const activeLocale = getActiveLocale(locale);
         const options: Intl.DateTimeFormatOptions = {
             year: 'numeric',
             month: 'short',
@@ -42,10 +67,12 @@ export const formatDate = (dateString?: string | null, includeTime: boolean = fa
         if (includeTime) {
             options.hour = '2-digit';
             options.minute = '2-digit';
-            options.hour12 = true;
+            if (activeLocale.startsWith('en-US')) {
+                options.hour12 = true;
+            }
         }
 
-        return new Intl.DateTimeFormat('en-US', options).format(date);
+        return new Intl.DateTimeFormat(activeLocale, options).format(date);
     } catch (error) {
         console.error('Error formatting date:', error);
         return 'Invalid date';
@@ -167,7 +194,7 @@ export const calculateTimeElapsed = (dateString?: string | null): string => {
     if (!dateString) return 'Unknown';
 
     try {
-        const date = new Date(dateString);
+        const date = new Date(normalizeUtcTimestamp(dateString));
         const now = new Date();
 
         // Check if the date is valid
@@ -220,8 +247,11 @@ export const formatErrorMessage = (err: unknown): string => {
     if (typeof err === 'string') {
         try {
             const parsed = JSON.parse(err);
-            if (parsed && (parsed.custom_message || parsed.message)) {
-                return parsed.custom_message || parsed.message;
+            if (parsed && typeof parsed === 'object') {
+                const msg = (typeof parsed.custom_message === 'string' && parsed.custom_message.trim())
+                    || (typeof parsed.message === 'string' && parsed.message.trim())
+                    || (typeof parsed.message_from_code === 'string' && parsed.message_from_code.trim());
+                if (msg) return msg;
             }
         } catch {
             const jsonStart = err.indexOf('{"');
@@ -230,10 +260,14 @@ export const formatErrorMessage = (err: unknown): string => {
                 try {
                     const jsonStr = err.substring(jsonStart, jsonEnd + 1);
                     const parsed = JSON.parse(jsonStr);
-                    if (parsed && (parsed.custom_message || parsed.message)) {
-                        const prefix = err.substring(0, jsonStart).trim();
-                        const msg = parsed.custom_message || parsed.message;
-                        return prefix ? `${prefix} ${msg}` : msg;
+                    if (parsed && typeof parsed === 'object') {
+                        const msg = (typeof parsed.custom_message === 'string' && parsed.custom_message.trim())
+                            || (typeof parsed.message === 'string' && parsed.message.trim())
+                            || (typeof parsed.message_from_code === 'string' && parsed.message_from_code.trim());
+                        if (msg) {
+                            const prefix = err.substring(0, jsonStart).trim();
+                            return prefix ? `${prefix} ${msg}` : msg;
+                        }
                     }
                 } catch {
                     // Ignore parse error and fall back to raw string
@@ -241,11 +275,13 @@ export const formatErrorMessage = (err: unknown): string => {
             }
             return err;
         }
+        return err;
     }
     if (typeof err === 'object' && err !== null) {
         const obj = err as Record<string, unknown>;
-        if (typeof obj.custom_message === 'string') return obj.custom_message;
-        if (typeof obj.message === 'string') return obj.message;
+        if (typeof obj.custom_message === 'string' && obj.custom_message.trim()) return obj.custom_message;
+        if (typeof obj.message === 'string') return formatErrorMessage(obj.message);
+        if (typeof obj.message_from_code === 'string' && obj.message_from_code.trim()) return obj.message_from_code;
     }
     return String(err);
 };

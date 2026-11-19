@@ -1,6 +1,8 @@
 import { useCallback } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useHistory } from '../providers/HistoryProvider';
 import { useFileSystem } from '../providers/FileSystemProvider';
+import { getDirectoryPath, isRootPath } from '../utils/pathUtils';
 
 /**
  * Hook for handling navigation within the file explorer.
@@ -16,60 +18,52 @@ const useNavigation = () => {
         navigateTo
     } = useHistory();
 
-    const { loadDirectory } = useFileSystem();
+    const { loadDirectory, volumes } = useFileSystem();
 
-    // Navigate to a specific path
-    const navigateToPath = useCallback((path) => {
-        if (path === currentPath) return;
+    // Navigate to a specific path (only record in history when load succeeds)
+    const navigateToPath = useCallback(async (path) => {
+        if (!path || path === currentPath) return false;
 
-        loadDirectory(path)
-            .then(() => navigateTo(path))
-            .catch(error => {
-                console.error(`Failed to navigate to path: ${path}`, error);
-            });
+        try {
+            const ok = await loadDirectory(path);
+            if (ok) {
+                navigateTo(path);
+                return true;
+            }
+            return false;
+        } catch (error) {
+            console.error(`Failed to navigate to path: ${path}`, error);
+            return false;
+        }
     }, [currentPath, loadDirectory, navigateTo]);
 
     // Navigate to parent directory
     const navigateToParent = useCallback(() => {
-        if (!currentPath) return;
+        if (!currentPath || isRootPath(currentPath)) return;
 
-        // For Windows paths (e.g., C:\path\to\folder)
-        if (currentPath.includes(':\\')) {
-            // If at root of drive (e.g., C:\), don't navigate up
-            if (currentPath.match(/^[A-Z]:\\$/)) {
-                return;
-            }
-
-            const parentPath = currentPath.substring(0, currentPath.lastIndexOf('\\'));
-            // If at drive letter, add trailing slash (e.g., C:\ instead of C:)
-            const fixedParentPath = parentPath.match(/^[A-Z]:$/)
-                ? `${parentPath}\\`
-                : parentPath;
-
-            navigateToPath(fixedParentPath);
-        }
-        // For Unix paths (e.g., /path/to/folder)
-        else {
-            // If at root directory, don't navigate up
-            if (currentPath === '/') {
-                return;
-            }
-
-            const parentPath = currentPath.substring(0, currentPath.lastIndexOf('/'));
-            // If empty string, we were in a first-level directory, navigate to root
-            const fixedParentPath = parentPath || '/';
-
-            navigateToPath(fixedParentPath);
+        const parentPath = getDirectoryPath(currentPath);
+        if (parentPath && parentPath !== currentPath) {
+            navigateToPath(parentPath);
         }
     }, [currentPath, navigateToPath]);
 
     // Navigate to home directory
-    const navigateToHome = useCallback(() => {
-        // This would typically depend on the OS
-        // For demo purposes, we'll use a placeholder
-        const homePath = '/home/user';
-        navigateToPath(homePath);
-    }, [navigateToPath]);
+    const navigateToHome = useCallback(async () => {
+        try {
+            const metaDataJson = await invoke('get_meta_data_as_json');
+            const metaData = JSON.parse(metaDataJson);
+            const homePath = metaData?.user_home_dir;
+            if (homePath) {
+                await navigateToPath(homePath);
+                return;
+            }
+        } catch (error) {
+            console.warn('Failed to retrieve user home directory:', error);
+        }
+
+        const fallback = volumes?.[0]?.mount_point || '/';
+        await navigateToPath(fallback);
+    }, [navigateToPath, volumes]);
 
     // Refresh current directory
     const refreshCurrentDirectory = useCallback(() => {
@@ -86,56 +80,132 @@ const useNavigation = () => {
         if (!path) return [];
 
         const segments = [];
-        let currentSegment = '';
 
-        // Handle Windows paths
-        if (path.includes(':\\')) {
-            const parts = path.split('\\');
+        // Handle SFTP URLs: sftp://user@host:port/a/b
+        if (path.startsWith('sftp://')) {
+            const schemeEnd = 'sftp://'.length;
+            const firstSlash = path.indexOf('/', schemeEnd);
+            const authority = firstSlash === -1 ? path.slice(schemeEnd) : path.slice(schemeEnd, firstSlash);
+            const rootPath = `sftp://${authority}/`;
+            segments.push({
+                name: authority,
+                path: rootPath,
+                type: 'sftp',
+            });
 
-            // Add the drive letter (e.g., C:)
+            if (firstSlash !== -1) {
+                const rest = path.slice(firstSlash + 1).split('/').filter(Boolean);
+                let acc = `sftp://${authority}`;
+                for (const part of rest) {
+                    acc += `/${part}`;
+                    segments.push({
+                        name: part,
+                        path: acc,
+                        type: 'folder',
+                    });
+                }
+            }
+            return segments;
+        }
+
+        // Handle SFTP custom format: sftp:conn:a/b
+        if (path.startsWith('sftp:')) {
+            const firstColon = path.indexOf(':');
+            const secondColon = path.indexOf(':', firstColon + 1);
+            if (secondColon !== -1) {
+                const prefix = path.substring(0, secondColon + 1);
+                const connName = path.substring(firstColon + 1, secondColon);
+                const remote = path.substring(secondColon + 1);
+                segments.push({
+                    name: connName || 'SFTP',
+                    path: `${prefix}/`,
+                    type: 'sftp',
+                });
+                const parts = remote.split('/').filter(Boolean);
+                let acc = remote.startsWith('/') ? '' : '';
+                for (const part of parts) {
+                    if (part === '.') continue;
+                    acc = acc ? `${acc}/${part}` : (remote.startsWith('/') ? `/${part}` : part);
+                    segments.push({
+                        name: part,
+                        path: `${prefix}${acc}`,
+                        type: 'folder',
+                    });
+                }
+                return segments;
+            }
+        }
+
+        // Handle UNC paths: \\server\share\dir
+        if (path.startsWith('\\\\')) {
+            const parts = path.slice(2).split(/[/\\]+/).filter(Boolean);
+            if (parts.length >= 2) {
+                const shareRoot = `\\\\${parts[0]}\\${parts[1]}`;
+                segments.push({
+                    name: shareRoot,
+                    path: shareRoot,
+                    type: 'drive',
+                });
+                let acc = shareRoot;
+                for (let i = 2; i < parts.length; i++) {
+                    acc += `\\${parts[i]}`;
+                    segments.push({
+                        name: parts[i],
+                        path: acc,
+                        type: 'folder',
+                    });
+                }
+                return segments;
+            }
+        }
+
+        // Handle Windows drive paths (case-insensitive, \ or /): C:\path\to\folder or c:/path
+        if (/^[A-Za-z]:[/\\]?/.test(path)) {
+            const sep = path.includes('\\') ? '\\' : '/';
+            const parts = path.split(/[/\\]+/).filter(Boolean);
+            if (parts.length === 0) return segments;
+
+            const driveRoot = `${parts[0]}${sep}`;
             segments.push({
                 name: parts[0],
-                path: parts[0] + '\\',
+                path: driveRoot,
                 type: 'drive',
             });
 
-            // Add the rest of the path
+            let acc = parts[0];
             for (let i = 1; i < parts.length; i++) {
-                if (!parts[i]) continue;
-
-                currentSegment += '\\' + parts[i];
+                acc += `${sep}${parts[i]}`;
                 segments.push({
                     name: parts[i],
-                    path: parts[0] + currentSegment,
+                    path: acc,
                     type: 'folder',
                 });
             }
+            return segments;
         }
+
         // Handle Unix paths
-        else {
-            const parts = path.split('/');
+        const parts = path.split('/');
+        let currentSegment = '';
 
-            // Handle root directory
-            if (parts[0] === '') {
-                segments.push({
-                    name: '/',
-                    path: '/',
-                    type: 'root',
-                });
-                parts.shift(); // Remove empty string from beginning
-            }
+        if (parts[0] === '') {
+            segments.push({
+                name: '/',
+                path: '/',
+                type: 'root',
+            });
+            parts.shift();
+        }
 
-            // Add the rest of the path
-            for (let i = 0; i < parts.length; i++) {
-                if (!parts[i]) continue;
+        for (let i = 0; i < parts.length; i++) {
+            if (!parts[i]) continue;
 
-                currentSegment += '/' + parts[i];
-                segments.push({
-                    name: parts[i],
-                    path: currentSegment,
-                    type: 'folder',
-                });
-            }
+            currentSegment += '/' + parts[i];
+            segments.push({
+                name: parts[i],
+                path: currentSegment,
+                type: 'folder',
+            });
         }
 
         return segments;

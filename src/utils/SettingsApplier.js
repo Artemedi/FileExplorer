@@ -29,9 +29,14 @@ const SettingsApplier = () => {
             effectiveAccent = '#0672ef';
         }
 
-        // Convert hex to RGB for CSS variables that need RGB values
+        // Convert 3-digit or 6-digit hex to RGB for CSS variables that need RGB values
         const hexToRgb = (hex) => {
-            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            if (typeof hex !== 'string') return null;
+            const clean = hex.trim().replace(/^#/, '');
+            const full = clean.length === 3
+                ? clean.split('').map(c => c + c).join('')
+                : clean;
+            const result = /^([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(full);
             return result ? {
                 r: parseInt(result[1], 16),
                 g: parseInt(result[2], 16),
@@ -59,16 +64,19 @@ const SettingsApplier = () => {
             document.documentElement.style.setProperty('--light-accent-surface', lighterAccent);
             document.documentElement.style.setProperty('--dark-accent-surface', darkAccentSurface);
 
-            // Update RGB values for transparency effects
-            document.documentElement.style.setProperty('--accent-rgb', `${rgb.r}, ${rgb.g}, ${rgb.b}`);
-
             // Apply to current theme
-            const isDark = document.documentElement.classList.contains('theme-dark') || 
-                           (!document.documentElement.classList.contains('theme-light') && window.matchMedia('(prefers-color-scheme: dark)').matches);
+            const isDark = document.documentElement.classList.contains('theme-dark') ||
+                           (!document.documentElement.classList.contains('theme-light') &&
+                            typeof window !== 'undefined' &&
+                            window.matchMedia &&
+                            window.matchMedia('(prefers-color-scheme: dark)').matches);
             const currentAccent = isDark ? darkAccent : effectiveAccent;
             const currentHover = isDark ? darkAccentHover : darkerAccent;
             const currentSurface = isDark ? darkAccentSurface : lighterAccent;
+            const currentRgb = hexToRgb(currentAccent) || rgb;
 
+            // Update RGB values for transparency effects matching the active theme's accent
+            document.documentElement.style.setProperty('--accent-rgb', `${currentRgb.r}, ${currentRgb.g}, ${currentRgb.b}`);
             document.documentElement.style.setProperty('--accent', currentAccent);
             document.documentElement.style.setProperty('--accent-hover', currentHover);
             document.documentElement.style.setProperty('--accent-surface', currentSurface);
@@ -93,7 +101,7 @@ const SettingsApplier = () => {
             terminal_height: settings.terminal_height
         });
 
-    }, [settings.font_size, settings.accent_color, settings.enable_animations_and_transitions, settings.terminal_height]);
+    }, [settings.darkmode, settings.font_size, settings.accent_color, settings.enable_animations_and_transitions, settings.terminal_height]);
 
     // This component doesn't render anything
     return null;

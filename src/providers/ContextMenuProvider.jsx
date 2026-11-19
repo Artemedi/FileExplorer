@@ -4,18 +4,21 @@ import { useFileSystem } from './FileSystemProvider';
 import { useHistory } from './HistoryProvider';
 import { useSftp } from './SftpProvider';
 import { useSettings } from './SettingsProvider';
-import { getDirectoryPath, getFileName, joinPath } from '../utils/pathUtils';
+import { getDirectoryPath, getFileName, joinPath, normalizePath, isRootPath } from '../utils/pathUtils';
 import { showNotification, showError, showSuccess, showConfirm } from '../utils/NotificationSystem';
 
-export const ContextMenuContext = createContext({
-    isOpen: false,
-    position: { x: 0, y: 0 },
-    target: null,
-    items: [],
-    openContextMenu: () => {},
-    closeContextMenu: () => {},
-    clipboard: { items: [], operation: null }, // 'copy' or 'cut'
-});
+export const ContextMenuContext = createContext(null);
+
+const isSameDirectoryPath = (a, b) => {
+    if (!a || !b) return false;
+    const normA = normalizePath(a);
+    const normB = normalizePath(b);
+    if (normA === normB) return true;
+    if (/^[A-Za-z]:[/\\]/.test(normA) || normA.startsWith('\\\\')) {
+        return normA.toLowerCase() === normB.toLowerCase();
+    }
+    return false;
+};
 
 export default function ContextMenuProvider({ children }) {
     const [isOpen, setIsOpen] = useState(false);
@@ -175,7 +178,7 @@ export default function ContextMenuProvider({ children }) {
         } finally {
             setIsProcessing(false);
         }
-    }, [isSftpPath]);
+    }, [isSftpPath, downloadAndOpenSftpFile]);
 
     // Copy items to clipboard
     const copyToClipboard = useCallback(async (items) => {
@@ -256,6 +259,9 @@ export default function ContextMenuProvider({ children }) {
         if (!clipboard.items.length || !destRoot) return;
 
         setIsProcessing(true);
+        const remainingCutItems = [];
+        let anySucceeded = false;
+
         try {
             for (const item of clipboard.items) {
                 const fileName = item.name || getFileName(item.path);
@@ -268,60 +274,72 @@ export default function ContextMenuProvider({ children }) {
                 if (clipboard.operation === 'cut') {
                     // For move operations, use original filename (no duplicates)
                     const destPath = joinPath(destRoot, fileName);
-                    
+
                     // Check if we're trying to paste in the same directory
                     const sourceDir = getDirectoryPath(sourcePath);
-                    const destDir = destRoot;
-                    
-                    if (sourceDir === destDir) {
+                    if (isSameDirectoryPath(sourceDir, destRoot)) {
+                        remainingCutItems.push(item);
                         continue;
                     }
-                    
+
                     // Move operation
                     if (sourceIsSftp || destIsSftp) {
                         if (sourceIsSftp && destIsSftp) {
-                            // SFTP to SFTP move
-                            await moveSftpItem(sourcePath, destPath);
+                            const moved = await moveSftpItem(sourcePath, destPath);
+                            if (moved) {
+                                anySucceeded = true;
+                            } else {
+                                remainingCutItems.push(item);
+                            }
                         } else {
                             showError('Moving between SFTP and local file systems is not yet supported');
-                            continue;
+                            remainingCutItems.push(item);
                         }
                     } else {
-                        // Local file system move
-                        await invoke('rename', {
-                            oldPath: sourcePath,
-                            newPath: destPath
-                        });
+                        try {
+                            await invoke('rename', {
+                                oldPath: sourcePath,
+                                newPath: destPath
+                            });
+                            anySucceeded = true;
+                        } catch (itemError) {
+                            console.error(`Failed to move ${sourcePath}:`, itemError);
+                            showError(`Failed to move "${fileName}": ${itemError.message || itemError}`);
+                            remainingCutItems.push(item);
+                        }
                     }
                 } else {
                     // Copy operation - generate unique destination path to allow duplicates
                     const destPath = await generateUniqueDestPath(destRoot, fileName);
-                    
+
                     if (sourceIsSftp || destIsSftp) {
                         if (sourceIsSftp && destIsSftp) {
-                            // SFTP to SFTP copy
-                            await copySftpItem(sourcePath, destPath);
+                            const copied = await copySftpItem(sourcePath, destPath);
+                            if (copied) anySucceeded = true;
                         } else {
                             showError('Copying between SFTP and local file systems is not yet supported');
-                            continue;
                         }
                     } else {
-                        // Local file system copy
                         await invoke('copy_file_or_dir', {
                             sourcePath: sourcePath,
                             destinationPath: destPath
                         });
+                        anySucceeded = true;
                     }
                 }
             }
 
-            // Clear clipboard if it was a cut operation
+            // For cut operations, only remove items that were actually moved
             if (clipboard.operation === 'cut') {
-                setClipboard({ items: [], operation: null });
+                if (remainingCutItems.length === 0) {
+                    setClipboard({ items: [], operation: null });
+                } else {
+                    setClipboard({ items: remainingCutItems, operation: 'cut' });
+                }
             }
 
-            // Reload directory
-            if (currentPath) {
+            // Reload directory if at least one item succeeded
+            if (anySucceeded && currentPath) {
                 await loadDirectory(currentPath);
             }
         } catch (error) {
@@ -332,7 +350,7 @@ export default function ContextMenuProvider({ children }) {
         }
     }, [clipboard, currentPath, loadDirectory, isSftpPath, copySftpItem, moveSftpItem, generateUniqueDestPath]);
 
-    // Delete items
+    // Delete items (batch without reloading on every item)
     const deleteItems = useCallback(async (items) => {
         if (!items.length) return;
 
@@ -347,9 +365,15 @@ export default function ContextMenuProvider({ children }) {
 
         setIsProcessing(true);
         try {
-            // Call moveToTrash for each item - it handles SFTP vs local paths and directory reload
+            let anyDeleted = false;
             for (const item of items) {
-                await moveToTrash(item.path);
+                const ok = await moveToTrash(item.path, { skipReload: true });
+                if (ok) {
+                    anyDeleted = true;
+                }
+            }
+            if (anyDeleted && currentPath) {
+                await loadDirectory(currentPath);
             }
         } catch (error) {
             console.error('Delete operation failed:', error);
@@ -357,7 +381,7 @@ export default function ContextMenuProvider({ children }) {
         } finally {
             setIsProcessing(false);
         }
-    }, [moveToTrash, settings?.confirm_delete]);
+    }, [moveToTrash, settings?.confirm_delete, currentPath, loadDirectory]);
 
     // Rename item - dispatch event to open rename modal
     const renameItem = useCallback((item) => {
@@ -388,18 +412,14 @@ export default function ContextMenuProvider({ children }) {
             const baseName = item.name;
             zipName = `${baseName}.zip`;
         } else {
-            // For multiple items, ask user for zip name
-            zipName = window.prompt('Enter name for the zip file:', 'archive.zip');
-            if (!zipName) return;
-            if (!zipName.endsWith('.zip')) {
-                zipName += '.zip';
-            }
+            // For multiple items, generate a unique archive name without blocking on window.prompt
+            const uniqueArchivePath = await generateUniqueDestPath(currentPath, 'archive.zip');
+            zipName = getFileName(uniqueArchivePath) || `archive_${Date.now()}.zip`;
         }
 
         if (isAllSftp) {
             // Handle SFTP items
-            destinationPath = `${currentPath}/${zipName}`;
-            const sftpDestinationPath = destinationPath;
+            destinationPath = joinPath(currentPath, zipName);
             
             setIsProcessing(true);
             try {
@@ -426,19 +446,16 @@ export default function ContextMenuProvider({ children }) {
                 
                 // Upload zip back to SFTP if current path is SFTP
                 if (isSftpPath(currentPath)) {
-                    // Parse current SFTP path to get connection details
                     const parsed = parseSftpPath(currentPath);
                     if (parsed && parsed.connection) {
-                        // Upload the zip file (we'd need an upload function in SFTP provider)
-                        // For now, we'll copy it to local temp and let user know
                         showSuccess(`ZIP created locally at: ${tempZipPath}. SFTP upload not yet implemented.`);
                     }
                 } else {
-                    // Copy zip to current local directory
                     await invoke('copy_file_or_dir', {
                         sourcePath: tempZipPath,
                         destinationPath: destinationPath
                     });
+                    await invoke('cleanup_sftp_temp_files').catch(() => {});
                     showSuccess(`Successfully created ${zipName}`);
                 }
                 
@@ -470,7 +487,7 @@ export default function ContextMenuProvider({ children }) {
                 setIsProcessing(false);
             }
         }
-    }, [currentPath, loadDirectory, isSftpPath, downloadAndOpenSftpFile, parseSftpPath]);
+    }, [currentPath, loadDirectory, isSftpPath, downloadAndOpenSftpFile, parseSftpPath, generateUniqueDestPath]);
 
     // Unzip item
     const unzipItem = useCallback(async (item) => {
@@ -672,12 +689,30 @@ export default function ContextMenuProvider({ children }) {
     const getCurrentFolderMetadata = useCallback(async (folderPath) => {
         if (!folderPath) return null;
 
+        const folderName = getFileName(folderPath) || folderPath;
+
+        if (isRootPath(folderPath) || isSftpPath(folderPath)) {
+            return {
+                name: folderName || 'Root',
+                path: folderPath,
+                isDirectory: true,
+                sub_file_count: 0,
+                sub_dir_count: 0,
+                is_symlink: false,
+                access_rights_as_string: 'rwxr-xr-x',
+                access_rights_as_number: 16877,
+                size_in_bytes: 0,
+                created: new Date().toISOString().replace('T', ' ').split('.')[0],
+                last_modified: new Date().toISOString().replace('T', ' ').split('.')[0],
+                accessed: new Date().toISOString().replace('T', ' ').split('.')[0]
+            };
+        }
+
         try {
-            // Get parent directory path
-            const separator = folderPath.includes('\\') ? '\\' : '/';
-            const pathParts = folderPath.split(separator);
-            const folderName = pathParts.pop();
-            const parentPath = pathParts.join(separator) || separator;
+            const parentPath = getDirectoryPath(folderPath);
+            if (!parentPath || parentPath === folderPath) {
+                return null;
+            }
 
             // Load parent directory to get metadata for current folder
             const parentContent = await invoke('open_directory', { path: parentPath });
@@ -690,7 +725,6 @@ export default function ContextMenuProvider({ children }) {
                 return currentFolderMeta;
             }
 
-            // If not found in directories, create a basic folder object
             return {
                 name: folderName || 'Root',
                 path: folderPath,
@@ -708,10 +742,8 @@ export default function ContextMenuProvider({ children }) {
         } catch (error) {
             console.error('Failed to get folder metadata:', error);
 
-            // Return a basic folder object as fallback
-            const folderName = folderPath.split(/[/\\]/).pop() || 'Root';
             return {
-                name: folderName,
+                name: folderName || 'Root',
                 path: folderPath,
                 isDirectory: true,
                 sub_file_count: 0,
@@ -725,21 +757,18 @@ export default function ContextMenuProvider({ children }) {
                 accessed: new Date().toISOString().replace('T', ' ').split('.')[0]
             };
         }
-    }, []);
+    }, [isSftpPath]);
 
     // Show properties - dispatch event to open details panel
     const showProperties = useCallback(async (item) => {
-        // If it's a folder path (string), get real metadata
-        if (typeof item === 'string' || (item && !item.size_in_bytes && !item.sub_file_count)) {
-            const folderPath = typeof item === 'string' ? item : item.path;
+        // Only resolve folder metadata when item is a folder path string (never for 0-byte files or empty folders)
+        if (typeof item === 'string') {
             try {
-                const folderMetadata = await getCurrentFolderMetadata(folderPath);
+                const folderMetadata = await getCurrentFolderMetadata(item);
                 if (folderMetadata) {
-                    // First, select the item with real metadata
                     document.dispatchEvent(new CustomEvent('select-item', {
                         detail: { item: folderMetadata }
                     }));
-                    // Then show properties
                     document.dispatchEvent(new CustomEvent('show-properties', {
                         detail: { item: folderMetadata }
                     }));
@@ -750,12 +779,10 @@ export default function ContextMenuProvider({ children }) {
             }
         }
 
-        // Fallback to original item
-        // First, select the item
+        // Dispatch original item
         document.dispatchEvent(new CustomEvent('select-item', {
             detail: { item }
         }));
-        // Then show properties
         document.dispatchEvent(new CustomEvent('show-properties', {
             detail: { item }
         }));
@@ -766,7 +793,7 @@ export default function ContextMenuProvider({ children }) {
         const isDirectory = contextTarget && (contextTarget.isDirectory || ('sub_file_count' in contextTarget));
         const isFile = contextTarget && !isDirectory;
         const hasClipboard = clipboard.items.length > 0;
-        const isZipFile = contextTarget && contextTarget.name.toLowerCase().endsWith('.zip');
+        const isZipFile = Boolean(contextTarget && !isDirectory && contextTarget.name?.toLowerCase().endsWith('.zip'));
         const effectiveSelectedItems = Array.isArray(overrideSelectedItems) ? overrideSelectedItems : selectedItems;
         const selectionCount = contextTarget ? (effectiveSelectedItems.length || 1) : 0;
 
@@ -917,7 +944,7 @@ export default function ContextMenuProvider({ children }) {
                     action: () => unzipItem(contextTarget)
                 }
             );
-        } else if (!isZipFile) {
+        } else {
             menuItems.push(
                 { type: 'separator' },
                 {
@@ -1054,4 +1081,10 @@ export default function ContextMenuProvider({ children }) {
     );
 }
 
-export const useContextMenu = () => useContext(ContextMenuContext);
+export const useContextMenu = () => {
+    const context = useContext(ContextMenuContext);
+    if (!context) {
+        throw new Error('useContextMenu must be used within a ContextMenuProvider');
+    }
+    return context;
+};
