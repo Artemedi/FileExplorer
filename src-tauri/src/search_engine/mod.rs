@@ -7,8 +7,10 @@ pub mod search_core;
 #[cfg(test)]
 pub mod test_generate_test_data {
     use crate::log_info;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+
+    static TEST_DATA_GEN_LOCK: Mutex<()> = Mutex::new(());
 
     /// Generates a test data directory structure with random folder and file names.
     /// This function creates a hierarchical directory structure with random file and folder names
@@ -35,23 +37,32 @@ pub mod test_generate_test_data {
     /// ```
     #[allow(dead_code)]
     pub fn generate_test_data(base_path: PathBuf) -> Result<PathBuf, std::io::Error> {
+        let _guard = TEST_DATA_GEN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generate_test_data_locked(&base_path, 20, 20, 3, true)?;
+        Ok(base_path)
+    }
+
+    fn generate_test_data_locked(
+        base_path: &Path,
+        folders_per_level: usize,
+        files_per_folder: usize,
+        max_depth: usize,
+        clean_existing: bool,
+    ) -> Result<(), std::io::Error> {
         use rand::{thread_rng, Rng};
         use std::fs::{create_dir_all, File};
         use std::time::Instant;
 
-        // Constants for the directory structure
-        const FOLDERS_PER_LEVEL: usize = 20;
-        const FILES_PER_FOLDER: usize = 20;
-        const MAX_DEPTH: usize = 3;
-
-        // Remove the directory if it already exists
-        if base_path.exists() {
+        // Remove the directory if it already exists when requested
+        if clean_existing && base_path.exists() {
             log_info!("Removing existing test data at: {:?}", base_path);
-            std::fs::remove_dir_all(&base_path)?;
+            std::fs::remove_dir_all(base_path)?;
         }
 
         // Create the base directory
-        create_dir_all(&base_path)?;
+        create_dir_all(base_path)?;
         log_info!("Creating test data at: {:?}", base_path);
 
         let start_time = Instant::now();
@@ -69,7 +80,7 @@ pub mod test_generate_test_data {
             let mut rng = thread_rng();
 
             let idx = rng.gen_range(0, charset.len());
-            return charset[idx].to_string();
+            charset[idx].to_string()
         };
 
         // Function to create file extensions
@@ -89,7 +100,7 @@ pub mod test_generate_test_data {
 
         // Recursive function to create the folder structure
         fn create_structure(
-            path: &PathBuf,
+            path: &Path,
             depth: usize,
             max_depth: usize,
             folders_per_level: usize,
@@ -145,17 +156,18 @@ pub mod test_generate_test_data {
             Ok(())
         }
 
-        // Start the recursive creation
-        create_structure(
-            &base_path,
-            0,
-            MAX_DEPTH,
-            FOLDERS_PER_LEVEL,
-            FILES_PER_FOLDER,
-            &generate_random_name,
-            &generate_extension,
-            &entry_count,
-        )?;
+        if folders_per_level > 0 || files_per_folder > 0 {
+            create_structure(
+                base_path,
+                0,
+                max_depth,
+                folders_per_level,
+                files_per_folder,
+                &generate_random_name,
+                &generate_extension,
+                &entry_count,
+            )?;
+        }
 
         let total_count = *entry_count.lock().unwrap();
         let elapsed = start_time.elapsed();
@@ -164,17 +176,96 @@ pub mod test_generate_test_data {
         log_info!("Created {} total entries in {:?}", total_count, elapsed);
         log_info!("Path: {:?}", base_path);
 
-        Ok(base_path)
+        Ok(())
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn generate_test_data_if_not_exists(base_path: PathBuf) -> Result<(), std::io::Error> {
-        if !base_path.exists() {
+        let _guard = TEST_DATA_GEN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ready_marker = base_path.join(".test_data_ready");
+        let has_entries = base_path.exists()
+            && (ready_marker.exists()
+                || std::fs::read_dir(&base_path)
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(false));
+
+        if !has_entries {
             log_info!("Test data not found, generating...");
-            generate_test_data(base_path)?;
+            generate_test_data_locked(&base_path, 20, 20, 3, true)?;
+            std::fs::write(&ready_marker, b"ok")?;
         } else {
             log_info!("Test data already exists at: {:?}", base_path);
         }
         Ok(())
+    }
+
+    /// Creates an isolated `TempDir` populated with deterministic seed files/subdirectories
+    /// plus optional random hierarchical entries so tests never race on `./test-data-for-fuzzy-search`.
+    #[allow(dead_code)]
+    pub fn create_isolated_test_fixture(
+        folders_per_level: usize,
+        files_per_folder: usize,
+        max_depth: usize,
+    ) -> Result<tempfile::TempDir, std::io::Error> {
+        let temp_dir = tempfile::tempdir()?;
+        let root = temp_dir.path();
+
+        let seed_files = [
+            "file1.txt",
+            "file2.txt",
+            "test.md",
+            "apple.pdf",
+            "banana.txt",
+            "orange.md",
+            "train.txt",
+            "document.pdf",
+            "readme.md",
+        ];
+        for file_name in &seed_files {
+            std::fs::write(root.join(file_name), format!("seed content for {}", file_name))?;
+        }
+
+        let subdir_alpha = root.join("subdir_alpha");
+        let subdir_beta = root.join("subdir_beta");
+        std::fs::create_dir_all(&subdir_alpha)?;
+        std::fs::create_dir_all(&subdir_beta)?;
+
+        for file_name in [
+            "file_alpha1.txt",
+            "file_alpha2.txt",
+            "test_alpha.md",
+            "apple_notes.txt",
+        ] {
+            std::fs::write(
+                subdir_alpha.join(file_name),
+                format!("alpha content for {}", file_name),
+            )?;
+        }
+
+        for file_name in [
+            "file_beta1.txt",
+            "file_beta2.txt",
+            "test_beta.md",
+            "train_schedule.txt",
+        ] {
+            std::fs::write(
+                subdir_beta.join(file_name),
+                format!("beta content for {}", file_name),
+            )?;
+        }
+
+        if folders_per_level > 0 || files_per_folder > 0 {
+            generate_test_data_locked(
+                root,
+                folders_per_level,
+                files_per_folder,
+                max_depth,
+                false,
+            )?;
+        }
+
+        Ok(temp_dir)
     }
 }

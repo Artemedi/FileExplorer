@@ -106,14 +106,17 @@ mod tests_meta_data_commands {
     use super::*;
 
     // Helper function to create a test MetaDataState
-    fn create_test_meta_data_state() -> Arc<Mutex<MetaDataState>> {
-        // Create a temporary MetaDataState for testing
-        Arc::new(Mutex::new(MetaDataState::new()))
+    fn create_test_meta_data_state() -> (Arc<Mutex<MetaDataState>>, tempfile::TempDir) {
+        // Create a temporary MetaDataState for testing isolated from real user config
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let meta_path = temp_dir.path().join("meta_data.json");
+        let state = Arc::new(Mutex::new(MetaDataState::new_with_path(meta_path)));
+        (state, temp_dir)
     }
 
     #[test]
     fn test_get_meta_data_as_json_success() {
-        let state = create_test_meta_data_state();
+        let (state, _temp_dir) = create_test_meta_data_state();
 
         // Call the implementation function with our test state
         let result = get_meta_data_as_json_impl(state.clone());
@@ -129,7 +132,7 @@ mod tests_meta_data_commands {
 
     #[test]
     fn test_get_meta_data_as_json_contains_volumes() {
-        let state = create_test_meta_data_state();
+        let (state, _temp_dir) = create_test_meta_data_state();
 
         // First update the metadata to ensure we have fresh data
         state

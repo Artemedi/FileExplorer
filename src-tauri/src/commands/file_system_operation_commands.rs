@@ -1210,6 +1210,7 @@ mod tests_file_system_operation_commands {
         );
     }
 
+    #[cfg(feature = "long-tests")]
     #[tokio::test]
     async fn move_file_to_trash_test() {
         use tempfile::tempdir;
@@ -1242,6 +1243,23 @@ mod tests_file_system_operation_commands {
         );
 
         // No manual cleanup needed, as the temporary directory is automatically deleted
+    }
+
+    #[tokio::test]
+    async fn failed_move_to_trash_because_empty_path_test() {
+        let result = move_to_trash("").await;
+        assert!(
+            result.is_err(),
+            "Empty path should fail when moving to trash: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Failed to move file or directory to trash"),
+            "Unexpected error message: {}",
+            err
+        );
+        assert!(err.contains("InternalError"), "Unexpected error code: {}", err);
     }
 
     #[tokio::test]

@@ -267,27 +267,20 @@ pub fn reset_settings_impl(state: Arc<Mutex<SettingsState>>) -> Result<String, S
 mod tests_settings_commands {
     use super::*;
     use serde_json::json;
-    use std::path::PathBuf;
 
-    // Testing: Helper function to create a test SettingsState
-    fn create_test_settings_state() -> Arc<Mutex<SettingsState>> {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-        let path = temp_file.path().to_path_buf();
+    // Testing: Helper function to create an isolated test SettingsState with RAII TempDir guard
+    fn create_test_settings_state() -> (Arc<Mutex<SettingsState>>, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let path = temp_dir.path().join("settings.json");
 
-        // Create a settings state with a temporary file path
-        Arc::new(Mutex::new(SettingsState::new_with_path(path)))
-    }
-
-    fn create_test_settings_state_with_temp_file(temp_file: PathBuf) -> Arc<Mutex<SettingsState>> {
-        // Create a settings state with a temporary file path
-        Arc::new(Mutex::new(SettingsState::new_with_path(temp_file)))
+        // Create a settings state with a temporary file path kept alive by TempDir
+        let state = Arc::new(Mutex::new(SettingsState::new_with_path(path)));
+        (state, temp_dir)
     }
 
     #[test]
     fn test_get_settings_as_json_contains_default() {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-
-        let state = create_test_settings_state_with_temp_file(temp_file.path().to_path_buf());
+        let (state, _temp_dir) = create_test_settings_state();
         let json = get_settings_as_json_impl(state);
         assert!(json.contains("\"darkmode\":false"));
         assert!(json.contains("\"logging_level\":\"Full\""));
@@ -295,21 +288,21 @@ mod tests_settings_commands {
 
     #[test]
     fn test_get_setting_field_existing_key() {
-        let state = create_test_settings_state();
+        let (state, _temp_dir) = create_test_settings_state();
         let value = get_setting_field_impl(state.clone(), "darkmode".to_string()).unwrap();
         assert_eq!(value, json!(false));
     }
 
     #[test]
     fn test_get_setting_field_invalid_key() {
-        let state = create_test_settings_state();
+        let (state, _temp_dir) = create_test_settings_state();
         let result = get_setting_field_impl(state.clone(), "invalid_key".to_string());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_update_settings_field_success() {
-        let state = create_test_settings_state();
+        let (state, _temp_dir) = create_test_settings_state();
         let result = update_settings_field_impl(state.clone(), "darkmode".to_string(), json!(true));
         assert!(result.is_ok());
 
@@ -319,7 +312,7 @@ mod tests_settings_commands {
 
     #[test]
     fn test_update_settings_field_invalid_key() {
-        let state = create_test_settings_state();
+        let (state, _temp_dir) = create_test_settings_state();
         let result =
             update_settings_field_impl(state.clone(), "nonexistent".to_string(), json!(123));
         assert!(result.is_err());
@@ -327,7 +320,7 @@ mod tests_settings_commands {
 
     #[test]
     fn test_update_multiple_settings_success() {
-        let state = create_test_settings_state();
+        let (state, _temp_dir) = create_test_settings_state();
 
         let mut updates = serde_json::Map::new();
         updates.insert("darkmode".to_string(), json!(true));
@@ -345,7 +338,7 @@ mod tests_settings_commands {
 
     #[test]
     fn test_update_multiple_settings_with_invalid_key() {
-        let state = create_test_settings_state();
+        let (state, _temp_dir) = create_test_settings_state();
 
         let mut updates = serde_json::Map::new();
         updates.insert("nonexistent".to_string(), json!("oops"));
@@ -356,8 +349,17 @@ mod tests_settings_commands {
 
     #[test]
     fn test_reset_settings_command_success() {
-        let state = create_test_settings_state();
-        // Prefix unused variable with underscore
+        // BUG-013 / BUG-073: SettingsState::reset_settings() currently resets abs_file_path_buf
+        // to constants::SETTINGS_CONFIG_ABS_PATH until Wave 1C preserves the path.
+        // Skip modifying user config outside TempDir unless EXPLR_DATA_DIR is set.
+        if std::env::var_os("EXPLR_DATA_DIR").is_none() {
+            eprintln!(
+                "Skipping test_reset_settings_command_success: EXPLR_DATA_DIR not set (protects real user config)"
+            );
+            return;
+        }
+
+        let (state, _temp_dir) = create_test_settings_state();
         let _updated_data =
             update_settings_field_impl(state.clone(), "darkmode".to_string(), json!(true));
 

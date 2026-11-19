@@ -61,6 +61,240 @@ function snakeToCamel(snake) {
     return snake.replace(/_([a-z0-9])/g, (_, ch) => ch.toUpperCase());
 }
 
+function splitRustParams(str) {
+    const parts = [];
+    let depthAngle = 0;
+    let depthParen = 0;
+    let depthBracket = 0;
+    let depthBrace = 0;
+    let current = '';
+
+    for (let i = 0; i < str.length; i++) {
+        const ch = str[i];
+        if (ch === '<') depthAngle++;
+        else if (ch === '>' && depthAngle > 0) depthAngle--;
+        else if (ch === '(') depthParen++;
+        else if (ch === ')' && depthParen > 0) depthParen--;
+        else if (ch === '[') depthBracket++;
+        else if (ch === ']' && depthBracket > 0) depthBracket--;
+        else if (ch === '{') depthBrace++;
+        else if (ch === '}' && depthBrace > 0) depthBrace--;
+
+        if (ch === ',' && depthAngle === 0 && depthParen === 0 && depthBracket === 0 && depthBrace === 0) {
+            if (current.trim()) parts.push(current.trim());
+            current = '';
+        } else {
+            current += ch;
+        }
+    }
+    if (current.trim()) parts.push(current.trim());
+    return parts;
+}
+
+function stripJsComments(src) {
+    let out = '';
+    let inSingle = false;
+    let inDouble = false;
+    let inTemplate = false;
+    let inLineComment = false;
+    let inBlockComment = false;
+
+    for (let i = 0; i < src.length; i++) {
+        const ch = src[i];
+        const next = src[i + 1];
+
+        if (inLineComment) {
+            if (ch === '\n') {
+                inLineComment = false;
+                out += ch;
+            }
+            continue;
+        }
+        if (inBlockComment) {
+            if (ch === '*' && next === '/') {
+                inBlockComment = false;
+                i++;
+            }
+            continue;
+        }
+        if (!inSingle && !inDouble && !inTemplate) {
+            if (ch === '/' && next === '/') {
+                inLineComment = true;
+                i++;
+                continue;
+            }
+            if (ch === '/' && next === '*') {
+                inBlockComment = true;
+                i++;
+                continue;
+            }
+        }
+        if (ch === '\\' && (inSingle || inDouble || inTemplate)) {
+            out += ch + (src[i + 1] || '');
+            i++;
+            continue;
+        }
+        if (ch === "'" && !inDouble && !inTemplate) inSingle = !inSingle;
+        else if (ch === '"' && !inSingle && !inTemplate) inDouble = !inDouble;
+        else if (ch === '`' && !inSingle && !inDouble) inTemplate = !inTemplate;
+        out += ch;
+    }
+    return out;
+}
+
+function stripRustComments(src) {
+    let out = '';
+    let inDouble = false;
+    let inLineComment = false;
+    let inBlockComment = false;
+
+    for (let i = 0; i < src.length; i++) {
+        const ch = src[i];
+        const next = src[i + 1];
+
+        if (inLineComment) {
+            if (ch === '\n') {
+                inLineComment = false;
+                out += ch;
+            }
+            continue;
+        }
+        if (inBlockComment) {
+            if (ch === '*' && next === '/') {
+                inBlockComment = false;
+                i++;
+            }
+            continue;
+        }
+        if (!inDouble) {
+            if (ch === '/' && next === '/') {
+                inLineComment = true;
+                i++;
+                continue;
+            }
+            if (ch === '/' && next === '*') {
+                inBlockComment = true;
+                i++;
+                continue;
+            }
+        }
+        if (ch === '\\' && inDouble) {
+            out += ch + (src[i + 1] || '');
+            i++;
+            continue;
+        }
+        if (ch === '"') inDouble = !inDouble;
+        out += ch;
+    }
+    return out;
+}
+
+function splitJsTopLevel(str) {
+    const parts = [];
+    let depthParen = 0;
+    let depthBracket = 0;
+    let depthBrace = 0;
+    let inSingle = false;
+    let inDouble = false;
+    let inTemplate = false;
+    let current = '';
+
+    for (let i = 0; i < str.length; i++) {
+        const ch = str[i];
+        if (ch === '\\' && (inSingle || inDouble || inTemplate)) {
+            current += ch + (str[i + 1] || '');
+            i++;
+            continue;
+        }
+        if (ch === "'" && !inDouble && !inTemplate) inSingle = !inSingle;
+        else if (ch === '"' && !inSingle && !inTemplate) inDouble = !inDouble;
+        else if (ch === '`' && !inSingle && !inDouble) inTemplate = !inTemplate;
+        else if (!inSingle && !inDouble && !inTemplate) {
+            if (ch === '(') depthParen++;
+            else if (ch === ')' && depthParen > 0) depthParen--;
+            else if (ch === '[') depthBracket++;
+            else if (ch === ']' && depthBracket > 0) depthBracket--;
+            else if (ch === '{') depthBrace++;
+            else if (ch === '}' && depthBrace > 0) depthBrace--;
+        }
+
+        if (!inSingle && !inDouble && !inTemplate && ch === ',' && depthParen === 0 && depthBracket === 0 && depthBrace === 0) {
+            if (current.trim()) parts.push(current.trim());
+            current = '';
+        } else {
+            current += ch;
+        }
+    }
+    if (current.trim()) parts.push(current.trim());
+    return parts;
+}
+
+function findCallArgumentBlocks(content, fnNameRegex) {
+    const calls = [];
+    let match;
+    while ((match = fnNameRegex.exec(content)) !== null) {
+        let idx = match.index + match[0].length;
+        // Skip whitespace
+        while (idx < content.length && /\s/.test(content[idx])) idx++;
+        // Skip optional TypeScript generic type parameters <...>
+        if (content[idx] === '<') {
+            let angleDepth = 1;
+            let inS = false;
+            let inD = false;
+            let inT = false;
+            idx++;
+            while (idx < content.length && angleDepth > 0) {
+                const ch = content[idx];
+                if (ch === '\\' && (inS || inD || inT)) {
+                    idx += 2;
+                    continue;
+                }
+                if (ch === "'" && !inD && !inT) inS = !inS;
+                else if (ch === '"' && !inS && !inT) inD = !inD;
+                else if (ch === '`' && !inS && !inD) inT = !inT;
+                else if (!inS && !inD && !inT) {
+                    if (ch === '<') angleDepth++;
+                    else if (ch === '>' && content[idx - 1] !== '=') angleDepth--;
+                }
+                idx++;
+            }
+            if (angleDepth !== 0) continue;
+            while (idx < content.length && /\s/.test(content[idx])) idx++;
+        }
+        if (content[idx] !== '(') continue;
+        idx++; // step past '('
+
+        let depth = 1;
+        let inS = false;
+        let inD = false;
+        let inT = false;
+        let argsStr = '';
+        for (; idx < content.length && depth > 0; idx++) {
+            const ch = content[idx];
+            if (ch === '\\' && (inS || inD || inT)) {
+                argsStr += ch + (content[idx + 1] || '');
+                idx++;
+                continue;
+            }
+            if (ch === "'" && !inD && !inT) inS = !inS;
+            else if (ch === '"' && !inS && !inT) inD = !inD;
+            else if (ch === '`' && !inS && !inD) inT = !inT;
+            else if (!inS && !inD && !inT) {
+                if (ch === '(') depth++;
+                else if (ch === ')') {
+                    depth--;
+                    if (depth === 0) break;
+                }
+            }
+            argsStr += ch;
+        }
+        if (depth === 0) {
+            calls.push(splitJsTopLevel(argsStr));
+        }
+    }
+    return calls;
+}
+
 // ============================================================================
 // 1. Utility Unit Tests
 // ============================================================================
@@ -165,7 +399,7 @@ test('keyboard and search utilities work cleanly', () => {
 // 2. Frontend-Backend Tauri IPC Contract Verification
 // ============================================================================
 
-test('every frontend invoke() references a registered Tauri command with camelCase params', () => {
+test('Tauri commands, invoke() signatures/required params, and emit()/listen() contracts are consistent', () => {
     const mainRs = fs.readFileSync(path.join(RUST_SRC_DIR, 'main.rs'), 'utf8');
     const registeredCommands = new Set();
     const handlerMatch = mainRs.match(/generate_handler!\[([\s\S]*?)\]/);
@@ -181,87 +415,182 @@ test('every frontend invoke() references a registered Tauri command with camelCa
     }
     assert.ok(registeredCommands.has('open_file'), 'open_file must be registered in main.rs');
 
-    // Parse #[tauri::command] functions in src-tauri/src/commands/*.rs
-    const commandParams = new Map();
-    const rustCommandFiles = collectFiles(path.join(RUST_SRC_DIR, 'commands'), ['.rs']);
-    for (const file of rustCommandFiles) {
-        const content = fs.readFileSync(file, 'utf8');
-        const fnRegex = /#\[tauri::command[^\]]*\]\s*pub\s+(?:async\s+)?fn\s+([a-zA-Z0-9_]+)\s*\(([\s\S]*?)\)\s*(?:->|\{)/g;
+    // Wave 1D will remove #[tauri::command] from connect_to_sftp
+    const UNREGISTERED_COMMAND_ALLOWLIST = new Set([
+        'connect_to_sftp',
+    ]);
+
+    // Parse #[tauri::command] functions across src-tauri/src/**/*.rs
+    const definedCommands = new Set();
+    const commandSpecs = new Map();
+    const rustSrcFiles = collectFiles(RUST_SRC_DIR, ['.rs']);
+
+    for (const file of rustSrcFiles) {
+        const content = stripRustComments(fs.readFileSync(file, 'utf8'));
+        const fnRegex = /#\[tauri::command[^\]]*\]\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([a-zA-Z0-9_]+)\s*\(([\s\S]*?)\)\s*(?:->|\{)/g;
         let match;
         while ((match = fnRegex.exec(content)) !== null) {
             const cmdName = match[1];
             const rawParams = match[2];
-            const params = new Set();
-            for (const part of rawParams.split(',')) {
-                const trimmed = part.trim();
-                if (!trimmed) continue;
-                const pMatch = trimmed.match(/^([a-zA-Z0-9_]+)\s*:/);
-                if (!pMatch) continue;
-                const paramName = pMatch[1];
+            definedCommands.add(cmdName);
+
+            const allParams = new Set();
+            const requiredParams = new Set();
+            for (const part of splitRustParams(rawParams)) {
+                const colonIdx = part.indexOf(':');
+                if (colonIdx === -1) continue;
+                const paramName = part.slice(0, colonIdx).trim();
+                const paramType = part.slice(colonIdx + 1).trim();
                 if (paramName === 'state' || paramName === 'app' || paramName === 'window') continue;
-                if (trimmed.includes('State<') || trimmed.includes('AppHandle') || trimmed.includes('Window')) continue;
-                params.add(snakeToCamel(paramName));
+                if (/^(?:tauri::)?(?:State|AppHandle|Window|WebviewWindow)\b/.test(paramType) || paramType.includes('State<')) {
+                    continue;
+                }
+                const camelName = snakeToCamel(paramName);
+                allParams.add(camelName);
+                if (!/^Option\s*</.test(paramType)) {
+                    requiredParams.add(camelName);
+                }
             }
-            commandParams.set(cmdName, params);
+            commandSpecs.set(cmdName, { allParams, requiredParams });
         }
     }
 
-    // Scan all frontend files for invoke('command_name', { ... })
-    const frontendFiles = collectFiles(SRC_DIR, ['.js', '.jsx', '.ts', '.tsx']);
-    const failures = [];
+    const contractFailures = [];
 
+    // Bidirectional check: generate_handler![] <-> #[tauri::command]
+    for (const regCmd of registeredCommands) {
+        if (!definedCommands.has(regCmd)) {
+            contractFailures.push(`main.rs: generate_handler![] registers '${regCmd}' which has no #[tauri::command] definition`);
+        }
+    }
+    for (const defCmd of definedCommands) {
+        if (!registeredCommands.has(defCmd) && !UNREGISTERED_COMMAND_ALLOWLIST.has(defCmd)) {
+            contractFailures.push(`Rust commands: #[tauri::command] '${defCmd}' is not registered in main.rs generate_handler![]`);
+        }
+    }
+
+    // Scan all frontend files for invoke(...) / invoke<T>(...)
+    const frontendFiles = collectFiles(SRC_DIR, ['.js', '.jsx', '.ts', '.tsx']);
     for (const file of frontendFiles) {
-        const rawContent = fs.readFileSync(file, 'utf8');
-        const content = rawContent
-            .replace(/\/\*[\s\S]*?\*\//g, '')
-            .replace(/^\s*\/\/.*$/gm, '')
-            .replace(/([^:])\/\/.*$/gm, '$1');
+        const content = stripJsComments(fs.readFileSync(file, 'utf8'));
         const relPath = path.relative(ROOT_DIR, file);
-        const invokeRegex = /invoke\(\s*['"]([a-zA-Z0-9_]+)['"]\s*(?:,\s*\{([\s\S]*?)\})?\s*\)/g;
-        let match;
-        while ((match = invokeRegex.exec(content)) !== null) {
-            const cmd = match[1];
-            const argBlock = match[2];
+        const invokeCalls = findCallArgumentBlocks(content, /\binvoke\b/g);
+
+        for (const args of invokeCalls) {
+            if (args.length === 0) continue;
+            const cmdMatch = args[0].match(/^['"]([a-zA-Z0-9_]+)['"]$/);
+            if (!cmdMatch) continue;
+            const cmd = cmdMatch[1];
+
             if (!registeredCommands.has(cmd)) {
-                failures.push(`${relPath}: invokes unregistered command '${cmd}'`);
+                contractFailures.push(`${relPath}: invokes unregistered command '${cmd}'`);
                 continue;
             }
-            if (argBlock && commandParams.has(cmd)) {
-                const expectedParams = commandParams.get(cmd);
-                // Extract top-level keys inside { key: val, shorthandKey, ... }
-                const cleaned = argBlock
-                    .replace(/\/\/.*$/gm, '')
-                    .replace(/\/\*[\s\S]*?\*\//g, '');
-                let depth = 0;
-                let current = '';
-                const entries = [];
-                for (const ch of cleaned) {
-                    if (ch === '{' || ch === '[' || ch === '(') depth++;
-                    else if (ch === '}' || ch === ']' || ch === ')') depth--;
-                    if (ch === ',' && depth === 0) {
-                        entries.push(current.trim());
-                        current = '';
-                    } else {
-                        current += ch;
-                    }
-                }
-                if (current.trim()) entries.push(current.trim());
+            if (!commandSpecs.has(cmd)) continue;
 
-                for (const entry of entries) {
-                    const keyMatch = entry.match(/^([a-zA-Z0-9_]+)(?:\s*:|$)/);
-                    if (!keyMatch) continue;
-                    const key = keyMatch[1];
-                    if (key.includes('_')) {
-                        failures.push(`${relPath}: invoke('${cmd}') passes snake_case param '${key}'`);
-                    } else if (!expectedParams.has(key)) {
-                        failures.push(`${relPath}: invoke('${cmd}') passes unexpected param '${key}' (expected: ${[...expectedParams].join(', ')})`);
+            const { allParams, requiredParams } = commandSpecs.get(cmd);
+            const providedParams = new Set();
+            let hasDynamicOrSpread = false;
+
+            if (args.length >= 2) {
+                const payload = args[1].trim();
+                if (payload.startsWith('{') && payload.endsWith('}')) {
+                    const inner = payload.slice(1, -1);
+                    for (const entry of splitJsTopLevel(inner)) {
+                        if (entry.startsWith('...')) {
+                            hasDynamicOrSpread = true;
+                            continue;
+                        }
+                        const keyMatch = entry.match(/^([a-zA-Z0-9_]+)(?:\s*:|$)/);
+                        if (!keyMatch) continue;
+                        const key = keyMatch[1];
+                        providedParams.add(key);
+                        if (key.includes('_')) {
+                            contractFailures.push(`${relPath}: invoke('${cmd}') passes snake_case param '${key}'`);
+                        } else if (!allParams.has(key)) {
+                            contractFailures.push(`${relPath}: invoke('${cmd}') passes unexpected param '${key}' (expected: ${[...allParams].join(', ')})`);
+                        }
+                    }
+                } else {
+                    hasDynamicOrSpread = true;
+                }
+            }
+
+            if (!hasDynamicOrSpread) {
+                for (const reqParam of requiredParams) {
+                    if (!providedParams.has(reqParam)) {
+                        contractFailures.push(`${relPath}: invoke('${cmd}') is missing required param '${reqParam}'`);
                     }
                 }
             }
         }
     }
 
-    assert.deepEqual(failures, [], `IPC contract errors:\n${failures.join('\n')}`);
+    // Event contracts: Rust emit(...) <-> Frontend listen(...)
+    const emittedEvents = new Set();
+    for (const file of rustSrcFiles) {
+        const content = stripRustComments(fs.readFileSync(file, 'utf8'));
+        const emitRegex = /(?:\.|::)(emit|emit_all|emit_to)\s*\(/g;
+        let match;
+        while ((match = emitRegex.exec(content)) !== null) {
+            const method = match[1];
+            let idx = match.index + match[0].length;
+            let depth = 1;
+            let inD = false;
+            let argsStr = '';
+            for (; idx < content.length && depth > 0; idx++) {
+                const ch = content[idx];
+                if (ch === '\\' && inD) {
+                    argsStr += ch + (content[idx + 1] || '');
+                    idx++;
+                    continue;
+                }
+                if (ch === '"') inD = !inD;
+                else if (!inD) {
+                    if (ch === '(') depth++;
+                    else if (ch === ')') {
+                        depth--;
+                        if (depth === 0) break;
+                    }
+                }
+                argsStr += ch;
+            }
+            const args = splitRustParams(argsStr);
+            const eventArg = method === 'emit_to' ? args[1] : args[0];
+            const eventMatch = eventArg?.match(/^"([^"]+)"$/);
+            if (eventMatch) {
+                emittedEvents.add(eventMatch[1]);
+            }
+        }
+    }
+
+    const listenedEvents = new Set();
+    for (const file of frontendFiles) {
+        const content = stripJsComments(fs.readFileSync(file, 'utf8'));
+        const listenCalls = findCallArgumentBlocks(content, /\b(?:listen|once)\b/g);
+        for (const args of listenCalls) {
+            if (args.length === 0) continue;
+            const eventMatch = args[0].match(/^['"]([^'"]+)['"]$/);
+            if (eventMatch) {
+                listenedEvents.add(eventMatch[1]);
+            }
+        }
+    }
+
+    assert.ok(emittedEvents.size > 0, 'Expected at least one backend emit() event');
+    for (const ev of emittedEvents) {
+        if (!listenedEvents.has(ev)) {
+            contractFailures.push(`Backend emits event '${ev}' which has no frontend listen() subscriber`);
+        }
+    }
+    for (const ev of listenedEvents) {
+        if (ev.startsWith('tauri://')) continue;
+        if (!emittedEvents.has(ev)) {
+            contractFailures.push(`Frontend listens for event '${ev}' which is never emitted by the Rust backend`);
+        }
+    }
+
+    assert.deepEqual(contractFailures, [], `IPC / Event contract errors:\n${contractFailures.join('\n')}`);
 });
 
 // ============================================================================
@@ -351,40 +680,91 @@ test('targeted audit fixes remain intact across frontend and Rust backend', () =
 
     const metaDataRs = fs.readFileSync(path.join(RUST_SRC_DIR, 'state', 'meta_data.rs'), 'utf8');
     const loadTemplatesBlock = metaDataRs.match(/fn load_templates[\s\S]*?\n\}/)?.[0] || '';
+    assert.ok(loadTemplatesBlock.length > 0, 'Could not locate load_templates in meta_data.rs');
     assert.ok(!loadTemplatesBlock.includes('.unwrap()'), 'load_templates must not call .unwrap()');
 });
 
-test('i18n translation bundles define matching leaf keys', () => {
-    const enText = fs.readFileSync(path.join(SRC_DIR, 'i18n', 'index.jsx'), 'utf8');
+test('i18n translation bundles define symmetric leaf keys', () => {
+    const i18nDir = path.join(SRC_DIR, 'i18n');
+    const enText = fs.readFileSync(path.join(i18nDir, 'index.jsx'), 'utf8');
     assert.ok(enText.length > 0);
-    const i18nFiles = fs.readdirSync(path.join(SRC_DIR, 'i18n')).filter(f => f.endsWith('.json'));
-    if (i18nFiles.length >= 2) {
-        const base = JSON.parse(fs.readFileSync(path.join(SRC_DIR, 'i18n', i18nFiles[0]), 'utf8'));
-        const flattenKeys = (obj, prefix = '') =>
-            Object.entries(obj).flatMap(([k, v]) =>
-                v && typeof v === 'object' ? flattenKeys(v, `${prefix}${k}.`) : [`${prefix}${k}`]
-            );
-        const expectedKeys = new Set(flattenKeys(base));
-        for (const file of i18nFiles.slice(1)) {
-            const curr = JSON.parse(fs.readFileSync(path.join(SRC_DIR, 'i18n', file), 'utf8'));
-            const actualKeys = new Set(flattenKeys(curr));
-            for (const key of expectedKeys) {
-                assert.ok(actualKeys.has(key), `Translation file ${file} is missing key '${key}'`);
-            }
+    const i18nFiles = fs.readdirSync(i18nDir).filter((f) => f.endsWith('.json'));
+    assert.ok(i18nFiles.includes('en.json'), 'src/i18n/en.json must exist');
+    assert.ok(i18nFiles.includes('ru.json'), 'src/i18n/ru.json must exist');
+
+    const flattenKeys = (obj, prefix = '') =>
+        Object.entries(obj).flatMap(([k, v]) =>
+            v && typeof v === 'object' && !Array.isArray(v) ? flattenKeys(v, `${prefix}${k}.`) : [`${prefix}${k}`]
+        );
+
+    const keySets = new Map();
+    for (const file of i18nFiles) {
+        const parsed = JSON.parse(fs.readFileSync(path.join(i18nDir, file), 'utf8'));
+        const keys = new Set(flattenKeys(parsed));
+        assert.ok(keys.size > 0, `Translation file ${file} must not be empty`);
+        keySets.set(file, keys);
+    }
+
+    const baseFile = 'en.json';
+    const baseKeys = keySets.get(baseFile);
+    for (const [file, keys] of keySets.entries()) {
+        if (file === baseFile) continue;
+        for (const key of baseKeys) {
+            assert.ok(keys.has(key), `Translation file ${file} is missing key '${key}' present in ${baseFile}`);
+        }
+        for (const key of keys) {
+            assert.ok(baseKeys.has(key), `Translation file ${file} has extra key '${key}' missing from ${baseFile}`);
         }
     }
 });
 
-test('package metadata versions are synchronized across manifests', () => {
+test('package metadata versions, lockfile, and packaging scripts are synchronized', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'package.json'), 'utf8'));
+    const pkgLock = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'package-lock.json'), 'utf8'));
     const tauriConf = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'src-tauri', 'tauri.conf.json'), 'utf8'));
     const cargoToml = fs.readFileSync(path.join(ROOT_DIR, 'src-tauri', 'Cargo.toml'), 'utf8');
     const constantsRs = fs.readFileSync(path.join(RUST_SRC_DIR, 'constants.rs'), 'utf8');
+    const postBuildSh = fs.readFileSync(path.join(ROOT_DIR, 'src-tauri', 'scripts', 'post-build.sh'), 'utf8');
+    const buildUniversalSh = fs.readFileSync(path.join(ROOT_DIR, 'build-universal.sh'), 'utf8');
 
-    const cargoVersion = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+    const cargoPkgSection = cargoToml.match(/\[package\]([\s\S]*?)(?:\n\[|$)/)?.[1] || cargoToml;
+    const cargoBinName = cargoPkgSection.match(/^name\s*=\s*"([^"]+)"/m)?.[1];
+    const cargoVersion = cargoPkgSection.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
     const constVersion = constantsRs.match(/VERSION:\s*&str\s*=\s*"([^"]+)"/)?.[1];
 
+    assert.equal(cargoBinName, 'explr', 'Cargo.toml package name must be explr');
     assert.equal(tauriConf.version, pkg.version, 'tauri.conf.json version must match package.json');
     assert.equal(cargoVersion, pkg.version, 'Cargo.toml version must match package.json');
     assert.equal(constVersion, pkg.version, 'constants.rs VERSION must match package.json');
+
+    // package-lock.json sync checks
+    assert.equal(pkgLock.version, pkg.version, 'package-lock.json top-level version must match package.json');
+    assert.equal(pkgLock.packages?.['']?.version, pkg.version, 'package-lock.json root package version must match package.json');
+    assert.deepEqual(
+        Object.keys(pkgLock.packages?.['']?.dependencies || {}).sort(),
+        Object.keys(pkg.dependencies || {}).sort(),
+        'package-lock.json dependencies must match package.json'
+    );
+    assert.deepEqual(
+        Object.keys(pkgLock.packages?.['']?.devDependencies || {}).sort(),
+        Object.keys(pkg.devDependencies || {}).sort(),
+        'package-lock.json devDependencies must match package.json'
+    );
+
+    // Packaging script checks (BUG-038)
+    assert.ok(!postBuildSh.includes('src-tauri-real'), 'post-build.sh must not reference old src-tauri-real binary');
+    assert.ok(!postBuildSh.includes('$MACOS_DIR/src-tauri'), 'post-build.sh must not wrap $MACOS_DIR/src-tauri');
+    assert.ok(!postBuildSh.includes('0.2.3'), 'post-build.sh must not hardcode version 0.2.3');
+    assert.ok(postBuildSh.includes('Cargo.toml') && postBuildSh.includes('tauri.conf.json'), 'post-build.sh must read binary/version dynamically from Cargo.toml and tauri.conf.json');
+    assert.ok(postBuildSh.includes('BIN_NAME') && postBuildSh.includes('APP_VERSION'), 'post-build.sh must use dynamic BIN_NAME and APP_VERSION');
+
+    assert.ok(!buildUniversalSh.includes('VERSION="0.2.3"'), 'build-universal.sh must not hardcode VERSION="0.2.3"');
+    assert.ok(!buildUniversalSh.includes('file-explorer.app'), 'build-universal.sh must not reference file-explorer.app');
+    assert.ok(buildUniversalSh.includes('tauri.conf.json') && buildUniversalSh.includes('Cargo.toml'), 'build-universal.sh must read app metadata dynamically');
+
+    assert.match(
+        pkg.scripts?.['tauri:build:intel'] || '',
+        /CARGO_CFG_TARGET_ARCH=x86_64/,
+        'package.json tauri:build:intel must pass CARGO_CFG_TARGET_ARCH=x86_64'
+    );
 });

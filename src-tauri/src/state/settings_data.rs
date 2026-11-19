@@ -803,6 +803,13 @@ mod tests_settings {
         );
     }
 
+    fn create_test_settings_state() -> (SettingsState, tempfile::TempDir) {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let test_path = temp_dir.path().join("settings.json");
+        let state = SettingsState::new_with_path(test_path);
+        (state, temp_dir)
+    }
+
     /// Tests updating the darkmode setting field.
     ///
     /// Verifies that:
@@ -810,9 +817,7 @@ mod tests_settings {
     /// 2. The returned settings object reflects the updated value
     #[test]
     fn test_update_darkmode_field() {
-        let state = SettingsState::new_with_path(
-            tempfile::NamedTempFile::new().unwrap().path().to_path_buf(),
-        );
+        let (state, _temp_dir) = create_test_settings_state();
 
         let result = state.update_setting_field("darkmode", json!(true));
         assert!(result.is_ok());
@@ -826,9 +831,7 @@ mod tests_settings {
     /// 2. The returned settings object reflects the updated value
     #[test]
     fn test_update_default_theme_field() {
-        let state = SettingsState::new_with_path(
-            tempfile::NamedTempFile::new().unwrap().path().to_path_buf(),
-        );
+        let (state, _temp_dir) = create_test_settings_state();
 
         let result = state.update_setting_field("default_theme", json!("ocean"));
         assert!(result.is_ok());
@@ -842,9 +845,7 @@ mod tests_settings {
     /// 2. The returned settings object reflects the updated value
     #[test]
     fn test_update_default_checksum_hash_field() {
-        let state = SettingsState::new_with_path(
-            tempfile::NamedTempFile::new().unwrap().path().to_path_buf(),
-        );
+        let (state, _temp_dir) = create_test_settings_state();
 
         let result = state.update_setting_field("backend_settings.default_checksum_hash", json!("MD5"));
         assert!(result.is_ok());
@@ -858,9 +859,7 @@ mod tests_settings {
     /// 2. The returned settings object reflects the updated values
     #[test]
     fn test_update_custom_themes_field() {
-        let state = SettingsState::new_with_path(
-            tempfile::NamedTempFile::new().unwrap().path().to_path_buf(),
-        );
+        let (state, _temp_dir) = create_test_settings_state();
 
         let themes = vec!["dark".to_string(), "light".to_string()];
         let result = state.update_setting_field("custom_themes", json!(themes.clone()));
@@ -876,9 +875,7 @@ mod tests_settings {
     /// 3. Both fields are properly converted to PathBuf values
     #[test]
     fn test_update_path_fields() {
-        let state = SettingsState::new_with_path(
-            tempfile::NamedTempFile::new().unwrap().path().to_path_buf(),
-        );
+        let (state, _temp_dir) = create_test_settings_state();
 
         let path = "/some/path";
         let result1 = state.update_setting_field("default_themes_path", json!(path));
@@ -900,9 +897,7 @@ mod tests_settings {
     /// 2. The returned settings object reflects the updated enum value
     #[test]
     fn test_update_logging_level_field() {
-        let state = SettingsState::new_with_path(
-            tempfile::NamedTempFile::new().unwrap().path().to_path_buf(),
-        );
+        let (state, _temp_dir) = create_test_settings_state();
 
         let result = state.update_setting_field("backend_settings.logging_config.logging_level", json!("Minimal"));
         assert!(result.is_ok());
@@ -916,9 +911,7 @@ mod tests_settings {
     /// 2. The error message contains "Unknown settings key"
     #[test]
     fn test_invalid_key() {
-        let state = SettingsState::new_with_path(
-            tempfile::NamedTempFile::new().unwrap().path().to_path_buf(),
-        );
+        let (state, _temp_dir) = create_test_settings_state();
 
         let result = state.update_setting_field("non_existing_key", json!("value"));
         assert!(result.is_err());
@@ -935,9 +928,7 @@ mod tests_settings {
     /// 2. The error message indicates the type mismatch
     #[test]
     fn test_invalid_type_for_darkmode() {
-        let state = SettingsState::new_with_path(
-            tempfile::NamedTempFile::new().unwrap().path().to_path_buf(),
-        );
+        let (state, _temp_dir) = create_test_settings_state();
 
         let result = state.update_setting_field("darkmode", json!("not_a_bool"));
         assert!(result.is_err());
@@ -952,8 +943,7 @@ mod tests_settings {
     /// 2. The retrieved value matches what was set
     #[test]
     fn test_get_existing_field() {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-        let settings_state = SettingsState::new_with_path(temp_file.path().to_path_buf());
+        let (settings_state, _temp_dir) = create_test_settings_state();
 
         // Set a known value
         settings_state
@@ -973,8 +963,7 @@ mod tests_settings {
     /// 2. The error message contains "Unknown settings key"
     #[test]
     fn test_get_invalid_key() {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-        let settings_state = SettingsState::new_with_path(temp_file.path().to_path_buf());
+        let (settings_state, _temp_dir) = create_test_settings_state();
 
         let result = settings_state.get_setting_field("non_existing_key");
         assert!(result.is_err());
@@ -991,8 +980,7 @@ mod tests_settings {
     /// 2. The retrieved value matches what was set
     #[test]
     fn test_get_complex_field() {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-        let settings_state = SettingsState::new_with_path(temp_file.path().to_path_buf());
+        let (settings_state, _temp_dir) = create_test_settings_state();
 
         settings_state
             .update_setting_field("custom_themes", json!(["dark", "light"]))
@@ -1010,8 +998,7 @@ mod tests_settings {
     /// 2. All updated fields have the expected values in the returned settings
     #[test]
     fn test_update_multiple_valid_fields() {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-        let settings_state = SettingsState::new_with_path(temp_file.path().to_path_buf());
+        let (settings_state, _temp_dir) = create_test_settings_state();
 
         let mut updates: Map<String, Value> = Map::new();
         updates.insert("darkmode".into(), Value::Bool(true));
@@ -1032,8 +1019,7 @@ mod tests_settings {
     /// 2. The error message identifies the specific invalid key
     #[test]
     fn test_update_with_invalid_key() {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-        let settings_state = SettingsState::new_with_path(temp_file.path().to_path_buf());
+        let (settings_state, _temp_dir) = create_test_settings_state();
 
         let mut updates: Map<String, Value> = Map::new();
         updates.insert("non_existing_field".into(), Value::String("value".into()));
@@ -1055,8 +1041,7 @@ mod tests_settings {
     /// 3. The error message identifies the specific invalid key
     #[test]
     fn test_update_with_mixed_valid_and_invalid_keys() {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-        let settings_state = SettingsState::new_with_path(temp_file.path().to_path_buf());
+        let (settings_state, _temp_dir) = create_test_settings_state();
 
         let mut updates: Map<String, Value> = Map::new();
         updates.insert("darkmode".into(), Value::Bool(false));
@@ -1077,8 +1062,7 @@ mod tests_settings {
     /// 2. The error message indicates that no settings were provided
     #[test]
     fn test_update_with_empty_updates_map() {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-        let settings_state = SettingsState::new_with_path(temp_file.path().to_path_buf());
+        let (settings_state, _temp_dir) = create_test_settings_state();
 
         let updates: Map<String, Value> = Map::new();
 
@@ -1094,8 +1078,7 @@ mod tests_settings {
     /// 2. The error message indicates the type mismatch
     #[test]
     fn test_update_with_invalid_value_type() {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-        let settings_state = SettingsState::new_with_path(temp_file.path().to_path_buf());
+        let (settings_state, _temp_dir) = create_test_settings_state();
 
         let mut updates: Map<String, Value> = Map::new();
         updates.insert("darkmode".into(), Value::String("not_a_bool".into())); // darkmode expects bool

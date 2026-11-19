@@ -705,9 +705,9 @@ impl PathMatcher {
 #[cfg(test)]
 mod tests_fast_fuzzy_v2 {
     use super::*;
-    use crate::constants::TEST_DATA_PATH;
-    use crate::search_engine::test_generate_test_data::generate_test_data_if_not_exists;
-    use crate::{log_error, log_info, log_warn};
+    use crate::log_info;
+    use crate::search_engine::test_generate_test_data::create_isolated_test_fixture;
+    #[cfg(feature = "generate-test-data")]
     use std::path::PathBuf;
     use std::time::Duration;
     use std::time::Instant;
@@ -735,18 +735,20 @@ mod tests_fast_fuzzy_v2 {
         (result.unwrap(), duration)
     }
 
-    fn get_test_data_path() -> PathBuf {
-        let path = PathBuf::from(TEST_DATA_PATH);
-        generate_test_data_if_not_exists(PathBuf::from(TEST_DATA_PATH)).unwrap_or_else(|err| {
-            log_error!("Error during test data generation or path lookup: {}", err);
-            panic!("Test data generation failed");
-        });
-        path
+    #[cfg(any(feature = "long-tests", feature = "benchmarks"))]
+    fn get_test_data_path() -> tempfile::TempDir {
+        create_isolated_test_fixture(4, 6, 2).expect("Failed to create isolated test fixture")
     }
 
-    // Helper function to collect real paths from the test data directory
+    // Helper function to collect real paths from an isolated temporary test fixture
     fn collect_test_paths(limit: Option<usize>) -> Vec<String> {
-        let test_path = get_test_data_path();
+        let (folders, files) = if limit.is_none() || limit.unwrap_or(0) > 500 {
+            (5, 8)
+        } else {
+            (3, 5)
+        };
+        let test_dir = create_isolated_test_fixture(folders, files, 2)
+            .expect("Failed to create isolated test fixture");
         let mut paths = Vec::new();
 
         fn add_paths_recursively(
@@ -760,7 +762,7 @@ mod tests_fast_fuzzy_v2 {
                 }
             }
 
-            if let Some(walker) = std::fs::read_dir(dir).ok() {
+            if let Ok(walker) = std::fs::read_dir(dir) {
                 for entry in walker.filter_map(|e| e.ok()) {
                     let path = entry.path();
                     if let Some(path_str) = path.to_str() {
@@ -780,17 +782,7 @@ mod tests_fast_fuzzy_v2 {
             }
         }
 
-        add_paths_recursively(&test_path, &mut paths, limit);
-
-        // If test data doesn't contain enough paths or doesn't exist,
-        // fall back to synthetic data with a warning
-        if paths.is_empty() {
-            log_warn!("No test data found, using synthetic data instead");
-            return (0..100)
-                .map(|i| format!("/path/to/file{}.txt", i))
-                .collect();
-        }
-
+        add_paths_recursively(test_dir.path(), &mut paths, limit);
         paths
     }
 
@@ -1078,6 +1070,7 @@ mod tests_fast_fuzzy_v2 {
         log_info!("Large dataset (10,000 items) search took: {:.2?}", elapsed);
     }
 
+    #[cfg(feature = "benchmarks")]
     #[test]
     fn benchmark_indexing_speed() {
         let iterations = 5;
@@ -1149,6 +1142,7 @@ mod tests_fast_fuzzy_v2 {
         log_info!("  Large: {:.2} paths/sec", large_paths_per_sec);
     }
 
+    #[cfg(feature = "benchmarks")]
     #[test]
     fn benchmark_query_performance() {
         // Create matcher with real test data instead of synthetic paths
@@ -1191,6 +1185,7 @@ mod tests_fast_fuzzy_v2 {
         }
     }
 
+    #[cfg(feature = "benchmarks")]
     #[test]
     fn benchmark_comparison_with_alternatives() {
         // Use real test data instead of synthetic paths
@@ -1477,8 +1472,9 @@ mod tests_fast_fuzzy_v2 {
     #[test]
     #[cfg(feature = "long-tests")]
     fn test_with_generated_real_world_data() {
-        // Get the test data path
-        let test_path = get_test_data_path();
+        // Get the isolated test data directory
+        let test_dir = get_test_data_path();
+        let test_path = test_dir.path();
 
         log_info!("Loading test data from: {:?}", test_path);
 
@@ -1557,10 +1553,12 @@ mod tests_fast_fuzzy_v2 {
     }
 
     // Benchmark comparing fuzzy vs substring matching
+    #[cfg(feature = "benchmarks")]
     #[test]
     fn benchmark_fuzzy_vs_substring_matching() {
-        // Get test data
-        let test_path = get_test_data_path();
+        // Get isolated test data
+        let test_dir = get_test_data_path();
+        let test_path = test_dir.path();
 
         // Build PathMatcher
         let mut matcher = PathMatcher::new();
@@ -1609,8 +1607,9 @@ mod tests_fast_fuzzy_v2 {
     #[test]
     #[cfg(feature = "long-tests")]
     fn test_large_dataset_performance() {
-        // Get the test data directory
-        let test_path = get_test_data_path();
+        // Get the isolated test data directory
+        let test_dir = get_test_data_path();
+        let test_path = test_dir.path().to_path_buf();
 
         let start_time = Instant::now();
         let mut matcher = PathMatcher::new();

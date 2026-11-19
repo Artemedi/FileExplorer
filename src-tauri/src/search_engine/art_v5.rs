@@ -1993,27 +1993,18 @@ impl ART {
 #[cfg(test)]
 mod tests_art_v5 {
     use super::*;
-    use crate::constants::TEST_DATA_PATH;
-    use crate::search_engine::test_generate_test_data::generate_test_data_if_not_exists;
-    use crate::{log_info, log_warn};
-    use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+    use crate::log_info;
+    use crate::search_engine::test_generate_test_data::create_isolated_test_fixture;
+    use std::path::{Path, MAIN_SEPARATOR};
     #[cfg(feature = "long-tests")]
     use std::time::Duration;
     use std::time::Instant;
 
-    // Helper function to get test data directory
-    fn get_test_data_path() -> PathBuf {
-        let path = PathBuf::from(TEST_DATA_PATH);
-        generate_test_data_if_not_exists(PathBuf::from(TEST_DATA_PATH)).unwrap_or_else(|err| {
-            log_error!("Error during test data generation or path lookup: {}", err);
-            panic!("Test data generation failed");
-        });
-        path
-    }
-
-    // Helper function to collect real paths from the test data directory
+    // Helper function to collect real paths from an isolated temporary fixture
     fn collect_test_paths(limit: Option<usize>) -> Vec<String> {
-        let test_path = get_test_data_path();
+        let (folders, files) = if limit.is_none() { (5, 8) } else { (3, 5) };
+        let test_dir = create_isolated_test_fixture(folders, files, 2)
+            .expect("Failed to create isolated test fixture");
         let mut paths = Vec::new();
 
         fn add_paths_recursively(dir: &Path, paths: &mut Vec<String>, limit: Option<usize>) {
@@ -2023,7 +2014,7 @@ mod tests_art_v5 {
                 }
             }
 
-            if let Some(walker) = std::fs::read_dir(dir).ok() {
+            if let Ok(walker) = std::fs::read_dir(dir) {
                 for entry in walker.filter_map(|e| e.ok()) {
                     let path = entry.path();
                     if let Some(path_str) = path.to_str() {
@@ -2043,23 +2034,7 @@ mod tests_art_v5 {
             }
         }
 
-        add_paths_recursively(&test_path, &mut paths, limit);
-
-        // If test data doesn't contain enough paths or doesn't exist,
-        // fall back to synthetic data with a warning
-        if paths.is_empty() {
-            log_warn!("No test data found, using synthetic data instead");
-            // Generate paths with the correct separator
-            return (0..100)
-                .map(|i| {
-                    format!(
-                        "{}path{}to{}file{}.txt",
-                        MAIN_SEPARATOR, MAIN_SEPARATOR, MAIN_SEPARATOR, i
-                    )
-                })
-                .collect();
-        }
-
+        add_paths_recursively(test_dir.path(), &mut paths, limit);
         paths
     }
 

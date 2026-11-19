@@ -445,15 +445,33 @@ pub async fn stop_indexing(
 mod tests_autocomplete_commands {
     use super::*;
     use crate::state::searchengine_data::SearchEngineStatus;
+    use crate::state::SettingsState;
     use std::fs::File;
     use std::io::Write;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
-    use crate::state::SettingsState;
 
-    // Helper function to create a test SearchEngineState
-    fn create_test_search_engine_state() -> Arc<Mutex<SearchEngineState>> {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
-        Arc::new(Mutex::new(SearchEngineState::new(settings_state)))
+    // Helper function to create an isolated test SearchEngineState with RAII TempDir
+    fn create_test_search_engine_state() -> (Arc<Mutex<SearchEngineState>>, TempDir) {
+        let settings_dir = TempDir::new().unwrap();
+        let settings_path = settings_dir.path().join("settings.json");
+        let settings_state = Arc::new(Mutex::new(SettingsState::new_with_path(settings_path)));
+        let engine_state = Arc::new(Mutex::new(SearchEngineState::new(settings_state)));
+        (engine_state, settings_dir)
+    }
+
+    fn wait_until<F>(timeout: Duration, mut predicate: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        let start = Instant::now();
+        while !predicate() {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
     }
 
     // Helper to create a temporary file with content
@@ -466,7 +484,7 @@ mod tests_autocomplete_commands {
 
     #[test]
     fn test_search_impl_with_empty_engine() {
-        let state = create_test_search_engine_state();
+        let (state, _settings_dir) = create_test_search_engine_state();
         let results = search_impl("test".to_string(), state);
         assert!(results.is_ok());
         assert_eq!(results.unwrap().len(), 0);
@@ -474,7 +492,7 @@ mod tests_autocomplete_commands {
 
     #[test]
     fn test_search_with_extension_impl_with_empty_engine() {
-        let state = create_test_search_engine_state();
+        let (state, _settings_dir) = create_test_search_engine_state();
         let results =
             search_with_extension_impl("test".to_string(), vec!["txt".to_string()], state);
         assert!(results.is_ok());
@@ -486,7 +504,7 @@ mod tests_autocomplete_commands {
         let temp_dir = TempDir::new().unwrap();
         let file_path = create_temp_file(&temp_dir, "test.txt", "This is a test document");
 
-        let state = create_test_search_engine_state();
+        let (state, _settings_dir) = create_test_search_engine_state();
 
         // Add the file to the index
         let add_result = add_path_impl(file_path.to_string_lossy().to_string(), state.clone());
@@ -506,7 +524,7 @@ mod tests_autocomplete_commands {
         let temp_dir = TempDir::new().unwrap();
         let file_path = create_temp_file(&temp_dir, "test.txt", "This is a test document");
 
-        let state = create_test_search_engine_state();
+        let (state, _settings_dir) = create_test_search_engine_state();
 
         // Add the file to the index
         let add_result = add_path_impl(file_path.to_string_lossy().to_string(), state.clone());
@@ -533,26 +551,39 @@ mod tests_autocomplete_commands {
         std::fs::create_dir_all(&subdir).unwrap();
 
         let _file1 = create_temp_file(&temp_dir, "test1.txt", "This is test document one");
-        let _file2 = create_temp_file(
-            &TempDir::new_in(&subdir).unwrap(),
-            "test2.txt",
-            "This is test document two",
-        );
+        let file2_dir = TempDir::new_in(&subdir).unwrap();
+        let _file2 = create_temp_file(&file2_dir, "test2.txt", "This is test document two");
 
-        let state = create_test_search_engine_state();
+        let (state, _settings_dir) = create_test_search_engine_state();
 
         // Add all files recursively
         let add_result =
             add_paths_recursive_impl(temp_dir.path().to_string_lossy().to_string(), state.clone());
         assert!(add_result.is_ok());
 
-        // Search for a common term
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                get_search_engine_info_impl(state.clone())
+                    .map(|info| !matches!(info.status, SearchEngineStatus::Indexing))
+                    .unwrap_or(false)
+            }),
+            "Timed out waiting for recursive indexing to finish"
+        );
+
+        // Search for a common term and assert both files were indexed
         let search_result = search_impl("test".to_string(), state.clone());
         assert!(search_result.is_ok());
-        let _results = search_result.unwrap();
-
-        // Since recursive indexing happens in a background thread, we can't reliably test file count here
-        // We should test core functionality without relying on completion timing
+        let results = search_result.unwrap();
+        assert!(
+            results.iter().any(|(path, _)| path.contains("test1.txt")),
+            "Expected test1.txt in recursive search results: {:?}",
+            results
+        );
+        assert!(
+            results.iter().any(|(path, _)| path.contains("test2.txt")),
+            "Expected test2.txt in recursive search results: {:?}",
+            results
+        );
 
         // Remove all files recursively
         let remove_result = remove_paths_recursive_impl(
@@ -561,8 +592,14 @@ mod tests_autocomplete_commands {
         );
         assert!(remove_result.is_ok());
 
-        // Allow some time for removal to complete
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                search_impl("test".to_string(), state.clone())
+                    .map(|r| r.is_empty())
+                    .unwrap_or(false)
+            }),
+            "Timed out waiting for recursive removal to clear search results"
+        );
 
         // Search again after removal
         let search_result_after = search_impl("test".to_string(), state.clone());
@@ -578,7 +615,7 @@ mod tests_autocomplete_commands {
         let temp_dir = TempDir::new().unwrap();
         let file_path = create_temp_file(&temp_dir, "test.txt", "This is a test document");
 
-        let state = create_test_search_engine_state();
+        let (state, _settings_dir) = create_test_search_engine_state();
 
         // Add the file to the index
         let add_result = add_path_impl(file_path.to_string_lossy().to_string(), state.clone());
@@ -599,7 +636,7 @@ mod tests_autocomplete_commands {
 
     #[test]
     fn test_get_search_engine_info() {
-        let state = create_test_search_engine_state();
+        let (state, _settings_dir) = create_test_search_engine_state();
 
         let info_result = get_search_engine_info_impl(state.clone());
         assert!(info_result.is_ok());
@@ -618,7 +655,7 @@ mod tests_autocomplete_commands {
         let txt_file = create_temp_file(&temp_dir, "test.txt", "This is a text document");
         let md_file = create_temp_file(&temp_dir, "readme.md", "This is a markdown document");
 
-        let state = create_test_search_engine_state();
+        let (state, _settings_dir) = create_test_search_engine_state();
 
         // Add both files to the index
         add_path_impl(txt_file.to_string_lossy().to_string(), state.clone()).unwrap();
@@ -649,7 +686,7 @@ mod tests_autocomplete_commands {
         let file2_dir = TempDir::new_in(&subdir).unwrap();
         let _file2 = create_temp_file(&file2_dir, "chunked_test2.txt", "This is chunked test document two");
 
-        let state = create_test_search_engine_state();
+        let (state, _settings_dir) = create_test_search_engine_state();
 
         // The updated add_paths_recursive should use chunked indexing internally
         let add_result = add_paths_recursive_impl(
@@ -658,15 +695,30 @@ mod tests_autocomplete_commands {
         );
         assert!(add_result.is_ok());
 
-        // Allow time for chunked indexing to complete
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                get_search_engine_info_impl(state.clone())
+                    .map(|info| !matches!(info.status, SearchEngineStatus::Indexing))
+                    .unwrap_or(false)
+            }),
+            "Timed out waiting for chunked indexing to complete"
+        );
 
-        // Should be able to search successfully
+        // Should find both indexed files
         let search_result = search_impl("chunked".to_string(), state.clone());
         assert!(search_result.is_ok());
 
-        // Results might be empty if indexing is still in progress, which is acceptable
-        let _results = search_result.unwrap();
+        let results = search_result.unwrap();
+        assert!(
+            results.iter().any(|(path, _)| path.contains("chunked_test1.txt")),
+            "Expected chunked_test1.txt in results: {:?}",
+            results
+        );
+        assert!(
+            results.iter().any(|(path, _)| path.contains("chunked_test2.txt")),
+            "Expected chunked_test2.txt in results: {:?}",
+            results
+        );
     }
 
     #[test]
@@ -676,26 +728,39 @@ mod tests_autocomplete_commands {
         std::fs::create_dir_all(&subdir).unwrap();
 
         let _file1 = create_temp_file(&temp_dir, "test1.txt", "This is test document one");
-        let _file2 = create_temp_file(
-            &TempDir::new_in(&subdir).unwrap(),
-            "test2.txt",
-            "This is test document two",
-        );
+        let file2_dir = TempDir::new_in(&subdir).unwrap();
+        let _file2 = create_temp_file(&file2_dir, "test2.txt", "This is test document two");
 
-        let state = create_test_search_engine_state();
+        let (state, _settings_dir) = create_test_search_engine_state();
 
         // Add all files recursively (now uses chunked indexing)
         let add_result =
             add_paths_recursive_impl(temp_dir.path().to_string_lossy().to_string(), state.clone());
         assert!(add_result.is_ok());
 
-        // Search for a common term
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                get_search_engine_info_impl(state.clone())
+                    .map(|info| !matches!(info.status, SearchEngineStatus::Indexing))
+                    .unwrap_or(false)
+            }),
+            "Timed out waiting for chunked indexing to complete"
+        );
+
+        // Search for a common term and assert both files were indexed
         let search_result = search_impl("test".to_string(), state.clone());
         assert!(search_result.is_ok());
-        let _results = search_result.unwrap();
-
-        // Chunked indexing happens in the current thread but processes in chunks
-        // We can test that the command succeeded
+        let results = search_result.unwrap();
+        assert!(
+            results.iter().any(|(path, _)| path.contains("test1.txt")),
+            "Expected test1.txt in results: {:?}",
+            results
+        );
+        assert!(
+            results.iter().any(|(path, _)| path.contains("test2.txt")),
+            "Expected test2.txt in results: {:?}",
+            results
+        );
 
         // Remove all files recursively
         let remove_result = remove_paths_recursive_impl(
@@ -704,12 +769,22 @@ mod tests_autocomplete_commands {
         );
         assert!(remove_result.is_ok());
 
-        // Allow some time for removal to complete
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                search_impl("test".to_string(), state.clone())
+                    .map(|r| r.is_empty())
+                    .unwrap_or(false)
+            }),
+            "Timed out waiting for recursive removal to clear search results"
+        );
 
         // Search again after removal
         let search_result_after = search_impl("test".to_string(), state.clone());
         assert!(search_result_after.is_ok());
+        assert!(
+            search_result_after.unwrap().is_empty(),
+            "Expected empty results after recursive removal"
+        );
     }
 }
 

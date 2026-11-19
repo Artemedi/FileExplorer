@@ -50,9 +50,26 @@ fi
 
 print_header "🚀 Universal Explr Build"
 
-# Configuration
-APP_NAME="Explr"
-VERSION="0.2.3"
+# Configuration (read dynamically from manifests)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CARGO_TOML="$SCRIPT_DIR/src-tauri/Cargo.toml"
+TAURI_CONF="$SCRIPT_DIR/src-tauri/tauri.conf.json"
+
+BIN_NAME="$(tr -d '\r' < "$CARGO_TOML" | awk '/^\[package\]/{in_pkg=1; next} /^\[/{in_pkg=0} in_pkg && /^name[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/, ""); print; exit}')"
+BIN_NAME="${BIN_NAME:-explr}"
+
+APP_NAME="$(tr -d '\r' < "$TAURI_CONF" | sed -n 's/.*"productName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+APP_NAME="${APP_NAME:-Explr}"
+
+VERSION="$(tr -d '\r' < "$TAURI_CONF" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+if [ -z "$VERSION" ]; then
+    VERSION="$(tr -d '\r' < "$CARGO_TOML" | awk '/^\[package\]/{in_pkg=1; next} /^\[/{in_pkg=0} in_pkg && /^version[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/, ""); print; exit}')"
+fi
+if [ -z "$VERSION" ]; then
+    print_error "Failed to determine application version from $TAURI_CONF or $CARGO_TOML"
+    exit 1
+fi
+
 TARGETS=("aarch64-apple-darwin" "x86_64-apple-darwin")
 TARGET_NAMES=("Apple Silicon (M1/M2/M3)" "Intel Mac")
 
@@ -135,22 +152,8 @@ for i in "${!TARGETS[@]}"; do
     
     print_status "Applying fixes for $target_name..."
     
-    # Set environment variables for the post-build script
-    export CARGO_CFG_TARGET_ARCH=$(echo $target | cut -d- -f1)
-    export CARGO_CFG_TARGET_OS="macos"
-    
-    # Modify post-build script to work with specific target
-    TARGET_ARCH=$(echo $target | cut -d- -f1)
-    
-    # Create target-specific temp script
-    sed "s/aarch64-apple-darwin/$target/g" post-build.sh > "post-build-$TARGET_ARCH.sh"
-    chmod +x "post-build-$TARGET_ARCH.sh"
-    
-    # Run the fix
-    "./post-build-$TARGET_ARCH.sh"
-    
-    # Clean up temp script
-    rm "post-build-$TARGET_ARCH.sh"
+    TARGET_ARCH=$(echo "$target" | cut -d- -f1)
+    CARGO_CFG_TARGET_ARCH="$TARGET_ARCH" CARGO_CFG_TARGET_OS="macos" ./post-build.sh
     
     print_success "Fixes applied for $target_name"
 done
@@ -160,7 +163,7 @@ cd ../..
 # Step 6: Create distribution directory and copy files
 print_step "Creating distribution package..."
 
-DIST_DIR="dist/file-explorer-$VERSION-macos"
+DIST_DIR="dist/${BIN_NAME}-${VERSION}-macos"
 mkdir -p "$DIST_DIR"
 
 # Copy fixed DMGs
@@ -183,7 +186,7 @@ done
 print_step "Creating installation guide..."
 
 cat > "$DIST_DIR/README.md" << EOF
-# File Explorer v$VERSION - macOS Distribution
+# ${APP_NAME} v$VERSION - macOS Distribution
 
 ## Choose the Right Version
 
@@ -223,7 +226,7 @@ uname -m
 
 1. Download the correct DMG file for your Mac
 2. Double-click the DMG file to mount it
-3. Drag "file-explorer.app" to your Applications folder
+3. Drag "${APP_NAME}.app" to your Applications folder
 4. Launch from Applications or Spotlight search
 
 ## Troubleshooting

@@ -1,23 +1,31 @@
-FROM rust:latest
+FROM rust:1.88-bookworm AS dev
 
 RUN apt-get update && apt-get install -y \
     libwebkit2gtk-4.1-dev \
     libgtk-3-dev \
-    libjavascriptcoregtk-4.1-dev \
-    libsoup-3.0-dev \
+    libayatana-appindicator3-dev \
+    librsvg2-dev \
     pkg-config \
     build-essential \
+    libssl-dev \
+    libglib2.0-dev \
+    curl \
+    wget \
+    file \
     && rm -rf /var/lib/apt/lists/*
 
-# Set the working directory
-WORKDIR /app
+RUN rustup component add clippy rustfmt
 
-# Copy the current directory contents into the container at /app
-COPY . .
+ENV EXPLR_DATA_DIR=/tmp/explr-test-data
 
-WORKDIR /app/src-tauri
+WORKDIR /work
 
-RUN cargo install tauri-cli
+FROM dev AS test
 
-CMD ["cargo", "test"]
+ARG INSTALL_TAURI_CLI=false
+RUN if [ "$INSTALL_TAURI_CLI" = "true" ]; then cargo install tauri-cli; fi
 
+COPY . /work
+RUN mkdir -p /work/dist
+
+CMD ["cargo", "test", "--manifest-path", "src-tauri/Cargo.toml"]

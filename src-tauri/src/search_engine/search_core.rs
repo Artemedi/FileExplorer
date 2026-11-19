@@ -1361,11 +1361,9 @@ pub struct EngineStats {
 mod tests_search_core {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
     use std::thread::sleep;
-    use crate::{log_info, log_warn, log_error};
-    use crate::constants::TEST_DATA_PATH;
-    use crate::search_engine::test_generate_test_data::generate_test_data_if_not_exists;
+    use crate::log_info;
+    use crate::search_engine::test_generate_test_data::create_isolated_test_fixture;
 
     #[test]
     fn test_basic_search() {
@@ -1603,14 +1601,19 @@ mod tests_search_core {
     async fn test_add_paths_recursive() {
         let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
-        let root = "./test-data-for-fuzzy-search/";
-        let root_path = PathBuf::from(root);
-        assert!(root_path.exists(), "Test data directory should exist");
+        let temp_dir = create_isolated_test_fixture(2, 3, 2)
+            .expect("Failed to create isolated test fixture");
+        let root = temp_dir.path().to_string_lossy().to_string();
 
         engine.add_paths_recursive(&root, None).await;
 
         let results = engine.search("train");
         assert!(!results.is_empty(), "Should find train files");
+        assert!(
+            results.iter().any(|(path, _)| path.contains("train")),
+            "Expected train files in results: {:?}",
+            results
+        );
     }
 
     #[tokio::test]
@@ -1800,19 +1803,11 @@ mod tests_search_core {
         );
     }
 
-    // Helper function to get test data directory
-    fn get_test_data_path() -> PathBuf {
-        let path = PathBuf::from(TEST_DATA_PATH);
-        generate_test_data_if_not_exists(PathBuf::from(TEST_DATA_PATH)).unwrap_or_else(|err| {
-            log_error!("Error during test data generation or path lookup: {}", err);
-            panic!("Test data generation failed");
-        });
-        path
-    }
-
-    // Helper function to collect real paths from the test data directory
-    fn collect_test_paths(limit: Option<usize>) -> Vec<String> {
-        let test_path = get_test_data_path();
+    // Helper function to collect real paths from an isolated temporary test fixture
+    fn collect_test_paths(limit: Option<usize>) -> (tempfile::TempDir, Vec<String>) {
+        let (folders, files) = if limit.is_none() { (5, 8) } else { (3, 5) };
+        let temp_dir = create_isolated_test_fixture(folders, files, 2)
+            .expect("Failed to create isolated test fixture");
         let mut paths = Vec::new();
 
         fn add_paths_recursively(
@@ -1826,7 +1821,7 @@ mod tests_search_core {
                 }
             }
 
-            if let Some(walker) = fs::read_dir(dir).ok() {
+            if let Ok(walker) = fs::read_dir(dir) {
                 for entry in walker.filter_map(|e| e.ok()) {
                     let path = entry.path();
                     if let Some(path_str) = path.to_str() {
@@ -1846,18 +1841,8 @@ mod tests_search_core {
             }
         }
 
-        add_paths_recursively(&test_path, &mut paths, limit);
-
-        // If test data doesn't contain enough paths or doesn't exist,
-        // fall back to synthetic data with a warning
-        if paths.is_empty() {
-            log_warn!("No test data found, using synthetic data instead");
-            return (0..100)
-                .map(|i| format!("/path/to/file{}.txt", i))
-                .collect();
-        }
-
-        paths
+        add_paths_recursively(temp_dir.path(), &mut paths, limit);
+        (temp_dir, paths)
     }
 
     #[test]
@@ -1867,8 +1852,8 @@ mod tests_search_core {
         // Create a new engine with reasonable parameters
         let mut engine = SearchCore::new(100, 20, Duration::from_secs(300), RankingConfig::default());
 
-        // Get real-world paths from test data
-        let paths = collect_test_paths(Some(500));
+        // Get real-world paths from isolated fixture
+        let (_test_dir, paths) = collect_test_paths(Some(500));
         log_info!("Collected {} test paths", paths.len());
 
         // Add all paths to the engine
@@ -2116,8 +2101,8 @@ mod tests_search_core {
         // Create a new engine with reasonable parameters
         let mut engine = SearchCore::new(100, 20, Duration::from_secs(300), RankingConfig::default());
 
-        // Get ALL available test paths (no limit)
-        let paths = collect_test_paths(None);
+        // Get ALL available test paths from isolated fixture
+        let (_test_dir, paths) = collect_test_paths(None);
         log_info!("Collected {} test paths", paths.len());
 
         // Add all paths to the engine
@@ -2345,8 +2330,8 @@ mod tests_search_core {
     fn benchmark_search_with_all_paths_search_core() {
         log_info!("Benchmarking search core with thousands of real-world paths");
 
-        // 1. Collect all available paths
-        let paths = collect_test_paths(None); // Get all available paths
+        // 1. Collect all available paths from isolated fixture
+        let (_test_dir, paths) = collect_test_paths(None); // Get all available paths
         let path_count = paths.len();
 
         log_info!("Collected {} test paths", path_count);

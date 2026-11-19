@@ -1,5 +1,8 @@
 # Ignore build folders
+/target
 /src-tauri/target
+/dist
+/node_modules
 node_modules/
 
 # Ignore temporary or cache files

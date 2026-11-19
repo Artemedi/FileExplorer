@@ -306,22 +306,25 @@ mod tests_hash_commands {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    // Testing: Helper function to create a test SettingsState
-    fn create_test_settings_state() -> Arc<Mutex<SettingsState>> {
-        let temp_file = tempfile::NamedTempFile::new().unwrap();
-        let path = temp_file.path().to_path_buf();
+    // Testing: Helper function to create an isolated test SettingsState with RAII TempDir
+    fn create_test_settings_state() -> (Arc<Mutex<SettingsState>>, tempfile::TempDir) {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let path = temp_dir.path().join("settings.json");
 
-        // Create a settings state with a temporary file path
-        Arc::new(Mutex::new(SettingsState::new_with_path(path)))
+        // Create a settings state with a temporary file path kept alive by TempDir
+        let state = Arc::new(Mutex::new(SettingsState::new_with_path(path)));
+        (state, temp_dir)
     }
 
-    fn create_test_state(method: ChecksumMethod) -> Arc<Mutex<SettingsState>> {
-        let state = create_test_settings_state();
-        let state_guard = state.lock().unwrap();
-        state_guard
-            .update_setting_field("backend_settings.default_checksum_hash", json!(method))
-            .unwrap();
-        state.clone()
+    fn create_test_state(method: ChecksumMethod) -> (Arc<Mutex<SettingsState>>, tempfile::TempDir) {
+        let (state, temp_dir) = create_test_settings_state();
+        {
+            let state_guard = state.lock().unwrap();
+            state_guard
+                .update_setting_field("backend_settings.default_checksum_hash", json!(method))
+                .unwrap();
+        }
+        (state, temp_dir)
     }
 
     #[tokio::test]
@@ -335,7 +338,7 @@ mod tests_hash_commands {
         file.write_all(test_content)
             .expect("Failed to write test content");
 
-        let mock_state = create_test_state(ChecksumMethod::SHA256);
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
         let state: Arc<Mutex<SettingsState>> = mock_state.clone();
 
         let result = gen_hash_and_save_to_file_impl(
@@ -366,7 +369,7 @@ mod tests_hash_commands {
         file.write_all(test_content)
             .expect("Failed to write test content");
 
-        let mock_state = create_test_state(ChecksumMethod::SHA256);
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
         let state: Arc<Mutex<SettingsState>> = mock_state.clone();
 
         let correct_hash = "315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3";
@@ -412,7 +415,7 @@ mod tests_hash_commands {
             ];
 
         for (method, expected_hash) in expected_hashes {
-            let mock_state = create_test_state(method.clone());
+            let (mock_state, _settings_dir) = create_test_state(method.clone());
 
             let result = gen_hash_and_return_string_impl(
                 test_file_path.to_str().unwrap().to_string(),
@@ -428,7 +431,7 @@ mod tests_hash_commands {
 
     #[tokio::test]
     async fn test_non_existent_file() {
-        let mock_state = create_test_state(ChecksumMethod::SHA256);
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
         let non_existent_path = "not_a_real_file.txt";
 
         let result =
@@ -447,7 +450,7 @@ mod tests_hash_commands {
         let test_file_path = temp_dir.path().join("empty.txt");
         std::fs::File::create(&test_file_path).expect("Failed to create empty file");
 
-        let mock_state = create_test_state(ChecksumMethod::SHA256);
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
         let result = gen_hash_and_return_string_impl(
             test_file_path.to_str().unwrap().to_string(),
             mock_state,
@@ -467,7 +470,7 @@ mod tests_hash_commands {
         let test_file_path = temp_dir.path().join("test.txt");
         std::fs::write(&test_file_path, b"test data").expect("Failed to write test file");
 
-        let mock_state = create_test_state(ChecksumMethod::SHA256);
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
 
         let result = compare_file_or_dir_with_hash_impl(
             test_file_path.to_str().unwrap().to_string(),
@@ -488,7 +491,7 @@ mod tests_hash_commands {
             .join("test with spaces & special chars!@#$.txt");
         std::fs::write(&test_file_path, b"test data").expect("Failed to write test file");
 
-        let mock_state = create_test_state(ChecksumMethod::SHA256);
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
         let result = gen_hash_and_return_string_impl(
             test_file_path.to_str().unwrap().to_string(),
             mock_state,
@@ -505,7 +508,7 @@ mod tests_hash_commands {
         let binary_data: Vec<u8> = (0..255).collect();
         std::fs::write(&test_file_path, &binary_data).expect("Failed to write binary file");
 
-        let mock_state = create_test_state(ChecksumMethod::SHA256);
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
         let result = gen_hash_and_return_string_impl(
             test_file_path.to_str().unwrap().to_string(),
             mock_state,
@@ -521,7 +524,7 @@ mod tests_hash_commands {
         let test_file_path = temp_dir.path().join("switch_test.txt");
         std::fs::write(&test_file_path, b"test data").expect("Failed to write test file");
 
-        let state = create_test_settings_state();
+        let (state, _settings_dir) = create_test_settings_state();
         let file_path = test_file_path.to_str().unwrap().to_string();
 
         let methods = vec![
@@ -552,7 +555,7 @@ mod tests_hash_commands {
         let unicode_content = "Hello, 世界! こんにちは! 🌍 👋";
         std::fs::write(&test_file_path, unicode_content).expect("Failed to write unicode file");
 
-        let mock_state = create_test_state(ChecksumMethod::SHA256);
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
         let result = gen_hash_and_return_string_impl(
             test_file_path.to_str().unwrap().to_string(),
             mock_state,
@@ -569,7 +572,7 @@ mod tests_hash_commands {
         let data = vec![0, 255, 0, 255, 0];
         std::fs::write(&test_file_path, &data).expect("Failed to write file");
 
-        let mock_state = create_test_state(ChecksumMethod::SHA256);
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
         let result = gen_hash_and_return_string_impl(
             test_file_path.to_str().unwrap().to_string(),
             mock_state,
@@ -594,7 +597,7 @@ mod tests_hash_commands {
                 .expect("Failed to write chunk");
         }
 
-        let mock_state = create_test_state(ChecksumMethod::SHA256);
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
         let result = gen_hash_and_return_string_impl(
             test_file_path.to_str().unwrap().to_string(),
             mock_state,

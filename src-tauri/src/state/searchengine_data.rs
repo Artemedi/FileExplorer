@@ -1325,23 +1325,24 @@ impl Clone for SearchEngineState {
 }
 
 #[cfg(test)]
-// Helper function to get test data directory
-fn get_test_data_path() -> PathBuf {
-    use crate::search_engine::test_generate_test_data::generate_test_data_if_not_exists;
-    use crate::constants::TEST_DATA_PATH;
-
-    let path = PathBuf::from(TEST_DATA_PATH);
-    generate_test_data_if_not_exists(PathBuf::from(TEST_DATA_PATH)).unwrap_or_else(|err| {
-        log_error!("Error during test data generation or path lookup: {}", err);
-        panic!("Test data generation failed");
-    });
-    path
+fn create_isolated_test_settings() -> (Arc<Mutex<SettingsState>>, tempfile::TempDir) {
+    let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory for settings");
+    let settings_path = temp_dir.path().join("settings.json");
+    let settings_state = Arc::new(Mutex::new(SettingsState::new_with_path(settings_path)));
+    (settings_state, temp_dir)
 }
 
 #[cfg(test)]
-// Helper function to collect real paths from the test data directory
-fn collect_test_paths(limit: Option<usize>) -> Vec<String> {
-    let test_path = get_test_data_path();
+// Helper function to create an isolated temporary test data directory
+fn get_test_data_path() -> tempfile::TempDir {
+    crate::search_engine::test_generate_test_data::create_isolated_test_fixture(3, 5, 2)
+        .expect("Failed to create isolated test fixture")
+}
+
+#[cfg(test)]
+// Helper function to collect real paths from an isolated temporary fixture
+fn collect_test_paths(limit: Option<usize>) -> (tempfile::TempDir, Vec<String>) {
+    let test_dir = get_test_data_path();
     let mut paths = Vec::new();
 
     fn add_paths_recursively(dir: &std::path::Path, paths: &mut Vec<String>, limit: Option<usize>) {
@@ -1351,7 +1352,7 @@ fn collect_test_paths(limit: Option<usize>) -> Vec<String> {
             }
         }
 
-        if let Some(walker) = fs::read_dir(dir).ok() {
+        if let Ok(walker) = fs::read_dir(dir) {
             for entry in walker.filter_map(|e| e.ok()) {
                 let path = entry.path();
                 if let Some(path_str) = path.to_str() {
@@ -1371,18 +1372,23 @@ fn collect_test_paths(limit: Option<usize>) -> Vec<String> {
         }
     }
 
-    add_paths_recursively(&test_path, &mut paths, limit);
+    add_paths_recursively(test_dir.path(), &mut paths, limit);
+    (test_dir, paths)
+}
 
-    // If test data doesn't contain enough paths or doesn't exist,
-    // fall back to synthetic data with a warning
-    if paths.is_empty() {
-        log_warn!("No test data found, using synthetic data instead");
-        return (0..100)
-            .map(|i| format!("/path/to/file{}.txt", i))
-            .collect();
+#[cfg(test)]
+fn wait_until<F>(timeout: std::time::Duration, mut predicate: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let start = Instant::now();
+    while !predicate() {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-
-    paths
+    true
 }
 
 #[cfg(test)]
@@ -1393,72 +1399,24 @@ mod tests_searchengine_state {
     use std::thread;
     use std::time::Duration;
 
-    // Helper function to get a directory for indexing from test paths
-    fn get_test_dir_for_indexing() -> PathBuf {
-        let paths = collect_test_paths(Some(20));
-
-        // First try to find a directory path from the collected paths
-        for path in &paths {
-            let path_buf = PathBuf::from(path);
-            if path_buf.is_dir() {
-                return path_buf;
-            }
-        }
-
-        // If no directory found, use the parent of the first file path
-        if let Some(first_path) = paths.first() {
-            let path_buf = PathBuf::from(first_path);
-            if let Some(parent) = path_buf.parent() {
-                return parent.to_path_buf();
-            }
-        }
-
-        // Fallback to the test data root
+    // Helper function to get an isolated temporary directory for indexing
+    fn get_test_dir_for_indexing() -> tempfile::TempDir {
         get_test_data_path()
     }
 
-    // Helper function to get a subdirectory from test data for indexing tests
-    fn get_test_subdirs() -> (PathBuf, PathBuf) {
-        let test_data_root = get_test_data_path();
-
-        // Try to find two different subdirectories
-        let mut dirs = Vec::new();
-
-        if let Ok(entries) = fs::read_dir(&test_data_root) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.is_dir() {
-                    dirs.push(path);
-                    if dirs.len() >= 2 {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // If we found two directories, return them
-        if dirs.len() >= 2 {
-            return (dirs[0].clone(), dirs[1].clone());
-        }
-
-        // Otherwise, create two temporary subdirectories
-        let subdir1 = test_data_root.join("test_subdir1");
-        let subdir2 = test_data_root.join("test_subdir2");
-
-        // Create the directories if they don't exist
-        if !subdir1.exists() {
-            let _ = fs::create_dir_all(&subdir1);
-        }
-        if !subdir2.exists() {
-            let _ = fs::create_dir_all(&subdir2);
-        }
-
-        (subdir1, subdir2)
+    // Helper function to get two isolated subdirectories for indexing tests
+    fn get_test_subdirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root_dir = get_test_data_path();
+        let subdir1 = root_dir.path().join("subdir_alpha");
+        let subdir2 = root_dir.path().join("subdir_beta");
+        let _ = fs::create_dir_all(&subdir1);
+        let _ = fs::create_dir_all(&subdir2);
+        (root_dir, subdir1, subdir2)
     }
 
     #[test]
     fn test_initialization() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Check default values
@@ -1470,19 +1428,23 @@ mod tests_searchengine_state {
         assert!(data.recent_activity.recent_searches.is_empty());
     }
 
-    #[cfg(feature = "long-tests")]
     #[test]
     fn test_start_indexing() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
         let test_dir = get_test_dir_for_indexing();
+        let test_path = test_dir.path().to_path_buf();
 
         // Start indexing
-        let result = state.start_indexing(test_dir.clone());
+        let result = state.start_indexing(test_path.clone());
         assert!(result.is_ok(), "Indexing should start successfully");
 
-        // Allow some time for indexing to complete
-        thread::sleep(Duration::from_millis(200));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for indexing to complete"
+        );
 
         // Check that indexing completed
         let data = state.data.lock().unwrap();
@@ -1490,44 +1452,57 @@ mod tests_searchengine_state {
             data.status,
             SearchEngineStatus::Idle | SearchEngineStatus::Cancelled
         ));
-        assert_eq!(data.index_folder, test_dir);
+        assert_eq!(data.index_folder, test_path);
         assert!(data.metrics.last_indexing_duration_ms.is_some());
     }
 
     #[cfg(feature = "long-tests")]
     #[test]
+    fn test_start_indexing_large_dataset() {
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
+        let state = SearchEngineState::new(settings_state);
+        let test_dir = crate::search_engine::test_generate_test_data::create_isolated_test_fixture(6, 8, 2)
+            .expect("Failed to create large isolated test fixture");
+        let test_path = test_dir.path().to_path_buf();
+
+        let result = state.start_indexing(test_path.clone());
+        assert!(result.is_ok(), "Large indexing should start successfully");
+
+        let data = state.data.lock().unwrap();
+        assert_eq!(data.status, SearchEngineStatus::Idle);
+        assert_eq!(data.index_folder, test_path);
+        assert!(data.metrics.last_indexing_duration_ms.is_some());
+    }
+
+    #[test]
     fn test_stop_indexing() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = Arc::new(SearchEngineState::new(settings_state));
         let test_dir = get_test_dir_for_indexing();
+        let test_path = test_dir.path().to_path_buf();
 
-        // Create test files to ensure indexing takes enough time
-        let mut test_files = Vec::new();
-        for i in 0..1000 {
-            // Increased to 1000 files to ensure indexing takes time
-            let file_path = test_dir.join(format!("testfile_{}.txt", i));
+        // Create test files inside isolated TempDir
+        for i in 0..200 {
+            let file_path = test_path.join(format!("testfile_{}.txt", i));
             let _ = fs::write(&file_path, format!("Test content {}", i));
-            test_files.push(file_path);
         }
 
-        // Use more reliable synchronization
+        // Synchronize deterministically: hold Indexing state until main thread stops it
         let (status_tx, status_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
 
         // Clone the Arc for the thread to use
         let state_clone = Arc::clone(&state);
-        let test_dir_clone = test_dir.clone();
+        let test_dir_clone = test_path.clone();
 
         let indexing_thread = thread::spawn(move || {
-            // First manually set the status to Indexing to guarantee we're in that state
             {
                 let mut data = state_clone.data.lock().unwrap();
                 data.status = SearchEngineStatus::Indexing;
-
-                // Signal the test thread that we've set the status
                 status_tx.send(()).unwrap();
             }
 
-            // Now start the actual indexing (which may take a while)
+            proceed_rx.recv().unwrap();
             state_clone.start_indexing(test_dir_clone).unwrap();
         });
 
@@ -1548,7 +1523,6 @@ mod tests_searchengine_state {
         let stop_result = state.stop_indexing();
         assert!(stop_result.is_ok(), "Should successfully stop indexing");
 
-        // Verify that stopping worked - can be either Cancelled or Idle depending on timing
         {
             let data = state.data.lock().unwrap();
             assert!(
@@ -1557,48 +1531,39 @@ mod tests_searchengine_state {
             );
         }
 
-        // Wait for indexing thread to complete
+        proceed_tx.send(()).unwrap();
         indexing_thread.join().unwrap();
-
-        // Clean up test files (best effort, don't fail test if cleanup fails)
-        for file in test_files {
-            let _ = fs::remove_file(file);
-        }
     }
 
     #[test]
     fn test_cancel_indexing() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = Arc::new(SearchEngineState::new(settings_state));
         let test_dir = get_test_dir_for_indexing();
+        let test_path = test_dir.path().to_path_buf();
 
-        // Create a LOT of test files to ensure indexing takes enough time
-        let mut test_files = Vec::new();
-        for i in 0..1000 {
-            // Use 1000 files to ensure indexing takes time
-            let file_path = test_dir.join(format!("cancel_test_file_{}.txt", i));
+        // Create test files inside isolated TempDir
+        for i in 0..200 {
+            let file_path = test_path.join(format!("cancel_test_file_{}.txt", i));
             let _ = fs::write(&file_path, format!("Test content {}", i));
-            test_files.push(file_path);
         }
 
-        // Use more reliable synchronization with channel
+        // Synchronize deterministically: hold Indexing state until main thread cancels it
         let (status_tx, status_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
 
         // Clone the Arc for the thread to use
         let state_clone = Arc::clone(&state);
-        let test_dir_clone = test_dir.clone();
+        let test_dir_clone = test_path.clone();
 
         let indexing_thread = thread::spawn(move || {
-            // First manually set the status to Indexing to guarantee we're in that state
             {
                 let mut data = state_clone.data.lock().unwrap();
                 data.status = SearchEngineStatus::Indexing;
-
-                // Signal the test thread that we've set the status
                 status_tx.send(()).unwrap();
             }
 
-            // Now start the actual indexing
+            proceed_rx.recv().unwrap();
             state_clone.start_indexing(test_dir_clone).unwrap();
         });
 
@@ -1619,10 +1584,10 @@ mod tests_searchengine_state {
         let cancel_result = state.cancel_indexing();
         assert!(cancel_result.is_ok(), "Should successfully cancel indexing");
 
-        // Wait for indexing thread to complete
+        proceed_tx.send(()).unwrap();
         indexing_thread.join().unwrap();
 
-        // Verify final status - could be either Cancelled or Idle depending on timing
+        // Verify final status
         {
             let data = state.data.lock().unwrap();
             assert!(
@@ -1631,20 +1596,15 @@ mod tests_searchengine_state {
                 data.status
             );
         }
-
-        // Clean up test files (best effort, don't fail test if cleanup fails)
-        for file in test_files {
-            let _ = fs::remove_file(file);
-        }
     }
 
     #[test]
     fn test_search() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Get paths and add them directly to the engine
-        let paths = collect_test_paths(Some(100));
+        let (_test_dir, paths) = collect_test_paths(Some(100));
         for path in &paths {
             let _ = state.add_path(path);
         }
@@ -1684,11 +1644,11 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_multiple_searches() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Get paths and add them directly to the engine
-        let paths = collect_test_paths(Some(100));
+        let (_test_dir, paths) = collect_test_paths(Some(100));
         for path in &paths {
             let _ = state.add_path(path);
         }
@@ -1730,23 +1690,24 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_concurrent_operations() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = Arc::new(SearchEngineState::new(settings_state));
 
-        // Get a test directory for indexing
-        let (test_dir, subdir) = get_test_subdirs();
+        // Get two isolated subdirectories for indexing
+        let (_root_dir, test_dir, subdir) = get_test_subdirs();
 
-        // Create a LOT of test files to ensure indexing takes time
-        let mut test_files = Vec::new();
-        for i in 0..1000 {
-            // Increased to 1000 files to ensure indexing takes time
+        // Create test files inside isolated TempDir
+        for i in 0..200 {
             let file_path = test_dir.join(format!("concurrent_test_{}.txt", i));
             let _ = fs::write(&file_path, format!("Test content {}", i));
-            test_files.push(file_path);
         }
 
-        // Use more reliable synchronization
+        // Synchronize deterministically:
+        // 1) Let indexing_thread hold Indexing state while main thread verifies search rejection.
+        // 2) Wait until indexing_thread enters start_indexing(test_dir) and updates index_folder
+        //    before main thread starts indexing subdir, avoiding a start-order race.
         let (status_tx, status_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
 
         // Clone the Arc for the thread to use
         let state_clone = Arc::clone(&state);
@@ -1762,7 +1723,10 @@ mod tests_searchengine_state {
                 status_tx.send(()).unwrap();
             }
 
-            // Now start the actual indexing (which may take a while)
+            // Wait until the main thread has checked search() under Indexing state
+            proceed_rx.recv().unwrap();
+
+            // Now start the actual indexing
             state_clone.start_indexing(test_dir_clone).unwrap();
         });
 
@@ -1790,6 +1754,15 @@ mod tests_searchengine_state {
             "Error should mention indexing"
         );
 
+        // Allow indexing_thread to start indexing test_dir and wait until it sets index_folder = test_dir
+        proceed_tx.send(()).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                state.data.lock().unwrap().index_folder == test_dir
+            }),
+            "Timed out waiting for indexing_thread to begin indexing test_dir"
+        );
+
         // Try to start another indexing operation - should stop the previous one and start new
         let second_index_result = state.start_indexing(subdir.clone());
         assert!(
@@ -1800,9 +1773,6 @@ mod tests_searchengine_state {
         // Wait for indexing thread to complete
         indexing_thread.join().unwrap();
 
-        // Allow more time for the second indexing operation to complete and update the state
-        thread::sleep(Duration::from_millis(1000)); // Increased wait time to 1 second
-
         // Get the expected directory name for comparison
         let expected_name = subdir
             .file_name()
@@ -1810,74 +1780,36 @@ mod tests_searchengine_state {
             .to_string_lossy()
             .to_string();
 
-        // Retry mechanism for checking the directory - sometimes indexing takes longer
-        let max_attempts = 5;
-        let mut attempt = 0;
-        let mut success = false;
-
-        while attempt < max_attempts && !success {
+        let success = wait_until(Duration::from_secs(5), || {
             let data = state.data.lock().unwrap();
-
-            // Check if we're still indexing
             if matches!(data.status, SearchEngineStatus::Indexing) {
-                // Skip this attempt if still indexing
-                log_info!(
-                    "Attempt {}: Indexing still in progress, waiting...",
-                    attempt + 1
-                );
-                drop(data); // Release the lock before sleeping
-                thread::sleep(Duration::from_millis(500));
-            } else {
-                // Get just the filename component for comparison
-                let actual_name = data
-                    .index_folder
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-
-                log_info!(
-                    "Attempt {}: Actual folder name: '{}', Expected: '{}'",
-                    attempt + 1,
-                    actual_name,
-                    expected_name
-                );
-
-                // If names match or one contains the other (to handle path formatting differences)
-                if actual_name == expected_name
-                    || actual_name.contains(&expected_name)
-                    || expected_name.contains(&actual_name)
-                {
-                    success = true;
-                    log_info!("Directory name check passed!");
-                } else {
-                    drop(data); // Release the lock before sleeping
-                    thread::sleep(Duration::from_millis(500));
-                }
+                return false;
             }
-
-            attempt += 1;
-        }
+            let actual_name = data
+                .index_folder
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            actual_name == expected_name
+                || actual_name.contains(&expected_name)
+                || expected_name.contains(&actual_name)
+        });
 
         assert!(
             success,
-            "Failed to verify index folder was updated after {} attempts",
-            max_attempts
+            "Failed to verify index folder was updated to '{}' within timeout",
+            expected_name
         );
-
-        // Clean up test files (best effort, don't fail test if cleanup fails)
-        for file in test_files {
-            let _ = fs::remove_file(file);
-        }
     }
 
     #[test]
     fn test_directory_context_for_search() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Get paths from test data
-        let paths = collect_test_paths(Some(200));
+        // Get paths from isolated test fixture
+        let (test_dir, paths) = collect_test_paths(Some(200));
 
         // Add paths directly to the engine
         for path in &paths {
@@ -1890,10 +1822,10 @@ mod tests_searchengine_state {
             if let Some(parent) = path_buf.parent() {
                 parent.to_string_lossy().to_string()
             } else {
-                get_test_data_path().to_string_lossy().to_string()
+                test_dir.path().to_string_lossy().to_string()
             }
         } else {
-            get_test_data_path().to_string_lossy().to_string()
+            test_dir.path().to_string_lossy().to_string()
         };
 
         // Update configuration with directory context
@@ -1935,11 +1867,11 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_sequential_indexing() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Get two subdirectories for sequential indexing
-        let (subdir1, subdir2) = get_test_subdirs();
+        // Get two isolated subdirectories for sequential indexing
+        let (_root_dir, subdir1, subdir2) = get_test_subdirs();
 
         // Add some test files to both directories to ensure they have content
         let file1 = subdir1.join("testfile1.txt");
@@ -1951,8 +1883,12 @@ mod tests_searchengine_state {
         // Index first directory
         let _ = state.start_indexing(subdir1.clone());
 
-        // Allow indexing to complete
-        thread::sleep(Duration::from_millis(200));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for first indexing"
+        );
 
         // Search for the first file
         let search1 = state.search("testfile1");
@@ -1967,8 +1903,12 @@ mod tests_searchengine_state {
         // Now index second directory
         let _ = state.start_indexing(subdir2.clone());
 
-        // Allow indexing to complete
-        thread::sleep(Duration::from_millis(200));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for second indexing"
+        );
 
         // Search for the second file
         let search2 = state.search("testfile2");
@@ -1980,7 +1920,7 @@ mod tests_searchengine_state {
             "Should find testfile2 after indexing second directory"
         );
 
-        // First file should no longer be found (or at least not ranked highly)
+        // First file should no longer be found
         let search1_again = state.search("testfile1");
         assert!(search1_again.is_ok());
         let results1_again = search1_again.unwrap();
@@ -1991,19 +1931,15 @@ mod tests_searchengine_state {
             !still_has_file1,
             "Should not find testfile1 after switching indexes"
         );
-
-        // Clean up test files
-        let _ = fs::remove_file(file1);
-        let _ = fs::remove_file(file2);
     }
 
     #[test]
     fn test_empty_search_query() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Add some test paths
-        let paths = collect_test_paths(Some(50));
+        let (_test_dir, paths) = collect_test_paths(Some(50));
         for path in &paths {
             let _ = state.add_path(path);
         }
@@ -2019,7 +1955,7 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_update_indexing_progress() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Set initial state for testing progress updates
@@ -2049,7 +1985,7 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_get_stats() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Get initial stats
@@ -2057,7 +1993,7 @@ mod tests_searchengine_state {
         assert_eq!(initial_stats.trie_size, 0);
 
         // Add paths
-        let paths = collect_test_paths(Some(20));
+        let (_test_dir, paths) = collect_test_paths(Some(20));
         for path in &paths {
             let _ = state.add_path(path);
         }
@@ -2076,7 +2012,7 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_update_config() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Update the configuration
@@ -2090,7 +2026,7 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_add_and_remove_path() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Add a path
@@ -2119,7 +2055,7 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_start_indexing_invalid_path() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Try to index an invalid path
@@ -2129,18 +2065,21 @@ mod tests_searchengine_state {
         // Should still return Ok since the error is handled internally
         assert!(result.is_ok());
 
-        // But the status should be Failed or Idle
-        thread::sleep(Duration::from_millis(50)); // Wait for status update
-        let data = state.data.lock().unwrap();
-        assert!(matches!(
-            data.status,
-            SearchEngineStatus::Failed | SearchEngineStatus::Idle
-        ));
+        // Status should be Failed or Idle
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                matches!(
+                    state.data.lock().unwrap().status,
+                    SearchEngineStatus::Failed | SearchEngineStatus::Idle
+                )
+            }),
+            "Timed out waiting for invalid path indexing status"
+        );
     }
 
     #[test]
     fn test_stop_indexing_when_not_indexing() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Set state to Idle to ensure we're not indexing
@@ -2159,27 +2098,25 @@ mod tests_searchengine_state {
             .contains("No indexing operation in progress"));
     }
 
-    #[cfg(feature = "long-tests")]
     #[test]
     fn test_thread_safety() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = Arc::new(SearchEngineState::new(settings_state));
         let state_clone = Arc::clone(&state);
         let test_dir = get_test_dir_for_indexing();
+        let test_path = test_dir.path().to_path_buf();
 
-        // Create a LOT of test files to ensure indexing takes time
-        let mut test_files = Vec::new();
-        for i in 0..1000 {
-            // Increased to 1000 files to ensure indexing takes time
-            let file_path = test_dir.join(format!("thread_safety_test_{}.txt", i));
+        // Create test files inside isolated TempDir
+        for i in 0..200 {
+            let file_path = test_path.join(format!("thread_safety_test_{}.txt", i));
             let _ = fs::write(&file_path, format!("Test content {}", i));
-            test_files.push(file_path);
         }
 
-        // Use more reliable synchronization
+        // Synchronize deterministically: hold Indexing state while main thread tests rejection and stop
         let (status_tx, status_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
 
-        let test_dir_clone = test_dir.clone();
+        let test_dir_clone = test_path.clone();
 
         let indexing_thread = thread::spawn(move || {
             {
@@ -2188,6 +2125,7 @@ mod tests_searchengine_state {
                 status_tx.send(()).unwrap();
             }
 
+            proceed_rx.recv().unwrap();
             state_clone.start_indexing(test_dir_clone).unwrap();
         });
 
@@ -2204,8 +2142,10 @@ mod tests_searchengine_state {
         assert!(search_result.unwrap_err().contains("indexing"));
 
         // Stop the indexing operation
-        let _ = state.stop_indexing();
+        let stop_result = state.stop_indexing();
+        assert!(stop_result.is_ok(), "Should stop active indexing state");
 
+        proceed_tx.send(()).unwrap();
         indexing_thread.join().unwrap();
 
         // Set status back to Idle to allow successful search
@@ -2217,16 +2157,11 @@ mod tests_searchengine_state {
         // Now search should work
         let after_search = state.search("document");
         assert!(after_search.is_ok());
-
-        // Clean up test files (best effort, don't fail test if cleanup fails)
-        for file in test_files {
-            let _ = fs::remove_file(file);
-        }
     }
 
     #[test]
     fn test_clone_implementation() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Test that we can clone the state
@@ -2249,9 +2184,9 @@ mod tests_searchengine_state {
     #[test]
     fn test_interactive_search_scenarios() {
         // This test simulates a user interacting with the search engine
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
-        let mut paths = collect_test_paths(Some(100)); // Reduced for test stability
+        let (_test_dir, mut paths) = collect_test_paths(Some(100));
 
         // Ensure we have distinct paths with predictable content
         paths.push("/test/document1.txt".to_string());
@@ -2317,25 +2252,22 @@ mod tests_searchengine_state {
         } else {
             log_info!("Skipping assertion - test data has more 'doc' matches than 'do' matches");
         }
-
-        // Rest of the test remains unchanged
-        // ...existing code...
     }
 
     #[test]
     fn test_with_real_world_data() {
-        log_info!("Testing SearchEngineState with real-world test data");
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        log_info!("Testing SearchEngineState with isolated fixture test data");
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Get real-world paths from test data (limit to 100 for stability)
-        let mut paths = collect_test_paths(Some(100));
+        // Get paths from isolated TempDir fixture
+        let (test_dir, mut paths) = collect_test_paths(Some(100));
         log_info!("Collected {} test paths", paths.len());
 
-        // Add some guaranteed test paths
-        paths.push("./test-data-for-fuzzy-search/file1.txt".to_string());
-        paths.push("./test-data-for-fuzzy-search/file2.txt".to_string());
-        paths.push("./test-data-for-fuzzy-search/test.md".to_string());
+        // Add guaranteed paths inside the isolated TempDir
+        paths.push(test_dir.path().join("file1.txt").to_string_lossy().to_string());
+        paths.push(test_dir.path().join("file2.txt").to_string_lossy().to_string());
+        paths.push(test_dir.path().join("test.md").to_string_lossy().to_string());
 
         // Add paths directly to the engine
         let start = Instant::now();
@@ -2389,13 +2321,13 @@ mod tests_searchengine_state {
 
         assert!(
             found_results,
-            "Should find results with real-world data using at least one of the test queries"
+            "Should find results with isolated fixture data using at least one of the test queries"
         );
     }
 
     #[test]
     fn test_search_by_extension() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Add paths with different extensions
@@ -2500,26 +2432,32 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_start_chunked_indexing() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Get a test directory for indexing
+        // Get an isolated TempDir for indexing
         let test_dir = get_test_dir_for_indexing();
+        let test_path = test_dir.path().to_path_buf();
 
         // Create test files to ensure we have enough for multiple chunks
-        let mut test_files = Vec::new();
         for i in 0..100 {
-            let file_path = test_dir.join(format!("chunked_test_{}.txt", i));
+            let file_path = test_path.join(format!("chunked_test_{}.txt", i));
             let _ = fs::write(&file_path, format!("Test content {}", i));
-            test_files.push(file_path);
         }
 
         // Use a small chunk size to ensure multiple chunks
         let chunk_size = 10;
 
         // Start chunked indexing
-        let result = state.start_chunked_indexing(test_dir.clone(), chunk_size);
+        let result = state.start_chunked_indexing(test_path, chunk_size);
         assert!(result.is_ok(), "Chunked indexing should start successfully");
+
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
         // After indexing completes, verify the status is Idle
         let data = state.data.lock().unwrap();
@@ -2549,50 +2487,65 @@ mod tests_searchengine_state {
             found_chunked_test,
             "Should find at least one chunked test file"
         );
+    }
 
-        // Clean up test files
-        for file in test_files {
-            let _ = fs::remove_file(file);
+    /// Creates an isolated TempDir fixture large enough for deterministic mid-run cancellation tests.
+    fn create_chunked_cancel_fixture(prefix: &str) -> tempfile::TempDir {
+        let test_dir =
+            tempfile::tempdir().expect("Failed to create temp dir for chunked cancel fixture");
+        let test_path = test_dir.path();
+        for dir_idx in 0..25 {
+            let sub = test_path.join(format!("sub_{}", dir_idx));
+            fs::create_dir_all(&sub).unwrap();
+            for file_idx in 0..120 {
+                let file_path = sub.join(format!("{}_{}_{}.txt", prefix, dir_idx, file_idx));
+                fs::write(&file_path, "chunked cancel test").unwrap();
+            }
+        }
+        test_dir
+    }
+
+    /// Waits until chunked indexing has cleared reset_stop_flag() and begun discovering entries.
+    fn wait_for_chunked_indexing_active(state: &SearchEngineState) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let data = state.data.lock().unwrap();
+                if matches!(data.status, SearchEngineStatus::Indexing)
+                    && data.progress.files_discovered > 0
+                {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
     #[test]
     fn test_start_chunked_indexing_cancellation() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = Arc::new(SearchEngineState::new(settings_state));
         let state_clone = Arc::clone(&state);
 
-        // Get a test directory for indexing
-        let test_dir = get_test_dir_for_indexing();
-
-        // Create test files to ensure we have enough for multiple chunks
-        let mut test_files = Vec::new();
-        for i in 0..200 {
-            let file_path = test_dir.join(format!("cancel_chunked_{}.txt", i));
-            let _ = fs::write(&file_path, format!("Test content {}", i));
-            test_files.push(file_path);
-        }
-
-        // Use a small chunk size with delay to ensure we can cancel mid-operation
-        let chunk_size = 5;
-
-        // Start chunked indexing in a separate thread
-        let test_dir_clone = test_dir.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
+        // Create isolated TempDir with enough files across subdirectories so chunked indexing
+        // runs long enough (>200ms via sub-batch yields) for deterministic mid-run cancellation
+        let test_dir = create_chunked_cancel_fixture("cancel_chunked");
+        let chunk_size = 25;
+        let test_dir_clone = test_dir.path().to_path_buf();
 
         let indexing_thread = thread::spawn(move || {
-            // Signal that we're about to start indexing
-            tx.send(()).unwrap();
-
             let result = state_clone.start_chunked_indexing(test_dir_clone, chunk_size);
             assert!(result.is_ok());
         });
 
-        // Wait for the signal that indexing is about to start
-        rx.recv().unwrap();
-
-        // Give indexing a moment to begin
-        thread::sleep(Duration::from_millis(50));
+        // Wait until chunked indexing has genuinely entered Indexing and started processing entries
+        assert!(
+            wait_for_chunked_indexing_active(&state),
+            "Chunked indexing did not enter active Indexing state in time"
+        );
 
         // Now stop indexing
         {
@@ -2610,28 +2563,27 @@ mod tests_searchengine_state {
             SearchEngineStatus::Cancelled,
             "Status should be Cancelled after stopping indexing"
         );
-
-        // Clean up test files
-        for file in test_files {
-            let _ = fs::remove_file(file);
-        }
     }
 
     // ========== NEW CHUNKED INDEXING TESTS ==========
 
-    #[cfg(feature = "long-tests")]
     #[test]
     fn test_start_chunked_indexing_basic() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
         let test_dir = get_test_dir_for_indexing();
+        let test_path = test_dir.path().to_path_buf();
 
         // Start chunked indexing with chunk size 100
-        let result = state.start_chunked_indexing(test_dir.clone(), 100);
+        let result = state.start_chunked_indexing(test_path.clone(), 100);
         assert!(result.is_ok(), "Chunked indexing should start successfully");
 
-        // Allow some time for indexing to complete
-        thread::sleep(Duration::from_millis(200));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
         // Check that indexing completed
         let data = state.data.lock().unwrap();
@@ -2639,152 +2591,106 @@ mod tests_searchengine_state {
             data.status,
             SearchEngineStatus::Idle | SearchEngineStatus::Cancelled
         ));
-        assert_eq!(data.index_folder, test_dir);
+        assert_eq!(data.index_folder, test_path);
         assert!(data.metrics.last_indexing_duration_ms.is_some());
     }
 
     #[test]
     fn test_chunked_indexing_stop() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = Arc::new(SearchEngineState::new(settings_state));
-        let test_dir = get_test_dir_for_indexing();
+        let test_dir = create_chunked_cancel_fixture("chunked_stop");
 
-        // Create test files to ensure indexing takes enough time
-        let mut test_files = Vec::new();
-        for i in 0..1000 {
-            let file_path = test_dir.join(format!("chunked_testfile_{}.txt", i));
-            let _ = fs::write(&file_path, format!("Chunked test content {}", i));
-            test_files.push(file_path);
-        }
-
-        // Use small chunk size and synchronization
-        let (status_tx, status_rx) = std::sync::mpsc::channel();
         let state_clone = Arc::clone(&state);
-        let test_dir_clone = test_dir.clone();
+        let test_dir_clone = test_dir.path().to_path_buf();
 
         let indexing_thread = thread::spawn(move || {
-            // Set status to Indexing
-            {
-                let mut data = state_clone.data.lock().unwrap();
-                data.status = SearchEngineStatus::Indexing;
-                status_tx.send(()).unwrap();
-            }
-
-            // Start chunked indexing
             state_clone
-                .start_chunked_indexing(test_dir_clone, 10)
+                .start_chunked_indexing(test_dir_clone, 25)
                 .unwrap();
         });
 
-        // Wait for indexing to start
-        status_rx.recv().unwrap();
+        assert!(
+            wait_for_chunked_indexing_active(&state),
+            "Chunked indexing did not enter active Indexing state in time"
+        );
 
-        // Verify we're in Indexing state
-        {
-            let data = state.data.lock().unwrap();
-            assert_eq!(data.status, SearchEngineStatus::Indexing);
-        }
-
-        // Stop indexing
+        // Stop indexing while active
         let stop_result = state.stop_indexing();
         assert!(
             stop_result.is_ok(),
             "Should successfully stop chunked indexing"
         );
 
-        // Verify that stopping worked
-        {
-            let data = state.data.lock().unwrap();
-            assert_eq!(data.status, SearchEngineStatus::Cancelled);
-        }
-
         indexing_thread.join().unwrap();
 
-        // Clean up test files
-        for file in test_files {
-            let _ = fs::remove_file(file);
-        }
+        // Verify that stopping worked
+        let data = state.data.lock().unwrap();
+        assert_eq!(data.status, SearchEngineStatus::Cancelled);
     }
 
     #[test]
     fn test_chunked_indexing_cancel() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = Arc::new(SearchEngineState::new(settings_state));
-        let test_dir = get_test_dir_for_indexing();
+        let test_dir = create_chunked_cancel_fixture("chunked_cancel");
 
-        // Create many test files
-        let mut test_files = Vec::new();
-        for i in 0..1000 {
-            let file_path = test_dir.join(format!("chunked_cancel_test_{}.txt", i));
-            let _ = fs::write(&file_path, format!("Chunked cancel test content {}", i));
-            test_files.push(file_path);
-        }
-
-        let (status_tx, status_rx) = std::sync::mpsc::channel();
         let state_clone = Arc::clone(&state);
-        let test_dir_clone = test_dir.clone();
+        let test_dir_clone = test_dir.path().to_path_buf();
 
         let indexing_thread = thread::spawn(move || {
-            {
-                let mut data = state_clone.data.lock().unwrap();
-                data.status = SearchEngineStatus::Indexing;
-                status_tx.send(()).unwrap();
-            }
-
             state_clone
-                .start_chunked_indexing(test_dir_clone, 5)
+                .start_chunked_indexing(test_dir_clone, 25)
                 .unwrap();
         });
 
-        status_rx.recv().unwrap();
+        assert!(
+            wait_for_chunked_indexing_active(&state),
+            "Chunked indexing did not enter active Indexing state in time"
+        );
 
-        {
-            let data = state.data.lock().unwrap();
-            assert_eq!(data.status, SearchEngineStatus::Indexing);
-        }
-
-        // Cancel indexing
+        // Cancel indexing while active
         let cancel_result = state.cancel_indexing();
         assert!(
             cancel_result.is_ok(),
             "Should successfully cancel chunked indexing"
         );
 
-        {
-            let data = state.data.lock().unwrap();
-            assert_eq!(data.status, SearchEngineStatus::Cancelled);
-        }
-
         indexing_thread.join().unwrap();
 
-        // Clean up test files
-        for file in test_files {
-            let _ = fs::remove_file(file);
-        }
+        let data = state.data.lock().unwrap();
+        assert_eq!(data.status, SearchEngineStatus::Cancelled);
     }
 
     #[test]
     fn test_chunked_search_after_indexing() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Get paths and use chunked indexing to add them
+        // Get isolated fixture and use chunked indexing to add paths
         let test_dir = get_test_dir_for_indexing();
-        let result = state.start_chunked_indexing(test_dir.clone(), 50);
+        let result = state.start_chunked_indexing(test_dir.path().to_path_buf(), 50);
         assert!(result.is_ok());
 
-        // Wait for indexing to complete
-        thread::sleep(Duration::from_millis(200));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
-        // Find a search term from the indexed content
+        // Find a guaranteed search term from the seeded fixture
         let search_term = "apple";
 
         // Search using the term
-        let search_result = state.search(&search_term);
+        let search_result = state.search(search_term);
         assert!(search_result.is_ok());
 
-        let _results = search_result.unwrap();
-        // Results might be empty if no files contain "test", which is acceptable
+        let results = search_result.unwrap();
+        assert!(
+            !results.is_empty(),
+            "Expected search results for 'apple' after chunked indexing"
+        );
 
         // Check that searches are recorded
         let data = state.data.lock().unwrap();
@@ -2794,13 +2700,18 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_chunked_multiple_searches() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Use chunked indexing on test directory
+        // Use chunked indexing on isolated test directory
         let test_dir = get_test_dir_for_indexing();
-        let _ = state.start_chunked_indexing(test_dir, 100);
-        thread::sleep(Duration::from_millis(200));
+        let _ = state.start_chunked_indexing(test_dir.path().to_path_buf(), 100);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
         let search_terms = ["file", "test", "data"];
 
@@ -2821,16 +2732,22 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_chunked_directory_context_for_search() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Use chunked indexing on test directory
+        // Use chunked indexing on isolated test directory
         let test_dir = get_test_dir_for_indexing();
-        let _ = state.start_chunked_indexing(test_dir.clone(), 75);
-        thread::sleep(Duration::from_millis(200));
+        let test_path = test_dir.path().to_path_buf();
+        let _ = state.start_chunked_indexing(test_path.clone(), 75);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
         // Set directory context
-        let dir_context = test_dir.to_string_lossy().to_string();
+        let dir_context = test_path.to_string_lossy().to_string();
         let _ = state.update_config(Some(dir_context.clone()));
 
         // Search for a generic term
@@ -2863,10 +2780,10 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_chunked_sequential_indexing() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        let (subdir1, subdir2) = get_test_subdirs();
+        let (_root_dir, subdir1, subdir2) = get_test_subdirs();
 
         // Add test files to both directories
         let file1 = subdir1.join("chunked_testfile1.txt");
@@ -2877,7 +2794,12 @@ mod tests_searchengine_state {
 
         // Index first directory with chunked indexing
         let _ = state.start_chunked_indexing(subdir1.clone(), 25);
-        thread::sleep(Duration::from_millis(200));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for first chunked indexing"
+        );
 
         // Search for the first file
         let search1 = state.search("chunked_testfile1");
@@ -2893,7 +2815,12 @@ mod tests_searchengine_state {
 
         // Index second directory with chunked indexing
         let _ = state.start_chunked_indexing(subdir2.clone(), 25);
-        thread::sleep(Duration::from_millis(200));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for second chunked indexing"
+        );
 
         // Search for the second file
         let search2 = state.search("chunked_testfile2");
@@ -2918,21 +2845,22 @@ mod tests_searchengine_state {
             !still_has_file1,
             "Should not find chunked_testfile1 after switching indexes"
         );
-
-        // Clean up test files
-        let _ = fs::remove_file(file1);
-        let _ = fs::remove_file(file2);
     }
 
     #[test]
     fn test_chunked_empty_search_query() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Use chunked indexing
         let test_dir = get_test_dir_for_indexing();
-        let _ = state.start_chunked_indexing(test_dir, 50);
-        thread::sleep(Duration::from_millis(200));
+        let _ = state.start_chunked_indexing(test_dir.path().to_path_buf(), 50);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
         // Search with empty query
         let empty_search = state.search("");
@@ -2945,7 +2873,7 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_chunked_update_indexing_progress() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Set initial state for testing progress updates during chunked indexing
@@ -2977,29 +2905,34 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_chunked_get_stats() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Get initial stats
         let initial_stats = state.get_stats();
         assert_eq!(initial_stats.trie_size, 0);
 
-        // Use chunked indexing on test directory
+        // Use chunked indexing on isolated test directory
         let test_dir = get_test_dir_for_indexing();
-        let _ = state.start_chunked_indexing(test_dir, 40);
-        thread::sleep(Duration::from_millis(200));
+        let _ = state.start_chunked_indexing(test_dir.path().to_path_buf(), 40);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
         // Get stats after chunked indexing
         let after_stats = state.get_stats();
         assert!(
-            !(after_stats.trie_size == 0),
+            after_stats.trie_size != 0,
             "Trie should contain indexed paths after chunked indexing"
         );
     }
 
     #[test]
     fn test_chunked_indexing_invalid_path() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Try chunked indexing on an invalid path
@@ -3010,51 +2943,32 @@ mod tests_searchengine_state {
         assert!(result.is_ok());
 
         // Status should be Idle since no files were found to index
-        thread::sleep(Duration::from_millis(50));
-        let data = state.data.lock().unwrap();
-        assert!(matches!(data.status, SearchEngineStatus::Idle));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                matches!(state.data.lock().unwrap().status, SearchEngineStatus::Idle)
+            }),
+            "Timed out waiting for invalid path chunked indexing status"
+        );
     }
 
-    #[cfg(feature = "long-tests")]
     #[test]
     fn test_chunked_thread_safety() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = Arc::new(SearchEngineState::new(settings_state));
         let state_clone = Arc::clone(&state);
-        let test_dir = get_test_dir_for_indexing();
-
-        // Create test files
-        let mut test_files = Vec::new();
-        for i in 0..1000 {
-            let file_path = test_dir.join(format!("chunked_thread_safety_test_{}.txt", i));
-            let _ = fs::write(
-                &file_path,
-                format!("Chunked thread safety test content {}", i),
-            );
-            test_files.push(file_path);
-        }
-
-        let (status_tx, status_rx) = std::sync::mpsc::channel();
-        let test_dir_clone = test_dir.clone();
+        let test_dir = create_chunked_cancel_fixture("chunked_thread_safety_doc");
+        let test_dir_clone = test_dir.path().to_path_buf();
 
         let indexing_thread = thread::spawn(move || {
-            {
-                let mut data = state_clone.data.lock().unwrap();
-                data.status = SearchEngineStatus::Indexing;
-                status_tx.send(()).unwrap();
-            }
-
             state_clone
-                .start_chunked_indexing(test_dir_clone, 30)
+                .start_chunked_indexing(test_dir_clone, 25)
                 .unwrap();
         });
 
-        status_rx.recv().unwrap();
-
-        {
-            let data = state.data.lock().unwrap();
-            assert_eq!(data.status, SearchEngineStatus::Indexing);
-        }
+        assert!(
+            wait_for_chunked_indexing_active(&state),
+            "Chunked indexing did not enter active Indexing state in time"
+        );
 
         // Try to search from main thread - should fail while chunked indexing
         let search_result = state.search("document");
@@ -3062,7 +2976,8 @@ mod tests_searchengine_state {
         assert!(search_result.unwrap_err().contains("indexing"));
 
         // Stop the chunked indexing operation
-        let _ = state.stop_indexing();
+        let stop_result = state.stop_indexing();
+        assert!(stop_result.is_ok(), "Should stop active chunked indexing");
 
         indexing_thread.join().unwrap();
 
@@ -3073,24 +2988,24 @@ mod tests_searchengine_state {
         }
 
         // Now search should work
-        let after_search = state.search("document");
+        let after_search = state.search("doc");
         assert!(after_search.is_ok());
-
-        // Clean up test files
-        for file in test_files {
-            let _ = fs::remove_file(file);
-        }
     }
 
     #[test]
     fn test_chunked_interactive_search_scenarios() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Use chunked indexing first
         let test_dir = get_test_dir_for_indexing();
-        let _ = state.start_chunked_indexing(test_dir, 60);
-        thread::sleep(Duration::from_millis(200));
+        let _ = state.start_chunked_indexing(test_dir.path().to_path_buf(), 60);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
         // Add predictable test content
         let _ = state.add_path("/chunked/test/document1.txt");
@@ -3127,25 +3042,30 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_chunked_with_real_world_data() {
-        log_info!("Testing chunked indexing with real-world test data");
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        log_info!("Testing chunked indexing with isolated fixture test data");
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Use chunked indexing on real test data
+        // Use chunked indexing on isolated test data
         let test_dir = get_test_data_path();
 
         let start = Instant::now();
-        let result = state.start_chunked_indexing(test_dir.clone(), 80);
+        let result = state.start_chunked_indexing(test_dir.path().to_path_buf(), 80);
         let elapsed = start.elapsed();
 
         assert!(
             result.is_ok(),
-            "Chunked indexing should succeed with real data"
+            "Chunked indexing should succeed with fixture data"
         );
         log_info!("Chunked indexing completed in {:?}", elapsed);
 
         // Wait for completion
-        thread::sleep(Duration::from_millis(200));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
         // Get stats after chunked indexing
         let stats = state.get_stats();
@@ -3187,19 +3107,24 @@ mod tests_searchengine_state {
 
         assert!(
             found_results,
-            "Should find results with chunked indexing using real-world data"
+            "Should find results with chunked indexing using isolated fixture data"
         );
     }
 
     #[test]
     fn test_chunked_search_by_extension() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
         // Use chunked indexing first, then add paths
         let test_dir = get_test_dir_for_indexing();
-        let _ = state.start_chunked_indexing(test_dir, 50);
-        thread::sleep(Duration::from_millis(100));
+        let _ = state.start_chunked_indexing(test_dir.path().to_path_buf(), 50);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
         // Add paths with different extensions
         state.add_path("/chunked/test/document.pdf").unwrap();
@@ -3253,13 +3178,15 @@ mod tests_searchengine_state {
 
     #[test]
     fn test_chunked_vs_traditional_indexing_results_consistency() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state1 = SearchEngineState::new(settings_state.clone());
         let state2 = SearchEngineState::new(settings_state);
 
-        // Create a controlled test directory
+        // Create a controlled test directory (use a deterministic numeric subfolder name so
+        // WalkDir's depth-0 directory entry never fuzzy-matches alphabetic search terms like `.tmpXXXXXX`)
         let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
-        let test_dir = temp_dir.path().to_path_buf();
+        let test_dir = temp_dir.path().join("9999");
+        fs::create_dir_all(&test_dir).expect("Failed to create deterministic fixture root");
 
         // Add test files
         let test_files = vec![
@@ -3277,11 +3204,21 @@ mod tests_searchengine_state {
 
         // Index with traditional method
         let _ = state1.start_indexing(test_dir.clone());
-        thread::sleep(Duration::from_millis(250));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state1.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for traditional indexing"
+        );
 
         // Index with chunked method
         let _ = state2.start_chunked_indexing(test_dir.clone(), 3);
-        thread::sleep(Duration::from_millis(250));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !matches!(state2.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+            }),
+            "Timed out waiting for chunked indexing"
+        );
 
         // Compare search results
         let search_terms = ["document", "readme", "script"];
@@ -3301,8 +3238,10 @@ mod tests_searchengine_state {
             assert_eq!(
                 traditional_results.len(),
                 chunked_results.len(),
-                "Traditional and chunked indexing should find same number of results for '{}'",
-                term
+                "Traditional and chunked indexing should find same number of results for '{}' (traditional={:?}, chunked={:?})",
+                term,
+                traditional_results,
+                chunked_results
             );
 
             // Top results should be the same files (though scores might differ slightly)
@@ -3337,65 +3276,22 @@ mod tests_searchengine_state {
 #[cfg(test)]
 mod bench_indexing_methods {
     use super::*;
+    #[cfg(feature = "benchmarks")]
     use std::collections::HashMap;
-    use std::time::Instant;
     use std::thread;
-    use std::time::Duration;
+    #[cfg(feature = "benchmarks")]
+    use std::time::{Duration, Instant};
 
-    // Helper function to create a larger test dataset for benchmarking using real test data
-    fn create_benchmark_test_files(base_dir: &PathBuf, file_count: usize) -> Vec<PathBuf> {
+    // Helper function to create synthetic test files in an isolated directory
+    #[cfg(feature = "benchmarks")]
+    fn create_benchmark_test_files(base_dir: &std::path::Path, file_count: usize) -> Vec<PathBuf> {
         let mut created_files = Vec::new();
-
-        // First try to use existing test data
-        let test_data_path = get_test_data_path();
-        if test_data_path.exists() {
-            log_info!(
-                "Using existing test data from: {}",
-                test_data_path.display()
-            );
-
-            // Collect existing files from test data
-            fn collect_existing_files(dir: &PathBuf, files: &mut Vec<PathBuf>, limit: usize) {
-                if files.len() >= limit {
-                    return;
-                }
-
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for entry in entries.filter_map(Result::ok) {
-                        if files.len() >= limit {
-                            break;
-                        }
-
-                        let path = entry.path();
-                        if path.is_file() {
-                            files.push(path.clone());
-                        } else if path.is_dir() {
-                            collect_existing_files(&path, files, limit);
-                        }
-                    }
-                }
-            }
-
-            collect_existing_files(&test_data_path, &mut created_files, file_count);
-
-            // If we have enough files from test data, use them
-            if created_files.len() >= file_count / 2 {
-                log_info!(
-                    "Using {} existing test files from test data",
-                    created_files.len()
-                );
-                return created_files;
-            }
-        }
-
-        // Fall back to creating synthetic test files in the base_dir
         log_info!("Creating synthetic test files in: {}", base_dir.display());
-        created_files.clear();
 
         // Create nested directory structure for realistic testing
         let depth_levels = 4;
         let dirs_per_level = 5;
-        let files_per_dir = file_count / (depth_levels * dirs_per_level);
+        let files_per_dir = (file_count / (depth_levels * dirs_per_level)).max(1);
 
         for depth in 0..depth_levels {
             for dir_num in 0..dirs_per_level {
@@ -3428,27 +3324,15 @@ mod bench_indexing_methods {
         created_files
     }
 
-    // Helper function to get the benchmark test directory - prefer real test data
-    fn get_benchmark_test_dir() -> PathBuf {
-        // First try to use the real test data directory
-        let test_data_path = get_test_data_path();
-        if test_data_path.exists() {
-            log_info!(
-                "Using real test data directory for benchmarking: {}",
-                test_data_path.display()
-            );
-            return test_data_path;
-        }
-
-        // Fall back to creating a temporary directory
-        log_warn!("Real test data not available, using temporary directory for benchmarking");
-        tempfile::tempdir()
-            .expect("Failed to create temp directory")
-            .path()
-            .to_path_buf()
+    // Helper function to create and keep an isolated temporary directory alive for benchmarking
+    #[cfg(feature = "benchmarks")]
+    fn get_benchmark_test_dir() -> tempfile::TempDir {
+        crate::search_engine::test_generate_test_data::create_isolated_test_fixture(3, 5, 2)
+            .expect("Failed to create temp directory for benchmarking")
     }
 
     // Helper function to clean up test files (only synthetic ones)
+    #[cfg(feature = "benchmarks")]
     fn cleanup_benchmark_files(files: Vec<PathBuf>) {
         // Only clean up files that are in temporary directories or synthetic benchmark files
         for file in files {
@@ -3462,6 +3346,7 @@ mod bench_indexing_methods {
     }
 
     // Helper function to measure indexing performance
+    #[cfg(feature = "benchmarks")]
     fn measure_indexing_performance(
         state: &SearchEngineState,
         test_dir: &PathBuf,
@@ -3501,13 +3386,15 @@ mod bench_indexing_methods {
     }
 
     // Helper function to verify indexing worked correctly
+    #[cfg(feature = "benchmarks")]
     fn verify_indexing_results(state: &SearchEngineState, _expected_files: usize) -> bool {
-        // Wait a moment for indexing to complete
-        thread::sleep(Duration::from_millis(100));
+        let finished = wait_until(Duration::from_secs(5), || {
+            !matches!(state.data.lock().unwrap().status, SearchEngineStatus::Indexing)
+        });
 
         // Check final status
         let data = state.data.lock().unwrap();
-        let status_ok = matches!(data.status, SearchEngineStatus::Idle);
+        let status_ok = finished && matches!(data.status, SearchEngineStatus::Idle);
         let progress_complete = data.progress.percentage_complete >= 100.0;
         drop(data);
 
@@ -3528,41 +3415,22 @@ mod bench_indexing_methods {
         status_ok && search_works && has_trie_content
     }
 
+    #[cfg(feature = "benchmarks")]
     #[test]
     fn benchmark_indexing_methods_comparison() {
         log_info!("=== INDEXING METHODS BENCHMARK ===");
 
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Use the real test data directory if available
-        let test_dir = get_benchmark_test_dir();
-        log_info!("Using test directory: {}", test_dir.display());
+        // Use an isolated temporary directory kept alive for the test
+        let test_dir_guard = get_benchmark_test_dir();
+        let test_dir = test_dir_guard.path().to_path_buf();
+        log_info!("Using isolated test directory: {}", test_dir.display());
 
-        // Count existing files in the test directory
-        let existing_file_count = if test_dir.exists() {
-            let paths = collect_test_paths(None); // Get all available paths
-            log_info!("Found {} existing files in test data", paths.len());
-            paths.len()
-        } else {
-            0
-        };
-
-        // If we don't have enough real files, supplement with synthetic ones
         let target_file_count = 1000;
-        let synthetic_files = if existing_file_count < target_file_count {
-            let needed = target_file_count - existing_file_count;
-            log_info!(
-                "Creating {} additional synthetic files for benchmarking",
-                needed
-            );
-            create_benchmark_test_files(&test_dir, needed)
-        } else {
-            log_info!("Using existing test data files for benchmarking");
-            Vec::new()
-        };
-
-        let total_files = existing_file_count + synthetic_files.len();
+        let synthetic_files = create_benchmark_test_files(&test_dir, target_file_count);
+        let total_files = synthetic_files.len();
         log_info!("Total files available for benchmarking: {}", total_files);
 
         // Store benchmark results
@@ -3606,12 +3474,7 @@ mod bench_indexing_methods {
 
         // Print comprehensive benchmark results
         log_info!("\n=== BENCHMARK RESULTS SUMMARY ===");
-        log_info!(
-            "Test files: {} (existing: {}, synthetic: {})",
-            total_files,
-            existing_file_count,
-            synthetic_files.len()
-        );
+        log_info!("Test files: {}", total_files);
         log_info!("Test directory: {}", test_dir.display());
 
         let mut sorted_results: Vec<_> = results.iter().collect();
@@ -3647,7 +3510,7 @@ mod bench_indexing_methods {
                     if let Some((chunked_duration, chunked_success)) = results.get(&key) {
                         if *chunked_success {
                             let ratio = chunked_duration.as_millis() as f64
-                                / traditional_duration.as_millis() as f64;
+                                / traditional_duration.as_millis().max(1) as f64;
                             let percentage = (ratio - 1.0) * 100.0;
 
                             if ratio < 1.0 {
@@ -3699,7 +3562,7 @@ mod bench_indexing_methods {
         // Verify that we have meaningful performance data
         let has_performance_data = results
             .values()
-            .any(|(duration, _)| duration.as_millis() > 0);
+            .any(|(duration, _)| duration.as_nanos() > 0);
         assert!(
             has_performance_data,
             "Should have measurable performance data"
@@ -3710,15 +3573,17 @@ mod bench_indexing_methods {
         log_info!("\n=== BENCHMARK COMPLETED ===");
     }
 
+    #[cfg(feature = "benchmarks")]
     #[test]
     fn benchmark_indexing_scalability() {
         log_info!("=== INDEXING SCALABILITY BENCHMARK ===");
 
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Use real test data directory
-        let base_test_dir = get_benchmark_test_dir();
+        // Use an isolated temporary directory kept alive for the test
+        let base_test_dir_guard = get_benchmark_test_dir();
+        let base_test_dir = base_test_dir_guard.path();
 
         // Test with different file counts to measure scalability
         let file_counts = [100, 500, 1000];
@@ -3731,7 +3596,7 @@ mod bench_indexing_methods {
             let test_dir = base_test_dir.join(format!("scalability_test_{}", file_count));
             let _ = fs::create_dir_all(&test_dir);
 
-            // Create test files using real data as template but in controlled quantities
+            // Create test files in isolated subdirectory
             let created_files = create_benchmark_test_files(&test_dir, file_count);
             log_info!("Created {} files for scalability test", created_files.len());
 
@@ -3778,25 +3643,22 @@ mod bench_indexing_methods {
         log_info!("\n=== SCALABILITY BENCHMARK COMPLETED ===");
     }
 
+    #[cfg(feature = "benchmarks")]
     #[test]
     fn benchmark_memory_usage_comparison() {
         log_info!("=== MEMORY USAGE BENCHMARK ===");
 
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Use real test data directory
-        let test_dir = get_benchmark_test_dir();
+        // Use isolated temporary directory kept alive for the benchmark
+        let test_dir_guard = get_benchmark_test_dir();
+        let test_dir = test_dir_guard.path().to_path_buf();
+        let created_files = create_benchmark_test_files(&test_dir, 800);
         log_info!(
-            "Using test directory for memory benchmark: {}",
+            "Using isolated test directory for memory benchmark ({} files): {}",
+            created_files.len(),
             test_dir.display()
-        );
-
-        // Count actual files available
-        let available_paths = collect_test_paths(Some(800));
-        log_info!(
-            "Using {} files for memory usage benchmark",
-            available_paths.len()
         );
 
         // Measure memory usage for traditional indexing
@@ -3849,13 +3711,13 @@ mod bench_indexing_methods {
 
         // Calculate memory efficiency (files per trie node)
         let traditional_efficiency = if traditional_stats.trie_size > 0 {
-            available_paths.len() as f64 / traditional_stats.trie_size as f64
+            created_files.len() as f64 / traditional_stats.trie_size as f64
         } else {
             0.0
         };
 
         let chunked_efficiency = if chunked_stats.trie_size > 0 {
-            available_paths.len() as f64 / chunked_stats.trie_size as f64
+            created_files.len() as f64 / chunked_stats.trie_size as f64
         } else {
             0.0
         };
@@ -3876,11 +3738,11 @@ mod bench_indexing_methods {
 
     #[test]
     fn test_concurrent_search_optimization() {
-        let settings_state = Arc::new(Mutex::new(SettingsState::new()));
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
         let state = SearchEngineState::new(settings_state);
 
-        // Get paths and add them directly to the engine for testing
-        let paths = collect_test_paths(Some(50));
+        // Get paths from isolated fixture and add them directly to the engine for testing
+        let (_test_dir, paths) = collect_test_paths(Some(50));
         for path in &paths {
             let _ = state.add_path(path);
         }

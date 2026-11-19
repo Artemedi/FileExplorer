@@ -462,15 +462,34 @@ mod tests_logging {
     const TEST_LOG_FILE: &str = "test_app.log";
     const TEST_ERROR_LOG_FILE: &str = "test_error.log";
 
-    fn setup_test_logger() -> (Logger, tempfile::TempDir) {
-        let temp_dir = tempdir().expect("Failed to create temporary directory");
-        let log_path = temp_dir.path().join(TEST_LOG_FILE);
+    struct TestTempDirs {
+        logs_dir: tempfile::TempDir,
+        _settings_dir: tempfile::TempDir,
+    }
+
+    impl TestTempDirs {
+        fn path(&self) -> &std::path::Path {
+            self.logs_dir.path()
+        }
+    }
+
+    fn setup_test_logger() -> (Logger, TestTempDirs) {
+        let logs_dir = tempdir().expect("Failed to create temporary logs directory");
+        let settings_dir = tempdir().expect("Failed to create temporary settings directory");
+        let log_path = logs_dir.path().join(TEST_LOG_FILE);
+        let settings_path = settings_dir.path().join("settings.json");
         let logger = Logger {
             log_path: log_path.clone(),
-            error_log_path: temp_dir.path().join(TEST_ERROR_LOG_FILE),
-            state: Arc::new(Mutex::new(SettingsState::new())),
+            error_log_path: logs_dir.path().join(TEST_ERROR_LOG_FILE),
+            state: Arc::new(Mutex::new(SettingsState::new_with_path(settings_path))),
         };
-        (logger, temp_dir)
+        (
+            logger,
+            TestTempDirs {
+                logs_dir,
+                _settings_dir: settings_dir,
+            },
+        )
     }
 
     #[test]
@@ -819,9 +838,20 @@ mod tests_logging {
         
         // Simulate log rotation by manually calling rotate_logs
         logger.rotate_logs(log_path);
-        
-        // Check if the log file still exists after rotation
-        assert!(!log_path.exists(), "Log file should still exist after rotation");
+
+        // rotate_logs moves the active log file into an archive until the next write recreates it
+        assert!(
+            !log_path.exists(),
+            "Active log file should be moved to an archive upon rotation"
+        );
+        let has_archive = fs::read_dir(_temp_dir.path())
+            .expect("Failed to read temp directory")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                name.starts_with("test_app.") && name.ends_with(".log")
+            });
+        assert!(has_archive, "Archived log file should exist after rotation");
         
         // Create new log entry after rotation
         logger.write_log("Test log entry after rotation");

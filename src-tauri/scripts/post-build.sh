@@ -18,7 +18,25 @@ if [ "$TARGET_OS" != "macos" ]; then
     exit 0
 fi
 
-APP_NAME="Explr"
+CARGO_TOML="$ROOT_DIR/src-tauri/Cargo.toml"
+TAURI_CONF="$ROOT_DIR/src-tauri/tauri.conf.json"
+
+BIN_NAME="$(tr -d '\r' < "$CARGO_TOML" | awk '/^\[package\]/{in_pkg=1; next} /^\[/{in_pkg=0} in_pkg && /^name[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/, ""); print; exit}')"
+BIN_NAME="${BIN_NAME:-explr}"
+
+APP_NAME="$(tr -d '\r' < "$TAURI_CONF" | sed -n 's/.*"productName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+APP_NAME="${APP_NAME:-Explr}"
+
+APP_VERSION="$(tr -d '\r' < "$TAURI_CONF" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+if [ -z "$APP_VERSION" ]; then
+    APP_VERSION="$(tr -d '\r' < "$CARGO_TOML" | awk '/^\[package\]/{in_pkg=1; next} /^\[/{in_pkg=0} in_pkg && /^version[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/, ""); print; exit}')"
+fi
+
+if [ -z "$APP_VERSION" ]; then
+    echo "❌ Failed to determine application version from $TAURI_CONF or $CARGO_TOML"
+    exit 1
+fi
+
 # Tauri outputs into repo root `target/`, not `src-tauri/target/`
 BUILD_DIR="$ROOT_DIR/target/${TARGET_ARCH}-apple-darwin/release/bundle"
 APP_PATH="$BUILD_DIR/macos/$APP_NAME.app"
@@ -83,14 +101,28 @@ fi
 
 # 1. Rename original binary
 MACOS_DIR="$APP_PATH/Contents/MacOS"
-if [ -f "$MACOS_DIR/src-tauri" ] && [ ! -f "$MACOS_DIR/src-tauri-real" ]; then
-    echo "📦 Renaming original binary..."
-    mv "$MACOS_DIR/src-tauri" "$MACOS_DIR/src-tauri-real"
+PLIST="$APP_PATH/Contents/Info.plist"
+BINARY_NAME="$BIN_NAME"
+if [ -z "$BINARY_NAME" ] || [ ! -f "$MACOS_DIR/$BINARY_NAME" ]; then
+    PLIST_EXEC="$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$PLIST" 2>/dev/null || true)"
+    if [ -n "$PLIST_EXEC" ] && [ -f "$MACOS_DIR/$PLIST_EXEC" ]; then
+        BINARY_NAME="$PLIST_EXEC"
+    fi
+fi
+
+if [ ! -f "$MACOS_DIR/$BINARY_NAME" ] && [ ! -f "$MACOS_DIR/${BINARY_NAME}-real" ]; then
+    echo "❌ Executable '$BINARY_NAME' not found in $MACOS_DIR"
+    exit 1
+fi
+
+if [ -f "$MACOS_DIR/$BINARY_NAME" ] && [ ! -f "$MACOS_DIR/${BINARY_NAME}-real" ]; then
+    echo "📦 Renaming original binary ($BINARY_NAME)..."
+    mv "$MACOS_DIR/$BINARY_NAME" "$MACOS_DIR/${BINARY_NAME}-real"
 fi
 
 # 2. Create wrapper script
-echo "🛠️  Creating launch wrapper..."
-cat > "$MACOS_DIR/src-tauri" << 'EOF'
+echo "🛠️  Creating launch wrapper for $BINARY_NAME..."
+cat > "$MACOS_DIR/$BINARY_NAME" << EOF
 #!/bin/bash
 
 # macOS Launch Services Fix - Simulates terminal environment
@@ -104,15 +136,14 @@ export __CFBundleIdentifier="com.apple.Terminal"
 # Complete PATH
 export PATH="/Library/Frameworks/Python.framework/Versions/3.11/bin:/opt/local/bin:/opt/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/Library/Apple/usr/bin"
 
-cd "$(dirname "$0")"
-exec ./src-tauri-real "$@"
+cd "\$(dirname "\$0")"
+exec ./${BINARY_NAME}-real "\$@"
 EOF
 
 # 3. Make wrapper executable
-chmod +x "$MACOS_DIR/src-tauri"
+chmod +x "$MACOS_DIR/$BINARY_NAME"
 
 # 4. Fix Info.plist
-PLIST="$APP_PATH/Contents/Info.plist"
 echo "⚙️  Updating Info.plist..."
 
 # Remove problematic keys if present
@@ -129,7 +160,8 @@ echo "🔏 Re-signing app..."
 codesign --force --deep --sign - "$APP_PATH" >/dev/null 2>&1
 
 # 6. Create fixed DMG
-FIXED_DMG_PATH="$BUILD_DIR/dmg/${APP_NAME}_fixed_0.2.3_${TARGET_ARCH}.dmg"
+mkdir -p "$BUILD_DIR/dmg"
+FIXED_DMG_PATH="$BUILD_DIR/dmg/${APP_NAME}_fixed_${APP_VERSION}_${TARGET_ARCH}.dmg"
 echo "📦 Creating fixed DMG..."
 
 # Create temporary directory for DMG contents
