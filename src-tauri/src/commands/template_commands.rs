@@ -1,24 +1,88 @@
+use crate::error_handling::{Error, ErrorCode};
 use crate::state::meta_data::MetaDataState;
 use crate::{log_error, log_info};
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::State;
+
+/// Maximum number of `name (n)` candidates tried before giving up.
+const MAX_UNIQUE_ATTEMPTS: u32 = 9999;
+
+// ---------------------------------------------------------------------------
+// Error helpers
+// ---------------------------------------------------------------------------
+
+/// Logs the error and converts it to the JSON string expected by the IPC layer.
+fn to_ipc(err: Error) -> String {
+    log_error!(err.custom_message.as_str());
+    err.to_json()
+}
+
+/// Builds an [`Error`] from an `io::Error`, keeping its code mapping and adding context.
+fn io_err(context: &str, err: io::Error) -> Error {
+    let mut error = Error::from(err);
+    error.custom_message = format!("{context}: {}", error.custom_message);
+    error
+}
+
+/// Runs a blocking filesystem job on the blocking thread pool.
+async fn run_blocking<T, F>(job: F) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+{
+    tokio::task::spawn_blocking(job)
+        .await
+        .map_err(|e| Error::internal(format!("Background task failed: {e}")))?
+}
+
+// ---------------------------------------------------------------------------
+// State helpers (no unwrap on locks: a poisoned mutex becomes an error)
+// ---------------------------------------------------------------------------
+
+fn templates_root(state: &Arc<Mutex<MetaDataState>>) -> Result<PathBuf, Error> {
+    let outer = state
+        .lock()
+        .map_err(|_| Error::internal("Metadata state lock is poisoned"))?;
+    let inner = outer
+        .0
+        .lock()
+        .map_err(|_| Error::internal("Metadata lock is poisoned"))?;
+    Ok(inner.abs_folder_path_buf_for_templates.clone())
+}
+
+fn refresh_template_paths(state: &Arc<Mutex<MetaDataState>>) -> Result<(), Error> {
+    let outer = state
+        .lock()
+        .map_err(|_| Error::internal("Metadata state lock is poisoned"))?;
+    let result = outer.update_template_paths();
+    result.map_err(|e| io_err("Failed to update template paths", e))
+}
+
+fn get_template_paths_from_state(state: &Arc<Mutex<MetaDataState>>) -> Result<Vec<PathBuf>, Error> {
+    let outer = state
+        .lock()
+        .map_err(|_| Error::internal("Metadata state lock is poisoned"))?;
+    let inner = outer
+        .0
+        .lock()
+        .map_err(|_| Error::internal("Metadata lock is poisoned"))?;
+    Ok(inner.template_paths.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
 
 /// Retrieves all available templates as a JSON string of paths.
 ///
 /// # Returns
 /// * `Ok(String)` - A JSON array of template paths as strings
-/// * `Err(String)` - An error message if the templates can't be retrieved
-///
-/// # Example
-/// ```rust
-/// let result = get_template_paths_as_json(state).await;
-/// match result {
-///     Ok(json_paths) => println!("Available templates: {}", json_paths),
-///     Err(e) => eprintln!("Error getting templates: {}", e),
-/// }
-/// ```
+/// * `Err(String)` - A JSON-serialized [`Error`] if the templates can't be retrieved
 #[tauri::command]
 pub async fn get_template_paths_as_json(
     state: State<'_, Arc<Mutex<MetaDataState>>>,
@@ -31,56 +95,35 @@ pub async fn get_template_paths_as_json_impl(
     state: Arc<Mutex<MetaDataState>>,
 ) -> Result<String, String> {
     log_info!("Retrieving template paths from state");
-    // Get the template paths
-    let paths = get_template_paths_from_state(state).await.map_err(|_| {
-        let error_msg = "Failed to get template paths from state";
-        log_error!(error_msg);
-        error_msg.to_string()
-    })?;
+    let paths = get_template_paths_from_state(&state).map_err(to_ipc)?;
 
-    // Convert PathBufs to strings
     let path_strings: Vec<String> = paths
         .into_iter()
-        .filter_map(|p| p.to_str().map(|s| s.to_string()))
+        .map(|p| p.to_string_lossy().into_owned())
         .collect();
 
     log_info!("Found {} template paths", path_strings.len());
 
-    // Serialize to JSON
-    match serde_json::to_string(&path_strings) {
-        Ok(json) => {
+    serde_json::to_string(&path_strings)
+        .inspect(|_| {
             log_info!("Successfully serialized template paths to JSON");
-            Ok(json)
-        }
-        Err(e) => {
-            let error_msg = format!("Failed to serialize paths to JSON: {}", e);
-            log_error!(error_msg.as_str());
-            Err(error_msg)
-        }
-    }
+        })
+        .map_err(|e| {
+            to_ipc(Error::internal(format!(
+                "Failed to serialize paths to JSON: {e}"
+            )))
+        })
 }
 
 /// Adds a template to the template directory.
 ///
-/// This function copies a file or directory from the provided path to the application's
-/// template directory and registers it as a template.
-///
-/// # Arguments
-/// * `state` - The application's metadata state
-/// * `template_path` - A string representing the absolute path to the file or directory to be added as a template
+/// Copies a file or directory to the application's template directory and registers it as a
+/// template. An already existing template is never overwritten; a unique name such as
+/// `name (1)` is used instead.
 ///
 /// # Returns
 /// * `Ok(String)` - A success message including the name of the template and its size
-/// * `Err(String)` - An error message if the template cannot be added
-///
-/// # Example
-/// ```rust
-/// let result = add_template(state, "/path/to/my/template").await;
-/// match result {
-///     Ok(msg) => println!("{}", msg),  // Template 'template' added successfully (1024 bytes)
-///     Err(e) => eprintln!("Error adding template: {}", e),
-/// }
-/// ```
+/// * `Err(String)` - A JSON-serialized [`Error`] if the template cannot be added
 #[tauri::command]
 pub async fn add_template(
     state: State<'_, Arc<Mutex<MetaDataState>>>,
@@ -96,100 +139,46 @@ pub async fn add_template_impl(
 ) -> Result<String, String> {
     log_info!("Adding template from path: {}", template_path);
 
-    // Check if the source path exists
-    if !Path::new(template_path).exists() {
-        let error_msg = format!("Source path does not exist: {}", template_path);
-        log_error!(error_msg.as_str());
-        return Err(error_msg);
-    }
+    let root = templates_root(&state).map_err(to_ipc)?;
+    log_info!("Template destination path: {}", root.display());
 
-    // Extract what we need from the metadata state before any await points
-    let dest_path = {
-        let metadata_state = state.lock().map_err(|e| {
-            let error_msg = format!("Error acquiring lock on metadata state: {:?}", e);
-            log_error!(error_msg.as_str());
-            error_msg
-        })?;
-        let inner_metadata = metadata_state.0.lock().map_err(|e| {
-            let error_msg = format!("Error acquiring lock on metadata state: {:?}", e);
-            log_error!(error_msg.as_str());
-            error_msg
-        })?;
-
-        inner_metadata.abs_folder_path_buf_for_templates.clone()
-    };
-
-    log_info!("Template destination path: {}", dest_path.display());
-
-    // Create destination directory if it doesn't exist
-    if !dest_path.exists() {
-        if let Err(err) = fs::create_dir_all(&dest_path) {
-            let error_msg = format!(
-                "Failed to create templates directory '{}': {}",
-                dest_path.display(),
-                err
-            );
-            log_error!(error_msg.as_str());
-            return Err(error_msg);
+    let source = PathBuf::from(template_path);
+    let size = run_blocking({
+        let state = state.clone();
+        let source = source.clone();
+        move || {
+            if !source.exists() {
+                return Err(Error::resource_not_found(format!(
+                    "Source path does not exist: {}",
+                    source.display()
+                )));
+            }
+            let size = copy_to_dest_sync(&source, &root)?;
+            refresh_template_paths(&state)?;
+            Ok(size)
         }
-    }
+    })
+    .await
+    .map_err(to_ipc)?;
 
-    // Copy the template using our helper function
-    let dest_path_str = dest_path.to_str().ok_or_else(|| {
-        let error_msg = "Invalid destination path encoding".to_string();
-        log_error!(error_msg.as_str());
-        error_msg
-    })?;
-    let size = copy_to_dest_path(template_path, dest_path_str).await?;
-
-    // Update the template paths in the metadata state
-    let update_result = {
-        let metadata_state = state.lock().unwrap();
-        metadata_state.update_template_paths()
-    };
-
-    match update_result {
-        Ok(_) => {
-            let success_msg = format!(
-                "Template '{}' added successfully ({} bytes)",
-                Path::new(template_path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                size
-            );
-            log_info!(success_msg.as_str());
-            Ok(success_msg)
-        }
-        Err(err) => {
-            let error_msg = format!("Failed to update template paths: {}", err);
-            log_error!(error_msg.as_str());
-            Err(error_msg)
-        }
-    }
+    let success_msg = format!(
+        "Template '{}' added successfully ({} bytes)",
+        source.file_name().unwrap_or_default().to_string_lossy(),
+        size
+    );
+    log_info!(success_msg.as_str());
+    Ok(success_msg)
 }
 
-/// Applies a template to the specified destination path.
+/// Applies a template to the specified destination directory.
 ///
-/// This function copies the content of a template (file or directory) to the specified destination.
-/// The template remains unchanged, creating a new instance at the destination path.
-///
-/// # Arguments
-/// * `template_path` - A string representing the absolute path to the template
-/// * `dest_path` - A string representing the absolute path where the template should be applied
+/// Copies the content of a template (file or directory) into `dest_path`. The template stays
+/// unchanged and existing files at the destination are never overwritten (a unique name such
+/// as `name (1).ext` is used instead).
 ///
 /// # Returns
 /// * `Ok(String)` - A success message with details about the template application
-/// * `Err(String)` - An error message if the template cannot be applied
-///
-/// # Example
-/// ```rust
-/// let result = use_template("/path/to/template", "/path/to/destination").await;
-/// match result {
-///     Ok(msg) => println!("{}", msg),  // Template applied successfully (1024 bytes copied)
-///     Err(e) => eprintln!("Error applying template: {}", e),
-/// }
-/// ```
+/// * `Err(String)` - A JSON-serialized [`Error`] if the template cannot be applied
 #[tauri::command]
 pub async fn use_template(template_path: &str, dest_path: &str) -> Result<String, String> {
     log_info!("use_template command called with key: {}", template_path);
@@ -199,59 +188,48 @@ pub async fn use_template(template_path: &str, dest_path: &str) -> Result<String
 pub async fn use_template_impl(template_path: &str, dest_path: &str) -> Result<String, String> {
     log_info!("Using template from path: {}", template_path);
 
-    // Check if the template path exists
-    if !Path::new(template_path).exists() {
-        let error_msg = format!("Template path does not exist: {}", template_path);
-        log_error!(error_msg.as_str());
-        return Err(error_msg);
-    }
+    let template = PathBuf::from(template_path);
+    let dest = PathBuf::from(dest_path);
 
-    // Check if the destination path exists
-    if !Path::new(dest_path).exists() {
-        let error_msg = format!("Destination path does not exist: {}", dest_path);
-        log_error!(error_msg.as_str());
-        return Err(error_msg);
-    }
+    let size = run_blocking(move || {
+        if !template.exists() {
+            return Err(Error::resource_not_found(format!(
+                "Template path does not exist: {}",
+                template.display()
+            )));
+        }
+        if !dest.exists() {
+            return Err(Error::resource_not_found(format!(
+                "Destination path does not exist: {}",
+                dest.display()
+            )));
+        }
+        if !dest.is_dir() {
+            return Err(Error::invalid_input(format!(
+                "Destination path is not a directory: {}",
+                dest.display()
+            )));
+        }
+        copy_to_dest_sync(&template, &dest)
+    })
+    .await
+    .map_err(to_ipc)?;
 
-    // Copy the template to the destination
-    match copy_to_dest_path(template_path, dest_path).await {
-        Ok(size) => {
-            let success_msg = format!(
-                "Template '{}' applied successfully to '{}' ({} bytes copied)",
-                template_path, dest_path, size
-            );
-            log_info!(success_msg.as_str());
-            Ok(success_msg)
-        }
-        Err(err) => {
-            let error_msg = format!("Failed to apply template: {}", err);
-            log_error!(error_msg.as_str());
-            Err(error_msg)
-        }
-    }
+    let success_msg = format!(
+        "Template '{template_path}' applied successfully to '{dest_path}' ({size} bytes copied)"
+    );
+    log_info!(success_msg.as_str());
+    Ok(success_msg)
 }
 
 /// Removes a template from the template directory.
 ///
-/// This function deletes a template (file or directory) from the application's template directory
-/// and updates the registered templates list.
-///
-/// # Arguments
-/// * `state` - The application's metadata state
-/// * `template_path` - A string representing the absolute path to the template to be removed
+/// Only paths strictly inside the templates directory can be removed. Symbolic links are
+/// removed as links and never followed.
 ///
 /// # Returns
 /// * `Ok(String)` - A success message confirming the removal of the template
-/// * `Err(String)` - An error message if the template cannot be removed
-///
-/// # Example
-/// ```rust
-/// let result = remove_template(state, "/path/to/templates/my_template").await;
-/// match result {
-///     Ok(msg) => println!("{}", msg),  // Template removed successfully
-///     Err(e) => eprintln!("Error removing template: {}", e),
-/// }
-/// ```
+/// * `Err(String)` - A JSON-serialized [`Error`] if the template cannot be removed
 #[tauri::command]
 pub async fn remove_template(
     state: State<'_, Arc<Mutex<MetaDataState>>>,
@@ -266,254 +244,275 @@ pub async fn remove_template_impl(
 ) -> Result<String, String> {
     log_info!("Removing template at path: {}", template_path);
 
-    // Check if the template path exists
-    if !Path::new(template_path).exists() {
-        let error_msg = format!("Template path does not exist: {}", template_path);
-        log_error!(error_msg.as_str());
-        return Err(error_msg);
+    let root = templates_root(&state).map_err(to_ipc)?;
+    let target = PathBuf::from(template_path);
+
+    run_blocking({
+        let state = state.clone();
+        move || {
+            remove_template_sync(&root, &target)?;
+            refresh_template_paths(&state)
+        }
+    })
+    .await
+    .map_err(to_ipc)?;
+
+    let success_msg = format!("Template '{template_path}' removed successfully");
+    log_info!(success_msg.as_str());
+    Ok(success_msg)
+}
+
+// ---------------------------------------------------------------------------
+// Removal
+// ---------------------------------------------------------------------------
+
+/// Removes `target` only if it is strictly inside `root` (after canonicalization).
+///
+/// A symlink target is canonicalized through its parent directory only, so the link itself is
+/// removed and whatever it points to is left untouched.
+fn remove_template_sync(root: &Path, target: &Path) -> Result<(), Error> {
+    if target.as_os_str().is_empty() {
+        return Err(Error::invalid_input("Template path is empty"));
     }
 
-    // Remove the template (file or directory)
-    let path = Path::new(template_path);
-    let remove_result = if path.is_dir() {
-        fs::remove_dir_all(path)
-    } else if path.is_file() {
-        fs::remove_file(path)
-    } else {
-        return Err(format!("Template path is neither file nor directory: {}", template_path));
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(Error::resource_not_found(format!(
+                "Template path does not exist: {}",
+                target.display()
+            )));
+        }
+        Err(err) => return Err(io_err("Failed to read template metadata", err)),
     };
 
-    match remove_result {
-        Ok(_) => {
-            let success_msg = format!("Template '{}' removed successfully", template_path);
-            log_info!(success_msg.as_str());
+    let canon_root =
+        fs::canonicalize(root).map_err(|e| io_err("Templates directory is not accessible", e))?;
 
-            // Update the template paths in the metadata state
-            let update_result = {
-                let metadata_state = state.lock().unwrap();
-                metadata_state.update_template_paths()
-            };
-
-            match update_result {
-                Ok(_) => {
-                    log_info!(success_msg.as_str());
-                    Ok(success_msg)
-                }
-                Err(err) => {
-                    let error_msg = format!("Failed to update template paths: {}", err);
-                    log_error!(error_msg.as_str());
-                    Err(error_msg)
-                }
-            }
-        }
-        Err(err) => {
-            let error_msg = format!("Failed to remove template: {}", err);
-            log_error!(error_msg.as_str());
-            Err(error_msg)
-        }
+    if metadata.file_type().is_symlink() {
+        return Err(Error::new(
+            ErrorCode::Unauthorized,
+            format!(
+                "Refusing to remove a symbolic link in the templates directory: {}",
+                target.display()
+            ),
+        ));
     }
+
+    let canon_target =
+        fs::canonicalize(target).map_err(|e| io_err("Failed to resolve template path", e))?;
+
+    if canon_target == canon_root || !canon_target.starts_with(&canon_root) {
+        return Err(Error::new(
+            ErrorCode::Unauthorized,
+            format!(
+                "Refusing to remove a path outside of the templates directory: {}",
+                target.display()
+            ),
+        ));
+    }
+
+    let result = if metadata.is_dir() {
+        fs::remove_dir_all(target)
+    } else {
+        fs::remove_file(target)
+    };
+    result.map_err(|e| io_err("Failed to remove template", e))
 }
 
-// helper functions
+// ---------------------------------------------------------------------------
+// Copy
+// ---------------------------------------------------------------------------
 
-async fn get_template_paths_from_state(
-    state: Arc<Mutex<MetaDataState>>,
-) -> Result<Vec<PathBuf>, ()> {
-    let meta_data_state = state.lock().unwrap();
-    let inner_meta_data = meta_data_state
-        .0
-        .lock()
-        .map_err(|_| log_error!("Cannot acquire lock on metadata state"))?;
-    Ok(inner_meta_data.template_paths.clone())
-}
-
+/// Copies `source_path` (file or directory) into the directory `dest_path`.
+///
+/// Never overwrites existing entries: a unique name (`name (1).ext`, folders `name (1)`) is
+/// chosen instead. Symbolic links inside copied directories are skipped.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn copy_to_dest_path(source_path: &str, dest_path: &str) -> Result<u64, String> {
     log_info!("Copying from '{}' to '{}'", source_path, dest_path);
+    let source = PathBuf::from(source_path);
+    let dest = PathBuf::from(dest_path);
+    run_blocking(move || copy_to_dest_sync(&source, &dest))
+        .await
+        .map_err(to_ipc)
+}
 
-    // Check if the source path exists
-    let source_path_buf = Path::new(source_path);
-    if !source_path_buf.exists() {
-        let error_msg = format!("Source path does not exist: {}", source_path);
-        log_error!(error_msg.as_str());
-        return Err(error_msg);
+fn copy_to_dest_sync(source: &Path, dest_dir: &Path) -> Result<u64, Error> {
+    if !source.exists() {
+        return Err(Error::resource_not_found(format!(
+            "Source path does not exist: {}",
+            source.display()
+        )));
     }
 
-    // Create parent directories for destination if they don't exist
-    let dest_path_buf = PathBuf::from(dest_path);
-    if let Some(parent) = dest_path_buf.parent() {
-        if !parent.exists() {
-            match fs::create_dir_all(parent) {
-                Ok(_) => log_info!(
-                    "Created parent directories for destination: {}",
-                    parent.display()
-                ),
-                Err(err) => {
-                    let error_msg = format!(
-                        "Failed to create parent directories for destination: {}",
-                        err
-                    );
-                    log_error!(error_msg.as_str());
-                    return Err(error_msg);
-                }
-            }
+    if dest_dir.exists() {
+        if !dest_dir.is_dir() {
+            return Err(Error::invalid_input(format!(
+                "Destination path is not a directory: {}",
+                dest_dir.display()
+            )));
         }
+    } else {
+        fs::create_dir_all(dest_dir)
+            .map_err(|e| io_err("Failed to create destination directory", e))?;
+        log_info!("Created destination directory: {}", dest_dir.display());
     }
 
-    if source_path_buf.is_dir() {
-        log_info!("Copying directory recursively");
-        // If the source is a directory, recursively copy it
-        let mut total_size = 0;
+    let name = source
+        .file_name()
+        .ok_or_else(|| Error::invalid_input("Invalid source name"))?;
 
-        // Get the source directory name
-        let source_dir_name = match source_path_buf.file_name() {
-            Some(name) => name,
-            None => {
-                let error_msg = "Invalid source directory name".to_string();
-                log_error!(error_msg.as_str());
-                return Err(error_msg);
-            }
-        };
-
-        // Create the final destination directory including the source directory name
-        let final_dest_path = dest_path_buf.join(source_dir_name);
-
-        // Create the destination directory
-        match fs::create_dir_all(&final_dest_path) {
-            Ok(_) => log_info!(
-                "Created destination directory: {}",
-                final_dest_path.display()
-            ),
-            Err(err) => {
-                let error_msg = format!("Failed to create destination directory: {}", err);
-                log_error!(error_msg.as_str());
-                return Err(error_msg);
-            }
+    if source.is_dir() {
+        let canon_source = fs::canonicalize(source)
+            .map_err(|e| io_err("Failed to resolve source directory", e))?;
+        let canon_dest = fs::canonicalize(dest_dir)
+            .map_err(|e| io_err("Failed to resolve destination directory", e))?;
+        if canon_dest.starts_with(&canon_source) {
+            return Err(Error::invalid_input(
+                "Cannot copy a directory into itself or one of its subdirectories",
+            ));
         }
 
-        // Read all entries in the source directory
-        let entries = match fs::read_dir(source_path) {
-            Ok(entries) => entries,
-            Err(err) => {
-                let error_msg = format!("Failed to read source directory: {}", err);
-                log_error!(error_msg.as_str());
-                return Err(error_msg);
-            }
-        };
-
-        for entry_result in entries {
-            let entry = match entry_result {
-                Ok(entry) => entry,
-                Err(err) => {
-                    let error_msg = format!("Failed to read directory entry: {}", err);
-                    log_error!(error_msg.as_str());
-                    return Err(error_msg);
-                }
-            };
-
-            let entry_path = entry.path();
-            let file_name = entry.file_name();
-            let dest_path_entry = final_dest_path.join(file_name);
-
-            log_info!("Processing item: {}", entry_path.display());
-
-            if entry_path.is_file() {
-                // Copy file
-                match fs::copy(&entry_path, &dest_path_entry) {
-                    Ok(size) => {
-                        log_info!(
-                            "Copied file: {} ({} bytes)",
-                            entry_path.display(),
-                            size
-                        );
-                        total_size += size;
-                    }
-                    Err(err) => {
-                        let error_msg =
-                            format!("Failed to copy file '{}': {}", entry_path.display(), err);
-                        log_error!(error_msg.as_str());
-                        return Err(error_msg);
-                    }
-                }
-            } else if entry_path.is_dir() {
-                // Recursively copy subdirectory - pass the dest_path_entry as destination
-                log_info!("Recursively copying subdirectory: {}", entry_path.display());
-                match Box::pin(copy_to_dest_path(
-                    entry_path.to_str().unwrap(),
-                    dest_path_entry.parent().unwrap().to_str().unwrap(),
-                ))
-                .await
-                {
-                    Ok(sub_size) => {
-                        log_info!(
-                            "Copied directory: {} ({} bytes)",
-                            entry_path.display(),
-                            sub_size
-                        );
-                        total_size += sub_size;
-                    }
-                    Err(err) => {
-                        log_error!(
-                            "Failed to copy directory '{}': {}",
-                            entry_path.display(),
-                            err
-                        );
-                        return Err(err);
-                    }
-                }
-            }
-        }
-
+        let final_dest = unique_dest_path(dest_dir, name, true)?;
+        fs::create_dir(&final_dest)
+            .map_err(|e| io_err("Failed to create destination directory", e))?;
+        let mut visited = HashSet::new();
+        let total = copy_dir_contents(source, &final_dest, &mut visited)?;
         log_info!(
             "Successfully copied directory with total size: {} bytes",
-            total_size
+            total
         );
-        Ok(total_size)
+        Ok(total)
     } else {
-        log_info!("Copying single file");
+        copy_file_unique(source, dest_dir, name)
+    }
+}
 
-        // For single files, construct the full destination path including filename
-        let file_name = match source_path_buf.file_name() {
-            Some(name) => name,
-            None => {
-                let error_msg = "Invalid source file name".to_string();
-                log_error!(error_msg.as_str());
-                return Err(error_msg);
-            }
-        };
+/// Returns a not-yet-existing path inside `dir` based on `name`.
+///
+/// Files become `stem (n).ext`, folders `name (n)` (so `a.b` becomes `a.b (1)`).
+fn unique_dest_path(dir: &Path, name: &OsStr, is_dir: bool) -> Result<PathBuf, Error> {
+    let first = dir.join(name);
+    if fs::symlink_metadata(&first).is_err() {
+        return Ok(first);
+    }
 
-        // Join the destination directory with the source filename
-        let final_dest_path = Path::new(dest_path).join(file_name);
-
-        // Create parent directory for the file if it doesn't exist
-        if let Some(parent) = final_dest_path.parent() {
-            if !parent.exists() {
-                match fs::create_dir_all(parent) {
-                    Ok(_) => log_info!("Created parent directory: {}", parent.display()),
-                    Err(err) => {
-                        let error_msg = format!("Failed to create parent directory: {}", err);
-                        log_error!(error_msg.as_str());
-                        return Err(error_msg);
-                    }
-                }
-            }
+    let as_path = Path::new(name);
+    let (stem, extension) = if is_dir {
+        (name.to_os_string(), None)
+    } else {
+        match (as_path.file_stem(), as_path.extension()) {
+            (Some(stem), Some(ext)) => (stem.to_os_string(), Some(ext.to_os_string())),
+            _ => (name.to_os_string(), None),
         }
+    };
 
-        // Copy the file to the final destination path
-        match fs::copy(source_path, final_dest_path.to_str().unwrap()) {
-            Ok(size) => {
+    for n in 1..=MAX_UNIQUE_ATTEMPTS {
+        let mut candidate = stem.clone();
+        candidate.push(format!(" ({n})"));
+        if let Some(ext) = &extension {
+            candidate.push(".");
+            candidate.push(ext);
+        }
+        let candidate = dir.join(candidate);
+        if fs::symlink_metadata(&candidate).is_err() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(Error::already_exists(format!(
+        "Could not find a free name for '{}' in '{}'",
+        name.to_string_lossy(),
+        dir.display()
+    )))
+}
+
+/// Copies one file into `dest_dir` without ever overwriting an existing entry.
+fn copy_file_unique(source: &Path, dest_dir: &Path, name: &OsStr) -> Result<u64, Error> {
+    let mut input = fs::File::open(source)
+        .map_err(|e| io_err(&format!("Failed to open '{}'", source.display()), e))?;
+
+    for _ in 0..5 {
+        let target = unique_dest_path(dest_dir, name, false)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(mut output) => {
+                let size = io::copy(&mut input, &mut output).map_err(|e| {
+                    io_err(&format!("Failed to copy file '{}'", source.display()), e)
+                })?;
+                drop(output);
+                if let Ok(meta) = input.metadata() {
+                    // Best effort: keep the source permissions like fs::copy does.
+                    let _ = fs::set_permissions(&target, meta.permissions());
+                }
                 log_info!(
                     "Copied file: {} to {} ({} bytes)",
-                    source_path, final_dest_path.display(), size
+                    source.display(),
+                    target.display(),
+                    size
                 );
-                Ok(size)
+                return Ok(size);
             }
+            // Lost a race for the name: pick the next free one.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
-                let error_msg = format!("Failed to copy file: {}", err);
-                log_error!(error_msg.as_str());
-                Err(error_msg)
+                return Err(io_err(
+                    &format!("Failed to create '{}'", target.display()),
+                    err,
+                ))
             }
         }
     }
+
+    Err(Error::already_exists(format!(
+        "Could not create a unique file for '{}'",
+        name.to_string_lossy()
+    )))
+}
+
+/// Recursively copies the content of `source` into the (already created) `dest`.
+///
+/// Symlinks are skipped and every canonical source directory is visited at most once, which
+/// protects against symlink / junction loops.
+fn copy_dir_contents(
+    source: &Path,
+    dest: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<u64, Error> {
+    let canonical = fs::canonicalize(source)
+        .map_err(|e| io_err(&format!("Failed to resolve '{}'", source.display()), e))?;
+    if !visited.insert(canonical) {
+        log_info!("Skipping already visited directory: {}", source.display());
+        return Ok(0);
+    }
+
+    let entries = fs::read_dir(source).map_err(|e| io_err("Failed to read source directory", e))?;
+
+    let mut total = 0;
+    for entry_result in entries {
+        let entry = entry_result.map_err(|e| io_err("Failed to read directory entry", e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| io_err("Failed to read entry type", e))?;
+        let entry_path = entry.path();
+        let name = entry.file_name();
+
+        if file_type.is_symlink() {
+            log_info!("Skipping symlink: {}", entry_path.display());
+        } else if file_type.is_dir() {
+            let sub_dest = unique_dest_path(dest, &name, true)?;
+            fs::create_dir(&sub_dest)
+                .map_err(|e| io_err(&format!("Failed to create '{}'", sub_dest.display()), e))?;
+            total += copy_dir_contents(&entry_path, &sub_dest, visited)?;
+        } else if file_type.is_file() {
+            total += copy_file_unique(&entry_path, dest, &name)?;
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -793,11 +792,12 @@ mod tests_template_commands {
             .expect("Failed to create test file in template");
 
         // Update template paths in state
-        let meta_state = state.lock().unwrap();
-        meta_state
-            .update_template_paths()
-            .expect("Failed to update template paths");
-        drop(meta_state);
+        {
+            let meta_state = state.lock().unwrap();
+            meta_state
+                .update_template_paths()
+                .expect("Failed to update template paths");
+        }
 
         // Verify the template exists
         assert!(
@@ -985,11 +985,245 @@ mod tests_template_commands {
         );
 
         // Verify the file content was preserved
-        let content = fs::read_to_string(expected_template_path).expect("Failed to read template file");
+        let content =
+            fs::read_to_string(expected_template_path).expect("Failed to read template file");
         assert_eq!(
-            content,
-            "Single file template content",
+            content, "Single file template content",
             "File content should match"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // TP-SEC-02: remove_template must never delete outside the templates dir
+    // ---------------------------------------------------------------------
+
+    /// Layout: base/{templates, outside/keep.txt}; the state points at `base/templates`.
+    fn sec_layout() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        Arc<Mutex<MetaDataState>>,
+    ) {
+        let base = tempdir().expect("base dir");
+        let metadata_dir = tempdir().expect("metadata dir");
+        let templates = base.path().join("templates");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&templates).unwrap();
+        create_test_file(&outside.join("keep.txt"), b"keep").unwrap();
+        let state = create_test_metadata_state(
+            metadata_dir.path().join("meta_data.json"),
+            templates.clone(),
+        );
+        (base, metadata_dir, templates, outside, state)
+    }
+
+    fn assert_outside_untouched(outside: &Path) {
+        assert!(outside.is_dir(), "outside dir must still exist");
+        assert_eq!(
+            fs::read_to_string(outside.join("keep.txt")).unwrap(),
+            "keep",
+            "keep.txt must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_template_rejects_outside_absolute_dir() {
+        let (_base, _meta, _templates, outside, state) = sec_layout();
+
+        let result = remove_template_impl(state, outside.to_str().unwrap()).await;
+
+        assert!(result.is_err(), "outside dir must not be removable");
+        assert_outside_untouched(&outside);
+    }
+
+    #[tokio::test]
+    async fn test_remove_template_rejects_dotdot_traversal() {
+        let (_base, _meta, templates, outside, state) = sec_layout();
+        let sneaky = templates.join("..").join("outside");
+
+        let result = remove_template_impl(state, sneaky.to_str().unwrap()).await;
+
+        assert!(result.is_err(), "`templates/../outside` must be rejected");
+        assert_outside_untouched(&outside);
+    }
+
+    #[tokio::test]
+    async fn test_remove_template_rejects_templates_root_itself() {
+        let (_base, _meta, templates, _outside, state) = sec_layout();
+
+        let result = remove_template_impl(state, templates.to_str().unwrap()).await;
+
+        assert!(result.is_err(), "templates root must not be removable");
+        assert!(templates.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_template_symlink_to_outside_keeps_target() {
+        let (_base, _meta, templates, outside, state) = sec_layout();
+        let link = templates.join("link_to_outside");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let result = remove_template_impl(state.clone(), link.to_str().unwrap()).await;
+        assert!(result.is_err(), "symlink pointing outside must be rejected");
+        assert_outside_untouched(&outside);
+
+        let via_link = link.join("keep.txt");
+        let result_inner = remove_template_impl(state, via_link.to_str().unwrap()).await;
+        assert!(
+            result_inner.is_err(),
+            "path through symlink pointing outside must be rejected"
+        );
+        assert_outside_untouched(&outside);
+    }
+
+    // ---------------------------------------------------------------------
+    // TP-BE-05: use_template must not overwrite, validate dest, survive poison
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_use_template_does_not_overwrite_existing_file() {
+        let template_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let template_file = template_dir.path().join("item.txt");
+        create_test_file(&template_file, b"new").unwrap();
+        let existing = dest_dir.path().join("item.txt");
+        create_test_file(&existing, b"original").unwrap();
+
+        let result = use_template_impl(
+            template_file.to_str().unwrap(),
+            dest_dir.path().to_str().unwrap(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "should succeed with unique name: {result:?}"
+        );
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "original");
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("item (1).txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_use_template_directory_with_dot_gets_unique_folder_name() {
+        let template_parent = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let template = template_parent.path().join("a.b");
+        create_test_file(&template.join("f.txt"), b"x").unwrap();
+        fs::create_dir(dest_dir.path().join("a.b")).unwrap();
+
+        let result = use_template_impl(
+            template.to_str().unwrap(),
+            dest_dir.path().to_str().unwrap(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(dest_dir.path().join("a.b (1)").join("f.txt").is_file());
+        assert!(!dest_dir.path().join("a.b").join("f.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_use_template_rejects_file_as_destination() {
+        let template_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let template_file = template_dir.path().join("item.txt");
+        create_test_file(&template_file, b"new").unwrap();
+        let dest_file = dest_dir.path().join("dest.txt");
+        create_test_file(&dest_file, b"original").unwrap();
+
+        let result =
+            use_template_impl(template_file.to_str().unwrap(), dest_file.to_str().unwrap()).await;
+
+        let err = result.expect_err("a file destination must be rejected");
+        assert!(err.contains("not a directory"), "{err}");
+        assert_eq!(fs::read_to_string(&dest_file).unwrap(), "original");
+    }
+
+    #[tokio::test]
+    async fn test_use_template_rejects_copy_into_itself() {
+        let template_dir = tempdir().unwrap();
+        create_test_file(&template_dir.path().join("f.txt"), b"x").unwrap();
+        let inner = template_dir.path().join("inner");
+        fs::create_dir(&inner).unwrap();
+
+        let result = use_template_impl(
+            template_dir.path().to_str().unwrap(),
+            inner.to_str().unwrap(),
+        )
+        .await;
+
+        assert!(result.is_err(), "copying a folder into itself must fail");
+        assert_eq!(fs::read_dir(&inner).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_use_template_skips_symlink_loops() {
+        let template_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let template = template_dir.path().join("tpl");
+        create_test_file(&template.join("f.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(&template, template.join("loop")).unwrap();
+
+        let result = use_template_impl(
+            template.to_str().unwrap(),
+            dest_dir.path().to_str().unwrap(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(dest_dir.path().join("tpl").join("f.txt").is_file());
+        assert!(!dest_dir.path().join("tpl").join("loop").exists());
+    }
+
+    #[tokio::test]
+    async fn test_poisoned_state_returns_error_instead_of_panicking() {
+        let templates_dir = tempdir().unwrap();
+        let metadata_dir = tempdir().unwrap();
+        let state = create_test_metadata_state(
+            metadata_dir.path().join("meta_data.json"),
+            templates_dir.path().to_path_buf(),
+        );
+        let template = templates_dir.path().join("tpl");
+        fs::create_dir(&template).unwrap();
+        let source = tempdir().unwrap();
+        create_test_file(&source.path().join("a.txt"), b"a").unwrap();
+
+        // Poison the outer Mutex<MetaDataState>.
+        let poisoner = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(state.lock().is_err(), "mutex should be poisoned");
+
+        let listed = get_template_paths_as_json_impl(state.clone()).await;
+        assert!(listed.is_err());
+
+        let added = add_template_impl(state.clone(), source.path().to_str().unwrap()).await;
+        assert!(added.is_err());
+
+        let removed = remove_template_impl(state, template.to_str().unwrap()).await;
+        assert!(removed.is_err());
+        assert!(template.exists(), "nothing may be removed on lock failure");
+    }
+
+    #[tokio::test]
+    async fn test_errors_are_json_serialized() {
+        let dest_dir = tempdir().unwrap();
+        let err = use_template_impl(
+            "/path/to/nonexistent/template",
+            dest_dir.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap_err();
+        let parsed: Error = serde_json::from_str(&err).expect("error must be JSON");
+        assert_eq!(parsed.message_from_code, ErrorCode::ResourceNotFound);
     }
 }

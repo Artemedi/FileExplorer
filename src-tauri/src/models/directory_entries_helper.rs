@@ -31,28 +31,25 @@ pub struct Entries {
 /// use std::fs::Permissions;
 /// use std::os::unix::fs::PermissionsExt;
 ///
-/// fn main() {
-///  let permissions = Permissions::from_mode(0o755);
-///  let is_directory = true;
-///  let permission_number = get_access_permission_number(permissions, is_directory);
-///  println!("Access permissions number: {}", permission_number);
-/// }
+/// let permissions = Permissions::from_mode(0o755);
+/// let is_directory = true;
+/// let permission_number = get_access_permission_number(permissions, is_directory);
+/// println!("Access permissions number: {}", permission_number);
+/// ```
 pub fn get_access_permission_number(permissions: Permissions, _is_directory: bool) -> u32 {
     #[cfg(windows)]
     {
         // Unix-like octal for Windows-permissions
-        return if permissions.readonly() {
-            0o444 // r--r--r--
-        } else if _is_directory {
-            0o755 // rwxr-xr-x
-        } else {
-            0o666 // rw-rw-rw-
-        }
+        return match (_is_directory, permissions.readonly()) {
+            (true, true) => 0o555,   // r-xr-xr-x
+            (true, false) => 0o755,  // rwxr-xr-x
+            (false, true) => 0o444,  // r--r--r--
+            (false, false) => 0o666, // rw-rw-rw-
+        };
     }
     #[cfg(unix)]
     {
-        let mode = permissions.mode();
-        mode
+        permissions.mode()
     }
 }
 
@@ -72,12 +69,10 @@ pub fn get_access_permission_number(permissions: Permissions, _is_directory: boo
 /// use std::fs::Permissions;
 /// use std::os::unix::fs::PermissionsExt;
 ///
-/// fn main() {
-///   let permissions = Permissions::from_mode(0o755);
-///   let is_directory = true;
-///   let permission_string = get_access_permission_string(permissions, is_directory);
-///   println!("Access permissions: {}", permission_string);
-/// }
+/// let permissions = Permissions::from_mode(0o755);
+/// let is_directory = true;
+/// let permission_string = get_access_permission_string(permissions, is_directory);
+/// println!("Access permissions: {}", permission_string);
 /// ```
 #[allow(unused_variables)]
 pub fn get_access_permission_string(permissions: Permissions, is_directory: bool) -> String {
@@ -107,29 +102,19 @@ pub fn get_access_permission_string(permissions: Permissions, is_directory: bool
 /// use std::fs::Permissions;
 /// use std::os::unix::fs::PermissionsExt;
 ///
-/// fn main() {
-///  let permissions = Permissions::from_mode(0o755);
-///  let is_directory = true;
-///  let permission_string = get_access_permission_string(permissions, is_directory);
+/// let permissions = Permissions::from_mode(0o755);
+/// let is_directory = true;
+/// let permission_string = get_access_permission_string(permissions, is_directory);
 /// println!("Access permissions: {}", permission_string);
-/// }
 /// ```
 #[allow(dead_code)]
 pub fn access_permission_string_windows(permission: Permissions, is_directory: bool) -> String {
-    // Standardmäßig Leserechte für alle
-    let mut result = String::from("r--r--r--");
-
-    // Wenn nicht schreibgeschützt, füge Schreibrechte für alle hinzu
-    if !permission.readonly() {
-        result = String::from("rw-rw-rw-");
+    match (is_directory, permission.readonly()) {
+        (true, true) => String::from("r-xr-xr-x"),
+        (true, false) => String::from("rwxr-xr-x"),
+        (false, true) => String::from("r--r--r--"),
+        (false, false) => String::from("rw-rw-rw-"),
     }
-
-    // Wenn es sich um ein Verzeichnis handelt, füge Ausführungsrechte hinzu
-    if is_directory {
-        result = String::from("rwxr-xr-x");
-    }
-
-    result
 }
 
 /// This function converts the access permissions of a file or directory into a human-readable string.
@@ -148,12 +133,10 @@ pub fn access_permission_string_windows(permission: Permissions, is_directory: b
 /// use std::fs::Permissions;
 /// use std::os::unix::fs::PermissionsExt;
 ///
-/// fn main() {
-///  let permissions = Permissions::from_mode(0o755);
-///  let is_directory = true;
-///  let permission_string = get_access_permission_string(permissions, is_directory);
-///  println!("Access permissions: {}", permission_string);
-/// }
+/// let permissions = Permissions::from_mode(0o755);
+/// let is_directory = true;
+/// let permission_string = get_access_permission_string(permissions, is_directory);
+/// println!("Access permissions: {}", permission_string);
 /// ```
 #[cfg(unix)]
 pub fn access_rights_to_string_unix(permissions: Permissions) -> String {
@@ -192,11 +175,10 @@ pub fn access_rights_to_string_unix(permissions: Permissions) -> String {
 /// use crate::commands::fs_dir_loader_commands::format_system_time;
 /// use std::time::SystemTime;
 ///
-/// fn main() {
-///  let system_time = SystemTime::now();
-///  let formatted_time = format_system_time(system_time);
-///  println!("Formatted time: {}", formatted_time);
-/// }
+/// let system_time = SystemTime::now();
+/// let formatted_time = format_system_time(system_time);
+/// println!("Formatted time: {}", formatted_time);
+/// ```
 pub fn format_system_time(system_time: SystemTime) -> String {
     let datetime: DateTime<Utc> = system_time.into();
     datetime.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -216,11 +198,10 @@ pub fn format_system_time(system_time: SystemTime) -> String {
 /// use crate::commands::fs_dir_loader_commands::get_directory_size_in_bytes;
 /// use std::fs;
 ///
-/// fn main() {
-///  let path = "/path/to/directory";
-///  let size = get_directory_size_in_bytes(path);
-///  println!("Directory size: {} bytes", size);
-/// }
+/// let path = "/path/to/directory";
+/// let size = get_directory_size_in_bytes(path);
+/// println!("Directory size: {} bytes", size);
+/// ```
 #[allow(dead_code)]
 pub fn get_directory_size_in_bytes(path: &str) -> u64 {
     WalkDir::new(path)
@@ -249,11 +230,10 @@ pub fn get_directory_size_in_bytes(path: &str) -> u64 {
 /// use crate::commands::fs_dir_loader_commands::count_subfiles_and_directories;
 /// use std::env;
 ///
-/// fn main() {
-///  let path = env::current_dir().unwrap().to_str().unwrap().to_string();
-///  let (file_count, dir_count) = count_subfiles_and_directories(&path);
-///  println!("Files: {}, Directories: {}", file_count, dir_count);
-/// }
+/// let path = env::current_dir().unwrap().to_str().unwrap().to_string();
+/// let (file_count, dir_count) = count_subfiles_and_directories(&path);
+/// println!("Files: {}, Directories: {}", file_count, dir_count);
+/// ```
 #[allow(dead_code)]
 pub fn count_subfiles_and_subdirectories(path: &str) -> (usize, usize) {
     let mut file_count = 0;
@@ -287,12 +267,11 @@ pub fn count_subfiles_and_subdirectories(path: &str) -> (usize, usize) {
 /// ```rust
 /// use crate::models::directory_entries_helper::count_subfiles;
 ///
-/// fn main() {
-///   let path = "/path/to/directory";
-///   let file_count = count_subfiles(path);
-///   println!("Files: {}", file_count);
-/// }
+/// let path = "/path/to/directory";
+/// let file_count = count_subfiles(path);
+/// println!("Files: {}", file_count);
 /// ```
+#[allow(dead_code)]
 pub fn count_subfiles(path: &str) -> usize {
     let mut file_count = 0;
 
@@ -322,12 +301,11 @@ pub fn count_subfiles(path: &str) -> usize {
 /// ```rust
 /// use crate::models::directory_entries_helper::count_subdirectories;
 ///
-/// fn main() {
-///   let path = "/path/to/directory";
-///   let dir_count = count_subdirectories(path);
-///   println!("Directories: {}", dir_count);
-/// }
+/// let path = "/path/to/directory";
+/// let dir_count = count_subdirectories(path);
+/// println!("Directories: {}", dir_count);
 /// ```
+#[allow(dead_code)]
 pub fn count_subdirectories(path: &str) -> usize {
     let mut dir_count = 0;
 
@@ -342,4 +320,34 @@ pub fn count_subdirectories(path: &str) -> usize {
     }
 
     dir_count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_windows_readonly_directory_permissions() {
+        let dir = tempdir().unwrap();
+        let subdir = dir.path().join("ro_dir");
+        fs::create_dir(&subdir).unwrap();
+
+        let writable_perms = fs::metadata(&subdir).unwrap().permissions();
+        assert_eq!(
+            access_permission_string_windows(writable_perms, true),
+            "rwxr-xr-x"
+        );
+
+        let mut ro_perms = fs::metadata(&subdir).unwrap().permissions();
+        ro_perms.set_readonly(true);
+        assert_eq!(
+            access_permission_string_windows(ro_perms.clone(), true),
+            "r-xr-xr-x"
+        );
+        assert_eq!(
+            access_permission_string_windows(ro_perms, false),
+            "r--r--r--"
+        );
+    }
 }

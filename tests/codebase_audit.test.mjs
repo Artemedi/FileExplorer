@@ -415,10 +415,7 @@ test('Tauri commands, invoke() signatures/required params, and emit()/listen() c
     }
     assert.ok(registeredCommands.has('open_file'), 'open_file must be registered in main.rs');
 
-    // Wave 1D will remove #[tauri::command] from connect_to_sftp
-    const UNREGISTERED_COMMAND_ALLOWLIST = new Set([
-        'connect_to_sftp',
-    ]);
+    const UNREGISTERED_COMMAND_ALLOWLIST = new Set([]);
 
     // Parse #[tauri::command] functions across src-tauri/src/**/*.rs
     const definedCommands = new Set();

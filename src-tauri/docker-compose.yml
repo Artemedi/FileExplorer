@@ -1,10 +1,10 @@
 services:
-  # emberstack/sftp with custom configuration
+  # Local test-only SFTP server (pinned release tag, bound strictly to loopback)
   sftp:
-    image: emberstack/sftp
+    image: emberstack/sftp:5.1.71
     container_name: test-sftp-explorer
     ports:
-      - "2222:22"
+      - "127.0.0.1:2222:22"
     volumes:
       - ./sftp.json:/app/config/sftp.json:ro
       - ./test-data-for-fuzzy-search:/home/explorer/data

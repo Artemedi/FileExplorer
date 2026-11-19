@@ -1,21 +1,22 @@
-use std::fmt::Display;
+use crate::error_handling::Error;
 use crate::state::SettingsState;
 use crc32fast::Hasher;
-use md5::{Digest as Md5Digest, Md5 as Md5Hasher};
+use md5::Md5 as Md5Hasher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256, Sha384, Sha512};
+use std::fmt::Display;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tauri::State;
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub enum HashError {
     SettingsLockError,
     InvalidChecksumMethod,
-    FileOperationError,
+    FileOperationError(String),
     ClipboardError,
 }
 
@@ -45,13 +46,29 @@ impl FromStr for ChecksumMethod {
 
 impl Display for HashError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let str = match self {
-            HashError::SettingsLockError => "Failed to access settings".to_string(),
-            HashError::InvalidChecksumMethod => "Invalid checksum method".to_string(),
-            HashError::FileOperationError => "File operation failed".to_string(),
-            HashError::ClipboardError => "Failed to copy to clipboard".to_string(),
-        };
-        write!(f, "{}", str)
+        match self {
+            HashError::SettingsLockError => write!(f, "Failed to access settings"),
+            HashError::InvalidChecksumMethod => write!(f, "Invalid checksum method"),
+            HashError::FileOperationError(detail) if detail.is_empty() => {
+                write!(f, "File operation failed")
+            }
+            HashError::FileOperationError(detail) => {
+                write!(f, "File operation failed: {detail}")
+            }
+            HashError::ClipboardError => write!(f, "Failed to copy to clipboard"),
+        }
+    }
+}
+
+impl From<HashError> for Error {
+    fn from(err: HashError) -> Self {
+        match &err {
+            HashError::InvalidChecksumMethod => Error::invalid_input(err.to_string()),
+            HashError::SettingsLockError | HashError::ClipboardError => {
+                Error::internal(err.to_string())
+            }
+            HashError::FileOperationError(_) => Error::internal(err.to_string()),
+        }
     }
 }
 
@@ -63,7 +80,10 @@ async fn get_checksum_method(
         .0
         .lock()
         .map_err(|_| HashError::SettingsLockError)?;
-    Ok(inner_settings.backend_settings.default_checksum_hash.clone())
+    Ok(inner_settings
+        .backend_settings
+        .default_checksum_hash
+        .clone())
 }
 
 fn calculate_md5(data: &[u8]) -> String {
@@ -95,16 +115,25 @@ fn calculate_crc32(data: &[u8]) -> String {
     let mut hasher = Hasher::new();
     hasher.update(data);
     let checksum = hasher.finalize();
-    format!("{:08x}", checksum)
+    format!("{checksum:08x}")
 }
 
 async fn calculate_file_hash(method: ChecksumMethod, path: &Path) -> Result<String, HashError> {
-    if !path.exists() || path.is_dir() {
-        return Err(HashError::FileOperationError);
+    if !path.exists() {
+        return Err(HashError::FileOperationError(format!(
+            "File does not exist: {}",
+            path.display()
+        )));
+    }
+    if path.is_dir() {
+        return Err(HashError::FileOperationError(format!(
+            "Path is a directory, not a file: {}",
+            path.display()
+        )));
     }
     let mut file = File::open(path)
         .await
-        .map_err(|_| HashError::FileOperationError)?;
+        .map_err(|e| HashError::FileOperationError(e.to_string()))?;
 
     let mut md5_hasher = (method == ChecksumMethod::MD5).then(Md5Hasher::new);
     let mut sha256_hasher = (method == ChecksumMethod::SHA256).then(Sha256::new);
@@ -112,21 +141,31 @@ async fn calculate_file_hash(method: ChecksumMethod, path: &Path) -> Result<Stri
     let mut sha512_hasher = (method == ChecksumMethod::SHA512).then(Sha512::new);
     let mut crc32_hasher = (method == ChecksumMethod::CRC32).then(Hasher::new);
 
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let n = file
             .read(&mut buffer)
             .await
-            .map_err(|_| HashError::FileOperationError)?;
+            .map_err(|e| HashError::FileOperationError(e.to_string()))?;
         if n == 0 {
             break;
         }
         let chunk = &buffer[..n];
-        if let Some(h) = &mut md5_hasher { h.update(chunk); }
-        if let Some(h) = &mut sha256_hasher { h.update(chunk); }
-        if let Some(h) = &mut sha384_hasher { h.update(chunk); }
-        if let Some(h) = &mut sha512_hasher { h.update(chunk); }
-        if let Some(h) = &mut crc32_hasher { h.update(chunk); }
+        if let Some(h) = &mut md5_hasher {
+            h.update(chunk);
+        }
+        if let Some(h) = &mut sha256_hasher {
+            h.update(chunk);
+        }
+        if let Some(h) = &mut sha384_hasher {
+            h.update(chunk);
+        }
+        if let Some(h) = &mut sha512_hasher {
+            h.update(chunk);
+        }
+        if let Some(h) = &mut crc32_hasher {
+            h.update(chunk);
+        }
     }
 
     let result = match method {
@@ -154,15 +193,18 @@ async fn calculate_hash(method: ChecksumMethod, data: &[u8]) -> Result<String, H
 #[allow(dead_code)]
 async fn read_file(path: &Path) -> Result<Vec<u8>, HashError> {
     if !path.exists() || path.is_dir() {
-        return Err(HashError::FileOperationError);
+        return Err(HashError::FileOperationError(format!(
+            "Invalid file path: {}",
+            path.display()
+        )));
     }
     let mut file = File::open(path)
         .await
-        .map_err(|_| HashError::FileOperationError)?;
+        .map_err(|e| HashError::FileOperationError(e.to_string()))?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)
         .await
-        .map_err(|_| HashError::FileOperationError)?;
+        .map_err(|e| HashError::FileOperationError(e.to_string()))?;
     Ok(buffer)
 }
 
@@ -199,10 +241,10 @@ pub async fn gen_hash_and_return_string_impl(
 ) -> Result<String, String> {
     let checksum_method = get_checksum_method(state)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Error::from(e).to_json())?;
     calculate_file_hash(checksum_method, Path::new(&path))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| Error::from(e).to_json())
 }
 
 /// Generates a hash for the given file and saves it to a specified output file.
@@ -241,14 +283,32 @@ pub async fn gen_hash_and_save_to_file_impl(
 ) -> Result<String, String> {
     let checksum_method = get_checksum_method(state)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Error::from(e).to_json())?;
     let hash = calculate_file_hash(checksum_method, Path::new(&source_path))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Error::from(e).to_json())?;
 
-    tokio::fs::write(output_path, hash.as_bytes())
+    let mut out_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
         .await
-        .map_err(|_| "Failed to write hash to file".to_string())?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                Error::already_exists(format!("Output hash file already exists: {output_path}"))
+                    .to_json()
+            }
+            _ => Error::internal(format!("Failed to create hash file: {e}")).to_json(),
+        })?;
+
+    out_file
+        .write_all(hash.as_bytes())
+        .await
+        .map_err(|e| Error::internal(format!("Failed to write hash to file: {e}")).to_json())?;
+    out_file
+        .flush()
+        .await
+        .map_err(|e| Error::internal(format!("Failed to flush hash file: {e}")).to_json())?;
 
     Ok(hash)
 }
@@ -287,14 +347,21 @@ pub async fn compare_file_or_dir_with_hash_impl(
     hash_to_compare: String,
     state: Arc<Mutex<SettingsState>>,
 ) -> Result<bool, String> {
+    let p = Path::new(&path);
+    if p.is_dir() {
+        return Err(Error::invalid_input(format!(
+            "Directory hashing is not supported (expected a file path): {path}"
+        ))
+        .to_json());
+    }
     let checksum_method = get_checksum_method(state)
         .await
-        .map_err(|e| e.to_string())?;
-    let calculated_hash = calculate_file_hash(checksum_method, Path::new(&path))
+        .map_err(|e| Error::from(e).to_json())?;
+    let calculated_hash = calculate_file_hash(checksum_method, p)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Error::from(e).to_json())?;
 
-    Ok(calculated_hash.eq_ignore_ascii_case(&hash_to_compare))
+    Ok(calculated_hash.eq_ignore_ascii_case(hash_to_compare.trim()))
 }
 
 #[cfg(test)]
@@ -438,9 +505,55 @@ mod tests_hash_commands {
             gen_hash_and_return_string_impl(non_existent_path.to_string(), mock_state).await;
 
         assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("File operation failed"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_hash_does_not_overwrite_existing_output_file() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let source_path = temp_dir.path().join("src.txt");
+        let out_path = temp_dir.path().join("out.sha256");
+        std::fs::write(&source_path, b"Hello, world!").unwrap();
+        std::fs::write(&out_path, b"ORIGINAL_DO_NOT_OVERWRITE").unwrap();
+
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
+        let res = gen_hash_and_save_to_file_impl(
+            source_path.to_string_lossy().to_string(),
+            out_path.to_string_lossy().to_string(),
+            mock_state,
+        )
+        .await;
+
+        assert!(res.is_err(), "existing output file must not be overwritten");
+        let err = res.unwrap_err();
+        assert!(err.contains("already exists"), "unexpected error: {}", err);
         assert_eq!(
-            result.unwrap_err(),
-            HashError::FileOperationError.to_string()
+            std::fs::read_to_string(&out_path).unwrap(),
+            "ORIGINAL_DO_NOT_OVERWRITE"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compare_directory_returns_explicit_error() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let (mock_state, _settings_dir) = create_test_state(ChecksumMethod::SHA256);
+        let res = compare_file_or_dir_with_hash_impl(
+            temp_dir.path().to_string_lossy().to_string(),
+            "315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3".to_string(),
+            mock_state,
+        )
+        .await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("Directory hashing is not supported"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -536,11 +649,15 @@ mod tests_hash_commands {
         ];
 
         for method in methods {
-            let state_guard = state.lock().unwrap();
-            state_guard
-                .update_setting_field("backend_settings.default_checksum_hash", json!(method.clone()))
-                .unwrap();
-            drop(state_guard);
+            {
+                let state_guard = state.lock().unwrap();
+                state_guard
+                    .update_setting_field(
+                        "backend_settings.default_checksum_hash",
+                        json!(method.clone()),
+                    )
+                    .unwrap();
+            }
 
             let result = gen_hash_and_return_string_impl(file_path.clone(), state.clone()).await;
 

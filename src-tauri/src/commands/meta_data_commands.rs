@@ -29,65 +29,38 @@ use tauri::State;
 /// ```
 #[tauri::command]
 pub fn get_meta_data_as_json(state: State<Arc<Mutex<MetaDataState>>>) -> Result<String, String> {
-    let meta_data = state.lock().map_err(|_| {
-        Error::new(
-            ErrorCode::InternalError,
-            "Failed to acquire lock on metadata state".to_string(),
-        ).to_json()
-    })?.refresh_volumes();
-
-    if let Err(e) = meta_data {
-        return Err(Error::new(
-            ErrorCode::InternalError,
-            format!("Error refreshing volumes: {}", e),
-        )
-        .to_json());
-    }
-
-    let meta_data = state.lock().map_err(|_| {
-        Error::new(
-            ErrorCode::InternalError,
-            "Failed to acquire lock on metadata state".to_string(),
-        ).to_json()
-    })?.0.clone();
-
-    serde_json::to_string(&meta_data).map_err(|e| {
-        Error::new(
-            ErrorCode::InternalError,
-            format!("Error serializing metadata: {}", e),
-        )
-        .to_json()
-    })
+    get_meta_data_as_json_impl(state.inner().clone())
 }
 
-#[cfg(test)]
 pub fn get_meta_data_as_json_impl(state: Arc<Mutex<MetaDataState>>) -> Result<String, String> {
-    let meta_data = state.lock().map_err(|_| {
+    let meta_data_guard = state.lock().map_err(|_| {
         Error::new(
             ErrorCode::InternalError,
             "Failed to acquire lock on metadata state".to_string(),
-        ).to_json()
-    })?.refresh_volumes();
-
-    if let Err(e) = meta_data {
-        return Err(Error::new(
-            ErrorCode::InternalError,
-            format!("Error refreshing volumes: {}", e),
         )
-        .to_json());
-    }
+        .to_json()
+    })?;
 
-    let meta_data = state.lock().map_err(|_| {
+    meta_data_guard.refresh_volumes().map_err(|e| {
         Error::new(
             ErrorCode::InternalError,
-            "Failed to acquire lock on metadata state".to_string(),
-        ).to_json()
-    })?.0.clone();
+            format!("Error refreshing volumes: {e}"),
+        )
+        .to_json()
+    })?;
 
-    serde_json::to_string(&meta_data).map_err(|e| {
+    let inner_meta_data = meta_data_guard.0.lock().map_err(|_| {
         Error::new(
             ErrorCode::InternalError,
-            format!("Error serializing metadata: {}", e),
+            "Failed to acquire inner lock on metadata state".to_string(),
+        )
+        .to_json()
+    })?;
+
+    serde_json::to_string(&*inner_meta_data).map_err(|e| {
+        Error::new(
+            ErrorCode::InternalError,
+            format!("Error serializing metadata: {e}"),
         )
         .to_json()
     })
@@ -95,10 +68,21 @@ pub fn get_meta_data_as_json_impl(state: Arc<Mutex<MetaDataState>>) -> Result<St
 
 #[tauri::command]
 pub fn update_meta_data(state: State<Arc<Mutex<MetaDataState>>>) -> Result<(), String> {
-    match state.lock().unwrap().refresh_volumes() {
-        Ok(_) => Ok(()),
-        Err(e) => Err(Error::new(ErrorCode::InternalError, format!("Error: {}", e)).to_json()),
-    }
+    update_meta_data_impl(state.inner().clone())
+}
+
+pub fn update_meta_data_impl(state: Arc<Mutex<MetaDataState>>) -> Result<(), String> {
+    let meta_data_guard = state.lock().map_err(|_| {
+        Error::new(
+            ErrorCode::InternalError,
+            "Failed to acquire lock on metadata state".to_string(),
+        )
+        .to_json()
+    })?;
+
+    meta_data_guard
+        .refresh_volumes()
+        .map_err(|e| Error::new(ErrorCode::InternalError, format!("Error: {e}")).to_json())
 }
 
 #[cfg(test)]
@@ -127,7 +111,6 @@ mod tests_meta_data_commands {
         // Verify the JSON contains expected metadata structure
         let json = result.unwrap();
         assert!(json.contains("volumes"));
-        // Add more specific assertions based on your expected data structure
     }
 
     #[test]
@@ -157,5 +140,31 @@ mod tests_meta_data_commands {
             .as_object()
             .unwrap()
             .contains_key("all_volumes_with_information"));
+    }
+
+    #[test]
+    fn test_update_meta_data_success() {
+        let (state, _temp_dir) = create_test_meta_data_state();
+        let result = update_meta_data_impl(state);
+        assert!(result.is_ok(), "update_meta_data_impl should succeed");
+    }
+
+    #[test]
+    fn test_update_meta_data_poisoned_mutex_returns_err() {
+        let (state, _temp_dir) = create_test_meta_data_state();
+        let state_clone = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state_clone.lock().unwrap();
+            panic!("intentional metadata state poison");
+        })
+        .join();
+
+        let err =
+            update_meta_data_impl(state.clone()).expect_err("Poisoned outer mutex must return Err");
+        assert!(err.contains("InternalError"));
+
+        let json_err =
+            get_meta_data_as_json_impl(state).expect_err("Poisoned outer mutex must return Err");
+        assert!(json_err.contains("InternalError"));
     }
 }

@@ -1,11 +1,433 @@
-use std::io::{Read, Write};
-use ssh2::{Session, Sftp};
-use std::net::TcpStream;
-use std::path::Path;
-use std::fs;
-use crate::models::SFTPDirectory;
 use crate::commands::preview_commands::PreviewPayload;
+use crate::constants::get_app_base_dir;
+use crate::models::SFTPDirectory;
 use base64::Engine;
+use sha2::{Digest, Sha256};
+use ssh2::{FileStat, Session, Sftp};
+use std::collections::HashMap;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const SFTP_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const SFTP_SSH_SESSION_TIMEOUT_MS: u32 = 30_000;
+const MAX_OPEN_FILE_SFTP_BYTES: usize = 10 * 1024 * 1024; // 10 MiB max for text open
+const MAX_PREVIEW_IMAGE_BYTES: usize = 6 * 1024 * 1024; // 6 MiB max for image preview
+const MAX_PREVIEW_PDF_BYTES: usize = 12 * 1024 * 1024; // 12 MiB max for PDF preview
+const MAX_PREVIEW_HEAD_BYTES: usize = 256 * 1024; // 256 KiB head for MIME & text preview
+const MAX_COPY_DIR_DEPTH: usize = 64;
+const SFTP_TEMP_RETENTION_TTL: Duration = Duration::from_secs(60 * 60); // 1 hour
+
+static SFTP_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+static SFTP_CREDENTIALS: OnceLock<RwLock<HashMap<String, ZeroizingString>>> = OnceLock::new();
+static KNOWN_HOSTS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Wrapper around a sensitive string that overwrites its UTF-8 buffer with zeros on drop.
+#[derive(Clone)]
+pub struct ZeroizingString(String);
+
+impl ZeroizingString {
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Drop for ZeroizingString {
+    fn drop(&mut self) {
+        // SAFETY: Writing 0x00 (valid UTF-8 NUL byte) to each byte of the owned String buffer
+        // via volatile writes prevents dead-store elimination before the String deallocates.
+        unsafe {
+            let bytes = self.0.as_bytes_mut();
+            for b in bytes.iter_mut() {
+                std::ptr::write_volatile(b, 0);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+}
+
+fn credential_store() -> &'static RwLock<HashMap<String, ZeroizingString>> {
+    SFTP_CREDENTIALS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn known_hosts_mutex() -> &'static Mutex<()> {
+    KNOWN_HOSTS_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+pub fn format_sftp_connection_key(username: &str, host: &str, port: u16) -> String {
+    format!("{}@{}:{}", username.trim(), host.trim(), port)
+}
+
+#[tauri::command]
+pub fn store_sftp_credentials(connection_key: String, password: String) -> Result<(), String> {
+    let secret = ZeroizingString::new(password);
+    let trimmed_key = connection_key.trim();
+    if trimmed_key.is_empty() {
+        return Err("SFTP connection key cannot be empty".to_string());
+    }
+    if secret.is_empty() {
+        return Err("SFTP password cannot be empty".to_string());
+    }
+    let mut store = credential_store()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    store.insert(trimmed_key.to_string(), secret);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn remove_sftp_credentials(connection_key: String) -> Result<(), String> {
+    let trimmed_key = connection_key.trim();
+    if trimmed_key.is_empty() {
+        return Err("SFTP connection key cannot be empty".to_string());
+    }
+    let mut store = credential_store()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    store.remove(trimmed_key);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn has_sftp_credentials(connection_key: String) -> Result<bool, String> {
+    let trimmed_key = connection_key.trim();
+    if trimmed_key.is_empty() {
+        return Ok(false);
+    }
+    let store = credential_store().read().unwrap_or_else(|e| e.into_inner());
+    Ok(store
+        .get(trimmed_key)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false))
+}
+
+fn resolve_sftp_password(
+    host: &str,
+    port: u16,
+    username: &str,
+    provided_password: String,
+) -> Result<ZeroizingString, String> {
+    let provided = ZeroizingString::new(provided_password);
+    if !provided.is_empty() {
+        return Ok(provided);
+    }
+
+    let store = credential_store().read().unwrap_or_else(|e| e.into_inner());
+    let primary_key = format_sftp_connection_key(username, host, port);
+    if let Some(secret) = store.get(&primary_key) {
+        if !secret.is_empty() {
+            return Ok(secret.clone());
+        }
+    }
+
+    let host_port_key = format!("{}:{}", host.trim(), port);
+    if let Some(secret) = store.get(&host_port_key) {
+        if !secret.is_empty() {
+            return Ok(secret.clone());
+        }
+    }
+
+    Err(format!(
+        "No SFTP password provided and no stored credentials found for {primary_key}"
+    ))
+}
+
+/// Computes the canonical `SHA256:<base64_no_pad>` fingerprint for raw SSH host key bytes.
+pub fn compute_host_key_fingerprint(host_key_bytes: &[u8]) -> String {
+    let digest = Sha256::digest(host_key_bytes);
+    let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest);
+    format!("SHA256:{b64}")
+}
+
+/// Normalizes an SSH SHA-256 fingerprint string into `SHA256:<base64_no_pad>`.
+pub fn normalize_fingerprint(fp: &str) -> String {
+    let trimmed = fp.trim();
+    let raw = if let Some(rest) = trimmed.strip_prefix("SHA256:") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("sha256:") {
+        rest
+    } else {
+        trimmed
+    };
+    let unpadded = raw.trim().trim_end_matches('=');
+    format!("SHA256:{unpadded}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostKeyVerification {
+    Trusted,
+    Untrusted { fingerprint: String },
+    Mismatch { expected: String, actual: String },
+}
+
+fn host_token_matches(token: &str, host: &str, port: u16) -> bool {
+    let host_lower = host.trim().to_lowercase();
+    let bracketed = format!("[{host_lower}]:{port}");
+    let unbracketed = format!("{host_lower}:{port}");
+
+    for part in token.split(',') {
+        let candidate = part.trim().to_lowercase();
+        if candidate == bracketed || candidate == unbracketed {
+            return true;
+        }
+        if port == 22 && candidate == host_lower {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_fingerprint_from_fields(fields: &[&str]) -> Option<String> {
+    if fields.len() < 2 {
+        return None;
+    }
+    // Format 1: `<host_token> SHA256:<b64> [optional_raw_b64]`
+    if fields[1].starts_with("SHA256:") || fields[1].starts_with("sha256:") {
+        return Some(normalize_fingerprint(fields[1]));
+    }
+    // Format 2: `<host_token> <key_type> SHA256:<b64>`
+    if fields.len() >= 3 && (fields[2].starts_with("SHA256:") || fields[2].starts_with("sha256:")) {
+        return Some(normalize_fingerprint(fields[2]));
+    }
+    // Format 3: Standard OpenSSH `known_hosts` line: `<host_token> <key_type> <base64_key>`
+    if fields.len() >= 3 {
+        let key_b64 = fields[2].trim();
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD
+            .decode(key_b64)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(key_b64))
+        {
+            if !decoded.is_empty() {
+                return Some(compute_host_key_fingerprint(&decoded));
+            }
+        }
+    }
+    None
+}
+
+pub fn verify_host_key_against_contents(
+    host: &str,
+    port: u16,
+    live_fingerprint: &str,
+    contents: &[String],
+) -> HostKeyVerification {
+    let normalized_live = normalize_fingerprint(live_fingerprint);
+    let mut matched_fingerprints: Vec<String> = Vec::new();
+
+    for content in contents {
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 2 {
+                continue;
+            }
+            if host_token_matches(fields[0], host, port) {
+                if let Some(fp) = extract_fingerprint_from_fields(&fields) {
+                    if fp == normalized_live {
+                        return HostKeyVerification::Trusted;
+                    }
+                    matched_fingerprints.push(fp);
+                }
+            }
+        }
+    }
+
+    if let Some(first_expected) = matched_fingerprints.into_iter().next() {
+        HostKeyVerification::Mismatch {
+            expected: first_expected,
+            actual: normalized_live,
+        }
+    } else {
+        HostKeyVerification::Untrusted {
+            fingerprint: normalized_live,
+        }
+    }
+}
+
+pub fn get_app_known_hosts_path() -> PathBuf {
+    let config_dir = get_app_base_dir().join("config");
+    let _ = fs::create_dir_all(&config_dir);
+    config_dir.join("sftp_known_hosts")
+}
+
+fn load_known_hosts_contents() -> Vec<String> {
+    let mut contents = Vec::new();
+    let app_known_hosts = get_app_known_hosts_path();
+    if let Ok(text) = fs::read_to_string(&app_known_hosts) {
+        contents.push(text);
+    }
+
+    // Only consult user's ~/.ssh/known_hosts when EXPLR_DATA_DIR is not isolated
+    if std::env::var_os("EXPLR_DATA_DIR").is_none() {
+        if let Some(home) = home::home_dir() {
+            let ssh_known_hosts = home.join(".ssh").join("known_hosts");
+            if let Ok(text) = fs::read_to_string(&ssh_known_hosts) {
+                contents.push(text);
+            }
+        }
+    }
+
+    contents
+}
+
+pub fn persist_trusted_host_key_to_path(
+    known_hosts_path: &Path,
+    host: &str,
+    port: u16,
+    fingerprint: &str,
+) -> Result<(), String> {
+    let host_trimmed = host.trim();
+    if host_trimmed.is_empty() {
+        return Err("Host cannot be empty".to_string());
+    }
+    let normalized_fp = normalize_fingerprint(fingerprint);
+    if normalized_fp == "SHA256:" {
+        return Err("Fingerprint cannot be empty".to_string());
+    }
+
+    let _guard = known_hosts_mutex()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if let Some(parent) = known_hosts_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create known_hosts config directory: {e}"))?;
+    }
+
+    let existing = fs::read_to_string(known_hosts_path).unwrap_or_default();
+    let mut kept_lines: Vec<String> = Vec::new();
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            kept_lines.push(line.to_string());
+            continue;
+        }
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        if !fields.is_empty() && host_token_matches(fields[0], host_trimmed, port) {
+            // Replace previous entry for this host:port
+            continue;
+        }
+        kept_lines.push(line.to_string());
+    }
+
+    kept_lines.push(format!(
+        "[{}]:{} {}",
+        host_trimmed.to_lowercase(),
+        port,
+        normalized_fp
+    ));
+    let mut new_content = kept_lines.join("\n");
+    new_content.push('\n');
+
+    fs::write(known_hosts_path, new_content)
+        .map_err(|e| format!("Failed to write sftp_known_hosts: {e}"))
+}
+
+fn connect_ssh_session(host: &str, port: u16) -> Result<(Session, String), String> {
+    let trimmed_host = host.trim();
+    if trimmed_host.is_empty() {
+        return Err("SFTP host cannot be empty".to_string());
+    }
+    if port == 0 {
+        return Err("SFTP port must be greater than 0".to_string());
+    }
+
+    let addrs: Vec<_> = (trimmed_host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("Failed to resolve SFTP host '{trimmed_host}:{port}': {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!(
+            "Could not resolve any socket address for '{trimmed_host}:{port}'"
+        ));
+    }
+
+    let mut last_err = None;
+    let mut connected_tcp = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, SFTP_TCP_CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                connected_tcp = Some(stream);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    let tcp = connected_tcp.ok_or_else(|| {
+        last_err
+            .map(|e| format!("Failed to connect to '{trimmed_host}:{port}': {e}"))
+            .unwrap_or_else(|| format!("Failed to connect to '{trimmed_host}:{port}'"))
+    })?;
+
+    let io_timeout = Duration::from_millis(SFTP_SSH_SESSION_TIMEOUT_MS as u64);
+    let _ = tcp.set_read_timeout(Some(io_timeout));
+    let _ = tcp.set_write_timeout(Some(io_timeout));
+
+    let mut session = Session::new().map_err(|_| "Could not initialize SSH session".to_string())?;
+    session.set_tcp_stream(tcp);
+    session.set_timeout(SFTP_SSH_SESSION_TIMEOUT_MS);
+    session.handshake().map_err(|e| e.to_string())?;
+
+    let (host_key_bytes, _key_type) = session
+        .host_key()
+        .ok_or_else(|| "HOST_KEY_UNTRUSTED:Server did not present a host key".to_string())?;
+    let fingerprint = compute_host_key_fingerprint(host_key_bytes);
+
+    Ok((session, fingerprint))
+}
+
+fn trust_sftp_host_key_impl(
+    host: String,
+    port: u16,
+    expected_fingerprint: String,
+) -> Result<(), String> {
+    let trimmed_expected = expected_fingerprint.trim();
+    if trimmed_expected.is_empty() {
+        return Err("Expected host key fingerprint cannot be empty".to_string());
+    }
+    let normalized_expected = normalize_fingerprint(trimmed_expected);
+    let (_session, live_fingerprint) = connect_ssh_session(&host, port)?;
+
+    if normalize_fingerprint(&live_fingerprint) != normalized_expected {
+        return Err(format!(
+            "HOST_KEY_MISMATCH:expected {normalized_expected}, got {live_fingerprint}"
+        ));
+    }
+
+    let known_hosts_path = get_app_known_hosts_path();
+    persist_trusted_host_key_to_path(&known_hosts_path, &host, port, &live_fingerprint)
+}
+
+#[tauri::command]
+pub async fn trust_sftp_host_key(
+    host: String,
+    port: u16,
+    expected_fingerprint: String,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || trust_sftp_host_key_impl(host, port, expected_fingerprint))
+        .await
+        .map_err(|e| format!("SFTP task join error: {e}"))?
+}
 
 fn connect_to_sftp_via_password(
     host: String,
@@ -13,32 +435,36 @@ fn connect_to_sftp_via_password(
     username: String,
     password: String,
 ) -> Result<Sftp, String> {
-    // Create the TCP connection string
-    let connection_string = format!("{}:{}", host, port);
-    // Connect to the SSH server
-    let tcp = TcpStream::connect(connection_string).map_err(|e| e.to_string())?;
-    let mut session = Session::new().map_err(|_| "Could not initialize session".to_string())?;
-    session.set_tcp_stream(tcp);
-    session.handshake().map_err(|e| e.to_string())?;
+    let secret_password = resolve_sftp_password(&host, port, &username, password)?;
+    let (session, live_fingerprint) = connect_ssh_session(&host, port)?;
 
-    // Generates a unique SFTP destination path by appending a number if the path already exists on the remote server.
-    // For example: "file.txt" -> "file (1).txt" -> "file (2).txt"
-    // For directories: "folder" -> "folder (1)" -> "folder (2)"
-    // Authenticate
-    session.userauth_password(&username, &password).map_err(|e| e.to_string())?;
-    
-    // Check if authentication was successful
+    // Verify SSH host key BEFORE sending password to prevent MITM credential interception
+    let known_contents = load_known_hosts_contents();
+    match verify_host_key_against_contents(&host, port, &live_fingerprint, &known_contents) {
+        HostKeyVerification::Trusted => {}
+        HostKeyVerification::Untrusted { fingerprint } => {
+            return Err(format!("HOST_KEY_UNTRUSTED:{fingerprint}"));
+        }
+        HostKeyVerification::Mismatch { expected, actual } => {
+            return Err(format!(
+                "HOST_KEY_MISMATCH:Host key for {host}:{port} changed (expected {expected}, got {actual})"
+            ));
+        }
+    }
+
+    session
+        .userauth_password(&username, secret_password.as_str())
+        .map_err(|e| e.to_string())?;
+
     if !session.authenticated() {
         return Err("Authentication failed".to_string());
     }
-    
-    // Open an SFTP session
-    session.sftp().map_err(|e| e.to_string()).map_err(|e| e.to_string())
+
+    session.sftp().map_err(|e| e.to_string())
 }
 
 #[allow(dead_code)]
-#[tauri::command]
-pub fn connect_to_sftp(
+fn connect_to_sftp(
     host: String,
     port: u16,
     username: String,
@@ -47,8 +473,23 @@ pub fn connect_to_sftp(
     connect_to_sftp_via_password(host, port, username, password)
 }
 
-#[tauri::command]
-pub fn load_dir(
+/// Reads at most `max_bytes` from `reader`, returning an error if the stream contains more than `max_bytes`.
+pub fn read_bounded<R: Read>(reader: R, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let limit = (max_bytes as u64).saturating_add(1);
+    reader
+        .take(limit)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    if buf.len() > max_bytes {
+        return Err(format!(
+            "File exceeds maximum allowed read limit of {max_bytes} bytes"
+        ));
+    }
+    Ok(buf)
+}
+
+fn load_dir_impl(
     host: String,
     port: u16,
     username: String,
@@ -56,43 +497,53 @@ pub fn load_dir(
     directory: String,
 ) -> Result<String, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Read the directory entries
-    let entries = sftp.readdir(&directory).map_err(|e| e.to_string())?;
-    
-    // Convert entries to SFTPDirectory format
-    let files: Vec<String> = entries.iter()
-        .filter_map(|(path, stat)| {
-            if stat.is_file() {
-                Some(path.to_str().unwrap_or("").to_string())
-            } else {
-                None
+    let entries = sftp
+        .readdir(Path::new(&directory))
+        .map_err(|e| e.to_string())?;
+
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+
+    for (path, stat) in entries {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name == "." || name == ".." {
+                continue;
             }
-        })
-        .collect();
-    
-    let directories: Vec<String> = entries.iter()
-        .filter_map(|(path, stat)| {
-            if stat.is_dir() {
-                Some(path.to_str().unwrap_or("").to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-    
+        }
+        let Some(raw_str) = path.to_str() else {
+            continue;
+        };
+        let normalized = raw_str.replace('\\', "/");
+        if stat.is_dir() {
+            directories.push(normalized);
+        } else if stat.is_file() {
+            files.push(normalized);
+        }
+    }
+
     let sftp_directory = SFTPDirectory {
         sftp_directory: directory,
         files,
         directories,
     };
-    
-    // Serialize the SFTPDirectory to JSON
+
     serde_json::to_string(&sftp_directory).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn open_file_sftp(
+pub async fn load_dir(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    directory: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || load_dir_impl(host, port, username, password, directory))
+        .await
+        .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn open_file_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -100,19 +551,39 @@ pub fn open_file_sftp(
     file_path: String,
 ) -> Result<String, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Open the file
-    let mut file = sftp.open(&file_path).map_err(|e| e.to_string())?;
-    
-    // Read the file content
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).map_err(|e| e.to_string())?;
-    
-    Ok(contents)
+    let remote_path = Path::new(&file_path);
+
+    if let Ok(stat) = sftp.stat(remote_path) {
+        if let Some(size) = stat.size {
+            if size > MAX_OPEN_FILE_SFTP_BYTES as u64 {
+                return Err(format!(
+                    "Remote file size ({size} bytes) exceeds maximum allowed limit of {MAX_OPEN_FILE_SFTP_BYTES} bytes"
+                ));
+            }
+        }
+    }
+
+    let file = sftp.open(remote_path).map_err(|e| e.to_string())?;
+    let bytes = read_bounded(file, MAX_OPEN_FILE_SFTP_BYTES)?;
+    String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn create_file_sftp(
+pub async fn open_file_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    file_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        open_file_sftp_impl(host, port, username, password, file_path)
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn create_file_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -120,15 +591,26 @@ pub fn create_file_sftp(
     file_path: String,
 ) -> Result<String, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Create the file
     sftp.create(file_path.as_ref()).map_err(|e| e.to_string())?;
-    
-    Ok(format!("File created at: {}", file_path))
+    Ok(format!("File created at: {file_path}"))
 }
 
 #[tauri::command]
-pub fn delete_file_sftp(
+pub async fn create_file_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    file_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        create_file_sftp_impl(host, port, username, password, file_path)
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn delete_file_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -136,15 +618,26 @@ pub fn delete_file_sftp(
     file_path: String,
 ) -> Result<String, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Delete the file
     sftp.unlink(file_path.as_ref()).map_err(|e| e.to_string())?;
-    
-    Ok(format!("File deleted at: {}", file_path))
+    Ok(format!("File deleted at: {file_path}"))
 }
 
 #[tauri::command]
-pub fn rename_file_sftp(
+pub async fn delete_file_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    file_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        delete_file_sftp_impl(host, port, username, password, file_path)
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn rename_file_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -153,15 +646,79 @@ pub fn rename_file_sftp(
     new_path: String,
 ) -> Result<String, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Rename the file
-    sftp.rename(old_path.as_ref(), new_path.as_ref(), None).map_err(|e| e.to_string())?;
-    
-    Ok(format!("File renamed from {} to {}", old_path, new_path))
+    sftp.rename(old_path.as_ref(), new_path.as_ref(), None)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("File renamed from {old_path} to {new_path}"))
 }
 
 #[tauri::command]
-pub fn copy_file_sftp(
+pub async fn rename_file_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    old_path: String,
+    new_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        rename_file_sftp_impl(host, port, username, password, old_path, new_path)
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn copy_file_sftp_impl(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    source_path: String,
+    destination_path: String,
+) -> Result<String, String> {
+    if source_path.trim() == destination_path.trim() {
+        return Err("Source and destination paths cannot be identical".to_string());
+    }
+    let sftp = connect_to_sftp_via_password(host, port, username, password)?;
+
+    let mut source_file = sftp
+        .open(Path::new(&source_path))
+        .map_err(|e| e.to_string())?;
+    let mut destination_file = sftp
+        .create(destination_path.as_ref())
+        .map_err(|e| e.to_string())?;
+
+    std::io::copy(&mut source_file, &mut destination_file).map_err(|e| e.to_string())?;
+    destination_file.flush().map_err(|e| e.to_string())?;
+
+    Ok(format!(
+        "File copied from {source_path} to {destination_path}"
+    ))
+}
+
+#[tauri::command]
+pub async fn copy_file_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    source_path: String,
+    destination_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        copy_file_sftp_impl(
+            host,
+            port,
+            username,
+            password,
+            source_path,
+            destination_path,
+        )
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn move_file_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -170,20 +727,15 @@ pub fn copy_file_sftp(
     destination_path: String,
 ) -> Result<String, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Copy the file
-    let mut source_file = sftp.open(&source_path).map_err(|e| e.to_string())?;
-    let mut destination_file = sftp.create(destination_path.as_ref()).map_err(|e| e.to_string())?;
-    
-    let mut buffer = Vec::new();
-    source_file.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
-    destination_file.write_all(&buffer).map_err(|e| e.to_string())?;
-    
-    Ok(format!("File copied from {} to {}", source_path, destination_path))
+    sftp.rename(source_path.as_ref(), destination_path.as_ref(), None)
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "File moved from {source_path} to {destination_path}"
+    ))
 }
 
 #[tauri::command]
-pub fn move_file_sftp(
+pub async fn move_file_sftp(
     host: String,
     port: u16,
     username: String,
@@ -191,16 +743,21 @@ pub fn move_file_sftp(
     source_path: String,
     destination_path: String,
 ) -> Result<String, String> {
-    let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Move the file
-    sftp.rename(source_path.as_ref(), destination_path.as_ref(), None).map_err(|e| e.to_string())?;
-    
-    Ok(format!("File moved from {} to {}", source_path, destination_path))
+    tokio::task::spawn_blocking(move || {
+        move_file_sftp_impl(
+            host,
+            port,
+            username,
+            password,
+            source_path,
+            destination_path,
+        )
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
 }
 
-#[tauri::command]
-pub fn create_directory_sftp(
+fn create_directory_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -208,15 +765,27 @@ pub fn create_directory_sftp(
     directory_path: String,
 ) -> Result<String, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Create the directory
-    sftp.mkdir(directory_path.as_ref(), 0o755).map_err(|e| e.to_string())?;
-    
-    Ok(format!("Directory created at: {}", directory_path))
+    sftp.mkdir(directory_path.as_ref(), 0o755)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Directory created at: {directory_path}"))
 }
 
 #[tauri::command]
-pub fn delete_directory_sftp(
+pub async fn create_directory_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    directory_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        create_directory_sftp_impl(host, port, username, password, directory_path)
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn delete_directory_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -224,15 +793,27 @@ pub fn delete_directory_sftp(
     directory_path: String,
 ) -> Result<String, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Delete the directory
-    sftp.rmdir(directory_path.as_ref()).map_err(|e| e.to_string())?;
-    
-    Ok(format!("Directory deleted at: {}", directory_path))
+    sftp.rmdir(directory_path.as_ref())
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Directory deleted at: {directory_path}"))
 }
 
 #[tauri::command]
-pub fn rename_directory_sftp(
+pub async fn delete_directory_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    directory_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        delete_directory_sftp_impl(host, port, username, password, directory_path)
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn rename_directory_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -241,15 +822,59 @@ pub fn rename_directory_sftp(
     new_path: String,
 ) -> Result<String, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Rename the directory
-    sftp.rename(old_path.as_ref(), new_path.as_ref(), None).map_err(|e| e.to_string())?;
-    
-    Ok(format!("Directory renamed from {} to {}", old_path, new_path))
+    sftp.rename(old_path.as_ref(), new_path.as_ref(), None)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Directory renamed from {old_path} to {new_path}"))
 }
 
 #[tauri::command]
-pub fn copy_directory_sftp(
+pub async fn rename_directory_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    old_path: String,
+    new_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        rename_directory_sftp_impl(host, port, username, password, old_path, new_path)
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+pub fn is_sftp_symlink(stat: &FileStat) -> bool {
+    stat.perm
+        .map(|perm| (perm & 0o170000) == 0o120000)
+        .unwrap_or(false)
+}
+
+pub fn validate_copy_directory_targets(
+    source_path: &str,
+    destination_path: &str,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_COPY_DIR_DEPTH {
+        return Err(format!(
+            "Maximum directory copy recursion depth ({MAX_COPY_DIR_DEPTH}) exceeded"
+        ));
+    }
+    let src_norm = source_path.trim().trim_end_matches(['/', '\\']);
+    let dst_norm = destination_path.trim().trim_end_matches(['/', '\\']);
+    if src_norm.is_empty() || dst_norm.is_empty() {
+        return Err("Source and destination directory paths cannot be empty".to_string());
+    }
+    if src_norm == dst_norm {
+        return Err("Cannot copy a directory into itself".to_string());
+    }
+    let src_prefix = format!("{src_norm}/");
+    if dst_norm.starts_with(&src_prefix) {
+        return Err("Cannot copy a directory into one of its own subdirectories".to_string());
+    }
+    Ok(())
+}
+
+fn copy_directory_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -257,40 +882,99 @@ pub fn copy_directory_sftp(
     source_path: String,
     destination_path: String,
 ) -> Result<String, String> {
-    let sftp = connect_to_sftp_via_password(host.clone(), port, username.clone(), password.clone())?;
-    
-    // Create the destination directory
-    sftp.mkdir(destination_path.as_ref(), 0o755).map_err(|e| e.to_string())?;
-    
-    // Read the source directory entries
-    let entries = sftp.readdir(&source_path).map_err(|e| e.to_string())?;
-    
-    for (path, stat) in entries {
-        let file_name = path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("[invalid_filename]");
-        let new_path = format!("{}/{}", destination_path, file_name);
-        
-        if stat.is_file() {
-            // Copy file
-            let mut source_file = sftp.open(&path).map_err(|e| e.to_string())?;
-            let mut destination_file = sftp.create(new_path.as_ref()).map_err(|e| e.to_string())?;
-            
-            let mut buffer = Vec::new();
-            source_file.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
-            destination_file.write_all(&buffer).map_err(|e| e.to_string())?;
-        } else if stat.is_dir() {
-            // Recursively copy directory
-            let path_str = path.to_str().unwrap_or("[invalid_path]").to_string();
-            copy_directory_sftp(host.clone(), port, username.clone(), password.clone(), path_str, new_path)?;
+    validate_copy_directory_targets(&source_path, &destination_path, 0)?;
+
+    // Reuse a SINGLE SFTP session across the entire iterative traversal
+    let sftp = connect_to_sftp_via_password(host, port, username, password)?;
+    let mut stack: Vec<(String, String, usize)> =
+        vec![(source_path.clone(), destination_path.clone(), 0)];
+
+    while let Some((curr_src, curr_dst, depth)) = stack.pop() {
+        validate_copy_directory_targets(&curr_src, &curr_dst, depth)?;
+
+        // Verify source exists before creating destination directory
+        let entries = sftp
+            .readdir(Path::new(&curr_src))
+            .map_err(|e| e.to_string())?;
+
+        sftp.mkdir(Path::new(&curr_dst), 0o755)
+            .map_err(|e| e.to_string())?;
+
+        for (entry_path, stat) in entries {
+            let file_name_os = entry_path.file_name().ok_or_else(|| {
+                format!("Invalid SFTP directory entry without filename: {entry_path:?}")
+            })?;
+            let file_name = file_name_os.to_str().ok_or_else(|| {
+                format!("Non-UTF-8 filename encountered in SFTP directory: {entry_path:?}")
+            })?;
+            if file_name == "." || file_name == ".." {
+                continue;
+            }
+            let entry_path_str = entry_path.to_str().ok_or_else(|| {
+                format!("Non-UTF-8 path encountered in SFTP directory: {entry_path:?}")
+            })?;
+
+            // Check lstat to avoid following symlinks or symlink loops
+            if is_sftp_symlink(&stat) {
+                continue;
+            }
+            if let Ok(lstat) = sftp.lstat(&entry_path) {
+                if is_sftp_symlink(&lstat) {
+                    continue;
+                }
+            }
+
+            let new_dst = format!("{}/{}", curr_dst.trim_end_matches('/'), file_name);
+
+            if stat.is_dir() {
+                let next_depth = depth + 1;
+                if next_depth > MAX_COPY_DIR_DEPTH {
+                    return Err(format!(
+                        "Maximum directory copy recursion depth ({MAX_COPY_DIR_DEPTH}) exceeded at {entry_path_str}"
+                    ));
+                }
+                stack.push((entry_path_str.to_string(), new_dst, next_depth));
+            } else if stat.is_file() {
+                let mut source_file = sftp.open(&entry_path).map_err(|e| e.to_string())?;
+                let mut destination_file = sftp
+                    .create(Path::new(&new_dst))
+                    .map_err(|e| e.to_string())?;
+                std::io::copy(&mut source_file, &mut destination_file)
+                    .map_err(|e| e.to_string())?;
+                destination_file.flush().map_err(|e| e.to_string())?;
+            }
         }
     }
-    
-    Ok(format!("Directory copied from {} to {}", source_path, destination_path))
+
+    Ok(format!(
+        "Directory copied from {source_path} to {destination_path}"
+    ))
 }
 
 #[tauri::command]
-pub fn move_directory_sftp(
+pub async fn copy_directory_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    source_path: String,
+    destination_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        copy_directory_sftp_impl(
+            host,
+            port,
+            username,
+            password,
+            source_path,
+            destination_path,
+        )
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn move_directory_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -299,30 +983,162 @@ pub fn move_directory_sftp(
     destination_path: String,
 ) -> Result<String, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Move the directory
-    sftp.rename(source_path.as_ref(), destination_path.as_ref(), None).map_err(|e| e.to_string())?;
-    
-    Ok(format!("Directory moved from {} to {}", source_path, destination_path))
+    sftp.rename(source_path.as_ref(), destination_path.as_ref(), None)
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Directory moved from {source_path} to {destination_path}"
+    ))
 }
 
-fn filename_from_path(path: &str) -> String {
-    if let Some(name) = path.split('/').last() {
-        if !name.is_empty() {
-            return name.to_string();
+#[tauri::command]
+pub async fn move_directory_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    source_path: String,
+    destination_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        move_directory_sftp_impl(
+            host,
+            port,
+            username,
+            password,
+            source_path,
+            destination_path,
+        )
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn has_drive_prefix(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim();
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Strictly validates and sanitizes a remote SFTP path to extract a safe single-component local filename.
+pub fn sanitize_sftp_filename(path: &str) -> Result<String, String> {
+    if path.is_empty() {
+        return Err("SFTP path cannot be empty".to_string());
+    }
+    if path.chars().any(|c| c == '\0' || c.is_control()) {
+        return Err("SFTP path contains forbidden NUL or control characters".to_string());
+    }
+
+    let mut non_empty_segments = Vec::new();
+    for seg in path.split(['/', '\\']) {
+        if seg.is_empty() {
+            continue;
+        }
+        if seg == "." || seg == ".." {
+            return Err(format!(
+                "Path traversal segment '{seg}' is not allowed in SFTP file path"
+            ));
+        }
+        if has_drive_prefix(seg) {
+            return Err(format!(
+                "Drive prefix '{seg}' is not allowed in SFTP file path"
+            ));
+        }
+        non_empty_segments.push(seg);
+    }
+
+    let raw_name = non_empty_segments
+        .last()
+        .copied()
+        .ok_or_else(|| "SFTP path does not contain a valid filename".to_string())?;
+
+    // Replace shell metacharacters and filesystem-unsafe symbols with '_'
+    let sanitized: String = raw_name
+        .chars()
+        .map(|c| match c {
+            '&' | '|' | '^' | '%' | '$' | ';' | '<' | '>' | '"' | '\'' | '`' | '*' | '?' | ':'
+            | '/' | '\\' => '_',
+            _ => c,
+        })
+        .collect();
+
+    let trimmed = sanitized.trim().trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return Err("Sanitized SFTP filename is empty or invalid".to_string());
+    }
+    if is_windows_reserved_device_name(trimmed) {
+        return Err(format!("Filename '{trimmed}' is a reserved OS device name"));
+    }
+
+    let safe = trimmed.to_string();
+    let mut comps = Path::new(&safe).components();
+    let is_single_normal =
+        matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none();
+    if !is_single_normal {
+        return Err(format!(
+            "Sanitized SFTP filename '{safe}' is not a single normal path component"
+        ));
+    }
+
+    Ok(safe)
+}
+
+fn filename_from_path(path: &str) -> Result<String, String> {
+    sanitize_sftp_filename(path)
+}
+
+/// Checks whether a filename has a dangerous auto-executable extension.
+pub fn is_dangerous_executable_extension(filename: &str) -> bool {
+    const DANGEROUS_EXTENSIONS: &[&str] = &[
+        "exe", "bat", "cmd", "ps1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "scr", "hta",
+        "com", "lnk", "sh", "pif", "reg", "jar", "cpl", "msc",
+    ];
+    let cleaned = filename.trim().trim_end_matches(['.', ' ']);
+    if let Some(ext) = cleaned.rsplit('.').next() {
+        if ext.len() != cleaned.len() {
+            let lower = ext.to_ascii_lowercase();
+            return DANGEROUS_EXTENSIONS.contains(&lower.as_str());
         }
     }
-    "file".to_string()
+    false
 }
 
 fn detect_mime_sftp(path: &str, head: &[u8]) -> Option<&'static str> {
     if let Some(kind) = infer::get(head) {
         return Some(kind.mime_type());
     }
-    
-    if let Some(ext) = path.split('.').last().map(|s| s.to_lowercase()) {
+
+    if let Some(ext) = path.rsplit('.').next().map(|s| s.to_lowercase()) {
         return Some(match ext.as_str() {
-            "md" | "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "txt" | "log" | "toml" | "yaml" | "yml" | "xml" | "ini" | "csv" => "text/plain",
+            "md" | "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "txt" | "log" | "toml"
+            | "yaml" | "yml" | "xml" | "ini" | "csv" => "text/plain",
             "pdf" => "application/pdf",
             "png" => "image/png",
             "jpg" | "jpeg" => "image/jpeg",
@@ -339,27 +1155,15 @@ fn detect_mime_sftp(path: &str, head: &[u8]) -> Option<&'static str> {
 }
 
 fn read_sftp_prefix(sftp: &Sftp, path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
-    let mut file = sftp.open(Path::new(path)).map_err(|e| e.to_string())?;
+    let file = sftp.open(Path::new(path)).map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(max_bytes.min(1024 * 1024));
-    let mut temp_buf = vec![0u8; max_bytes.min(8192)];
-    let mut total_read = 0;
-    
-    while total_read < max_bytes {
-        let chunk_size = std::cmp::min(temp_buf.len(), max_bytes - total_read);
-        match file.read(&mut temp_buf[..chunk_size]) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                buf.extend_from_slice(&temp_buf[..n]);
-                total_read += n;
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    }
+    file.take(max_bytes as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
     Ok(buf)
 }
 
-#[tauri::command]
-pub fn build_preview_sftp(
+fn build_preview_sftp_impl(
     host: String,
     port: u16,
     username: String,
@@ -367,26 +1171,30 @@ pub fn build_preview_sftp(
     file_path: String,
 ) -> Result<PreviewPayload, String> {
     let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    let name = filename_from_path(&file_path);
-    
-    // Get file stats to check if it's a directory or file
-    let stat = sftp.stat(Path::new(&file_path)).map_err(|e| e.to_string())?;
-    
-    // Handle directories
+    let name = filename_from_path(&file_path).unwrap_or_else(|_| "file".to_string());
+
+    let stat = sftp
+        .stat(Path::new(&file_path))
+        .map_err(|e| e.to_string())?;
+
     if stat.is_dir() {
-        // Count items (files + dirs, not recursive)
         let mut item_count = 0;
         let mut size: u64 = 0;
         let mut latest_modified: Option<u64> = None;
-        
+
         if let Ok(entries) = sftp.readdir(Path::new(&file_path)) {
-            for (_, entry_stat) in entries {
+            for (entry_path, entry_stat) in entries {
+                if let Some(entry_name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                    if entry_name == "." || entry_name == ".." {
+                        continue;
+                    }
+                }
                 item_count += 1;
                 if let Some(entry_size) = entry_stat.size {
-                    size += entry_size;
+                    size = size.saturating_add(entry_size);
                 }
                 if let Some(mtime) = entry_stat.mtime {
-                    let mtime_u64 = mtime as u64;
+                    let mtime_u64 = mtime;
                     latest_modified = match latest_modified {
                         Some(current) if current > mtime_u64 => Some(current),
                         _ => Some(mtime_u64),
@@ -394,8 +1202,7 @@ pub fn build_preview_sftp(
                 }
             }
         }
-        
-        // Use folder's own modified time if no children
+
         let folder_modified = stat.mtime;
         let modified_time = latest_modified.or(folder_modified);
         let modified_str = modified_time.map(|t| {
@@ -403,7 +1210,7 @@ pub fn build_preview_sftp(
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_else(|| "unknown".to_string())
         });
-        
+
         return Ok(PreviewPayload::Folder {
             name,
             size,
@@ -411,63 +1218,84 @@ pub fn build_preview_sftp(
             modified: modified_str,
         });
     }
-    
-    // Files
-    let bytes = stat.size.unwrap_or(0) as usize;
-    // Read a small head for detection + maybe text
-    let head = read_sftp_prefix(&sftp, &file_path, 256 * 1024).map_err(|e| e.to_string())?;
+
+    let head = read_sftp_prefix(&sftp, &file_path, MAX_PREVIEW_HEAD_BYTES)?;
     let mime = detect_mime_sftp(&file_path, &head).unwrap_or("application/octet-stream");
-    
-    // Branch by mime top-level type - exactly like original
+
     if mime.starts_with("image/") {
-        // Encode entire file only if small; else just the head (fast path)
-        let cap = 6 * 1024 * 1024;
-        let data = if bytes <= cap {
-            let mut full_file = sftp.open(Path::new(&file_path)).map_err(|e| e.to_string())?;
-            let mut full_data = Vec::new();
-            full_file.read_to_end(&mut full_data).map_err(|e| e.to_string())?;
-            full_data
-        } else {
-            head.clone()
+        if stat
+            .size
+            .map(|sz| sz > MAX_PREVIEW_IMAGE_BYTES as u64)
+            .unwrap_or(false)
+        {
+            return Ok(PreviewPayload::Unknown { name });
+        }
+        let full_file = sftp
+            .open(Path::new(&file_path))
+            .map_err(|e| e.to_string())?;
+        let Ok(data) = read_bounded(full_file, MAX_PREVIEW_IMAGE_BYTES) else {
+            return Ok(PreviewPayload::Unknown { name });
         };
-        let data_uri = format!("data:{};base64,{}", mime, base64::engine::general_purpose::STANDARD.encode(data));
-        return Ok(PreviewPayload::Image { name, data_uri, bytes });
+        let bytes = data.len();
+        let data_uri = format!(
+            "data:{};base64,{}",
+            mime,
+            base64::engine::general_purpose::STANDARD.encode(data)
+        );
+        return Ok(PreviewPayload::Image {
+            name,
+            data_uri,
+            bytes,
+        });
     }
-    
+
     if mime == "application/pdf" {
-        // Encode entire file only if small; else just the head (fast path)
-        let cap = 12 * 1024 * 1024; // Allow larger PDFs than images
-        let data = if bytes <= cap {
-            let mut full_file = sftp.open(Path::new(&file_path)).map_err(|e| e.to_string())?;
-            let mut full_data = Vec::new();
-            full_file.read_to_end(&mut full_data).map_err(|e| e.to_string())?;
-            full_data
-        } else {
-            head.clone()
+        if stat
+            .size
+            .map(|sz| sz > MAX_PREVIEW_PDF_BYTES as u64)
+            .unwrap_or(false)
+        {
+            return Ok(PreviewPayload::Unknown { name });
+        }
+        let full_file = sftp
+            .open(Path::new(&file_path))
+            .map_err(|e| e.to_string())?;
+        let Ok(data) = read_bounded(full_file, MAX_PREVIEW_PDF_BYTES) else {
+            return Ok(PreviewPayload::Unknown { name });
         };
-        let data_uri = format!("data:{};base64,{}", mime, base64::engine::general_purpose::STANDARD.encode(data));
-        return Ok(PreviewPayload::Pdf { name, data_uri, bytes });
+        let bytes = data.len();
+        let data_uri = format!(
+            "data:{};base64,{}",
+            mime,
+            base64::engine::general_purpose::STANDARD.encode(data)
+        );
+        return Ok(PreviewPayload::Pdf {
+            name,
+            data_uri,
+            bytes,
+        });
     }
 
-    if mime.starts_with("video/") {
-        // For SFTP videos, treat as unknown since we can't stream remote files
+    if mime.starts_with("video/") || mime.starts_with("audio/") {
         return Ok(PreviewPayload::Unknown { name });
     }
 
-    if mime.starts_with("audio/") {
-        // For SFTP audio, treat as unknown since we can't stream remote files
-        return Ok(PreviewPayload::Unknown { name });
-    }
-
-    // Heuristic: treat smallish or text‑ish files as text
-    let looks_texty = mime.starts_with("text/") || head.iter().all(|&b| b == 9 || b == 10 || b == 13 || (b >= 32 && b < 0xF5));
-    if looks_texty || bytes <= 2 * 1024 * 1024 {
+    let looks_texty = mime.starts_with("text/")
+        || (!head.is_empty()
+            && !head.contains(&0)
+            && head
+                .iter()
+                .all(|&b| b == 9 || b == 10 || b == 13 || (32..0xF5).contains(&b)));
+    if looks_texty {
         let mut det = chardetng::EncodingDetector::new();
         det.feed(&head, true);
         let enc = det.guess(None, true);
         let (cow, _, _) = enc.decode(&head);
         let mut text = cow.to_string();
-        let mut truncated = false;
+        let mut truncated = stat
+            .size
+            .map(|sz| sz > head.len() as u64)
+            .unwrap_or(head.len() >= MAX_PREVIEW_HEAD_BYTES);
         if text.len() > 200_000 {
             let mut cut = 200_000;
             while cut > 0 && !text.is_char_boundary(cut) {
@@ -477,14 +1305,76 @@ pub fn build_preview_sftp(
             text.push_str("\n…(truncated)");
             truncated = true;
         }
-        return Ok(PreviewPayload::Text { name, text, truncated });
+        return Ok(PreviewPayload::Text {
+            name,
+            text,
+            truncated,
+        });
     }
 
     Ok(PreviewPayload::Unknown { name })
 }
 
 #[tauri::command]
-pub fn download_and_open_sftp_file(
+pub async fn build_preview_sftp(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    file_path: String,
+) -> Result<PreviewPayload, String> {
+    tokio::task::spawn_blocking(move || {
+        build_preview_sftp_impl(host, port, username, password, file_path)
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+/// Allocates a unique isolated subdirectory and safe target path inside `base_temp_root`.
+pub fn create_unique_sftp_temp_file_path(
+    base_temp_root: &Path,
+    remote_file_path: &str,
+) -> Result<PathBuf, String> {
+    let safe_filename = filename_from_path(remote_file_path)?;
+
+    fs::create_dir_all(base_temp_root)
+        .map_err(|e| format!("Failed to create SFTP temp directory: {e}"))?;
+    let canon_root = fs::canonicalize(base_temp_root)
+        .map_err(|e| format!("Failed to canonicalize SFTP temp directory: {e}"))?;
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SFTP_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let unique_subdir_name = format!("sftp_{pid}_{ts}_{seq}");
+    let unique_subdir = canon_root.join(unique_subdir_name);
+
+    fs::create_dir_all(&unique_subdir)
+        .map_err(|e| format!("Failed to create unique temp subdirectory: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&unique_subdir, fs::Permissions::from_mode(0o700));
+    }
+
+    let canon_subdir = fs::canonicalize(&unique_subdir)
+        .map_err(|e| format!("Failed to canonicalize unique temp subdirectory: {e}"))?;
+    if !canon_subdir.starts_with(&canon_root) {
+        return Err("Unique SFTP temp subdirectory escaped temp root".to_string());
+    }
+
+    let temp_file_path = canon_subdir.join(&safe_filename);
+    if temp_file_path.parent() != Some(canon_subdir.as_path()) {
+        return Err("Target SFTP temp file path escaped unique temp subdirectory".to_string());
+    }
+
+    Ok(temp_file_path)
+}
+
+fn download_and_open_sftp_file_impl(
     host: String,
     port: u16,
     username: String,
@@ -492,104 +1382,375 @@ pub fn download_and_open_sftp_file(
     file_path: String,
     open_file: Option<bool>,
 ) -> Result<String, String> {
-    let sftp = connect_to_sftp_via_password(host, port, username, password)?;
-    
-    // Get the filename from the path
-    let filename = filename_from_path(&file_path);
-    
-    // Create a temporary directory if it doesn't exist
-    let temp_dir = std::env::temp_dir().join("file_explorer_sftp");
-    if !temp_dir.exists() {
-        fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp directory: {}", e))?;
-    }
-    
-    // Create a unique temporary file path
-    let temp_file_path = temp_dir.join(&filename);
-    
-    // Download the file from SFTP
-    let mut remote_file = sftp.open(Path::new(&file_path)).map_err(|e| e.to_string())?;
-    let mut local_file = fs::File::create(&temp_file_path).map_err(|e| e.to_string())?;
-    
-    // Copy the file content
-    std::io::copy(&mut remote_file, &mut local_file).map_err(|e| e.to_string())?;
-    
-    // Only open the file if explicitly requested (default is true for backward compatibility)
+    let safe_filename = filename_from_path(&file_path)?;
     let should_open = open_file.unwrap_or(true);
-    
-    if should_open {
-        // Open the file with the default application
-        #[cfg(target_os = "windows")]
-        {
-            std::process::Command::new("cmd")
-                .args(&["/C", "start", "", &temp_file_path.to_string_lossy()])
-                .spawn()
-                .map_err(|e| format!("Failed to open file: {}", e))?;
-        }
-        
-        #[cfg(target_os = "macos")]
-        {
-            std::process::Command::new("open")
-                .arg(&temp_file_path)
-                .spawn()
-                .map_err(|e| format!("Failed to open file: {}", e))?;
-        }
-        
-        #[cfg(target_os = "linux")]
-        {
-            std::process::Command::new("xdg-open")
-                .arg(&temp_file_path)
-                .spawn()
-                .map_err(|e| format!("Failed to open file: {}", e))?;
-        }
-        
-        Ok(format!("File downloaded to {} and opened", temp_file_path.to_string_lossy()))
-    } else {
-        // Return the temporary file path without opening
-        Ok(temp_file_path.to_string_lossy().to_string())
+
+    if should_open && is_dangerous_executable_extension(&safe_filename) {
+        return Err(format!(
+            "Refusing to auto-open potentially dangerous executable file type: '{safe_filename}'"
+        ));
     }
+
+    let sftp = connect_to_sftp_via_password(host, port, username, password)?;
+    let temp_root = std::env::temp_dir().join("file_explorer_sftp");
+    let temp_file_path = create_unique_sftp_temp_file_path(&temp_root, &file_path)?;
+    let canon_root = fs::canonicalize(&temp_root)
+        .map_err(|e| format!("Failed to canonicalize SFTP temp root: {e}"))?;
+
+    {
+        let mut remote_file = sftp
+            .open(Path::new(&file_path))
+            .map_err(|e| e.to_string())?;
+        let mut local_file = fs::File::create(&temp_file_path).map_err(|e| e.to_string())?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = local_file.set_permissions(fs::Permissions::from_mode(0o600));
+        }
+
+        std::io::copy(&mut remote_file, &mut local_file).map_err(|e| e.to_string())?;
+        local_file.flush().map_err(|e| e.to_string())?;
+    }
+
+    let canon_file = fs::canonicalize(&temp_file_path)
+        .map_err(|e| format!("Failed to canonicalize downloaded SFTP temp file: {e}"))?;
+    if !canon_file.starts_with(&canon_root) {
+        let _ = fs::remove_file(&temp_file_path);
+        return Err("Downloaded SFTP file escaped temporary directory root".to_string());
+    }
+
+    if should_open {
+        open::that(&canon_file).map_err(|e| format!("Failed to open file: {e}"))?;
+        Ok(format!(
+            "File downloaded to {} and opened",
+            canon_file.to_string_lossy()
+        ))
+    } else {
+        Ok(canon_file.to_string_lossy().to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn download_and_open_sftp_file(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    file_path: String,
+    open_file: Option<bool>,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        download_and_open_sftp_file_impl(host, port, username, password, file_path, open_file)
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
+}
+
+fn entry_is_older_than(path: &Path, max_age: Duration) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.is_dir() {
+        // Check if any child inside the directory is newer than max_age
+        if let Ok(children) = fs::read_dir(path) {
+            let mut has_child = false;
+            for child in children.flatten() {
+                has_child = true;
+                if !entry_is_older_than(&child.path(), max_age) {
+                    return false;
+                }
+            }
+            if has_child {
+                return true;
+            }
+        }
+    }
+    meta.modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|elapsed| elapsed >= max_age)
+        .unwrap_or(false)
+}
+
+pub fn cleanup_sftp_temp_files_in(temp_dir: &Path, max_age: Duration) -> Result<usize, String> {
+    if !temp_dir.exists() {
+        return Ok(0);
+    }
+
+    let entries =
+        fs::read_dir(temp_dir).map_err(|e| format!("Failed to read temp directory: {e}"))?;
+    let mut cleaned_count = 0usize;
+
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if !entry_is_older_than(&entry_path, max_age) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let removed = if file_type.is_dir() && !file_type.is_symlink() {
+            fs::remove_dir_all(&entry_path).is_ok()
+        } else {
+            fs::remove_file(&entry_path).is_ok()
+        };
+        if removed {
+            cleaned_count += 1;
+        }
+    }
+
+    Ok(cleaned_count)
 }
 
 #[tauri::command]
 pub fn cleanup_sftp_temp_files() -> Result<String, String> {
     let temp_dir = std::env::temp_dir().join("file_explorer_sftp");
-    
     if !temp_dir.exists() {
         return Ok("No temporary directory to clean".to_string());
     }
-    
-    let mut cleaned_count = 0;
-    
-    match fs::read_dir(&temp_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    if let Ok(metadata) = entry.metadata() {
-                        if let Ok(modified) = metadata.modified() {
-                            // Delete files older than 24 hours
-                            if let Ok(elapsed) = modified.elapsed() {
-                                if elapsed.as_secs() > 24 * 60 * 60 {
-                                    if fs::remove_file(entry.path()).is_ok() {
-                                        cleaned_count += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+    let cleaned_count = cleanup_sftp_temp_files_in(&temp_dir, SFTP_TEMP_RETENTION_TTL)?;
+    Ok(format!("Cleaned {cleaned_count} old temporary files"))
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use std::io::Cursor;
+    use tempfile::TempDir;
+
+    // TP-SFTP-01: SSH host key fingerprint calculation, known_hosts verification, untrusted & mismatch rejection
+    #[test]
+    fn test_tp_sftp_01_host_key_fingerprint_and_verification() {
+        let key_a = b"ssh-ed25519-public-key-bytes-server-a";
+        let key_b = b"ssh-ed25519-public-key-bytes-server-b";
+
+        let fp_a = compute_host_key_fingerprint(key_a);
+        let fp_b = compute_host_key_fingerprint(key_b);
+        assert!(fp_a.starts_with("SHA256:"));
+        assert_ne!(fp_a, fp_b);
+        assert_eq!(normalize_fingerprint(&format!("{fp_a}===")), fp_a);
+
+        // 1. Empty known_hosts -> Untrusted
+        let res_untrusted = verify_host_key_against_contents("example.com", 2222, &fp_a, &[]);
+        assert_eq!(
+            res_untrusted,
+            HostKeyVerification::Untrusted {
+                fingerprint: fp_a.clone()
             }
-        }
-        Err(e) => return Err(format!("Failed to read temp directory: {}", e)),
+        );
+
+        // 2. Persist trusted host key in isolated TempDir -> Trusted
+        let tmp = TempDir::new().expect("create temp dir");
+        let kh_path = tmp.path().join("sftp_known_hosts");
+        persist_trusted_host_key_to_path(&kh_path, "Example.COM", 2222, &fp_a)
+            .expect("persist trusted host key");
+
+        let stored = fs::read_to_string(&kh_path).expect("read known_hosts");
+        let res_trusted =
+            verify_host_key_against_contents("example.com", 2222, &fp_a, &[stored.clone()]);
+        assert_eq!(res_trusted, HostKeyVerification::Trusted);
+
+        // 3. Different key on same host:port -> Mismatch
+        let res_mismatch =
+            verify_host_key_against_contents("example.com", 2222, &fp_b, &[stored.clone()]);
+        assert_eq!(
+            res_mismatch,
+            HostKeyVerification::Mismatch {
+                expected: fp_a.clone(),
+                actual: fp_b.clone()
+            }
+        );
+
+        // 4. OpenSSH standard base64 known_hosts format support
+        let b64_key_a = base64::engine::general_purpose::STANDARD.encode(key_a);
+        let openssh_line =
+            format!("[sftp.internal]:2222,sftp.internal:2222 ssh-ed25519 {b64_key_a}\n");
+        let res_openssh =
+            verify_host_key_against_contents("sftp.internal", 2222, &fp_a, &[openssh_line]);
+        assert_eq!(res_openssh, HostKeyVerification::Trusted);
     }
-    
-    Ok(format!("Cleaned {} old temporary files", cleaned_count))
+
+    // TP-SFTP-02: Local path traversal rejection, shell metacharacter neutralization, and executable auto-open blocking
+    #[test]
+    fn test_tp_sftp_02_filename_sanitization_and_executable_blocking() {
+        // Traversal and drive-prefix payloads must be rejected
+        let traversal_payloads = [
+            "sub/..\\..\\outside.txt",
+            "../outside.txt",
+            "a/b/../../secret.ini",
+            "..",
+            ".",
+            "folder/..",
+            "folder/.",
+            "C:\\temp\\x.txt",
+            "D:evil.txt",
+            "foo/bar\0evil.txt",
+            "foo/bar\nevil.txt",
+            "CON.txt",
+            "   ",
+            "/",
+            "\\",
+        ];
+        for payload in traversal_payloads {
+            assert!(
+                sanitize_sftp_filename(payload).is_err(),
+                "Expected traversal/unsafe path '{payload}' to be rejected"
+            );
+        }
+
+        // Shell metacharacter payloads must have metacharacters stripped and remain a single normal component
+        let meta1 = sanitize_sftp_filename("foo/report&calc.txt").expect("sanitize &");
+        assert_eq!(meta1, "report_calc.txt");
+        assert!(!meta1.contains('&'));
+
+        let meta2 = sanitize_sftp_filename("foo/a\"&echo.txt").expect("sanitize quote and &");
+        assert_eq!(meta2, "a__echo.txt");
+        assert!(!meta2.contains('"') && !meta2.contains('&'));
+
+        let meta3 = sanitize_sftp_filename("/remote/dir/notes|calc;whoami`id`.md")
+            .expect("sanitize pipe/semicolon/backtick");
+        assert!(!meta3.contains(['|', ';', '`']));
+        assert_eq!(Path::new(&meta3).components().count(), 1);
+
+        // Dangerous executable extensions must be flagged
+        for dangerous in [
+            "payload.exe",
+            "script.BAT",
+            "run.cmd",
+            "hook.ps1",
+            "macro.vbs",
+            "shortcut.lnk",
+            "setup.msi",
+            "dropper.hta",
+            "shell.sh",
+            "trick.exe...",
+        ] {
+            assert!(
+                is_dangerous_executable_extension(dangerous),
+                "Expected '{dangerous}' to be flagged as dangerous executable"
+            );
+        }
+
+        for safe in [
+            "report.txt",
+            "photo.png",
+            "archive.zip",
+            "document.pdf",
+            "README",
+        ] {
+            assert!(
+                !is_dangerous_executable_extension(safe),
+                "Expected '{safe}' not to be flagged as dangerous executable"
+            );
+        }
+    }
+
+    // TP-SFTP-03: Bounded read helper prevents OOM when remote file or stream exceeds limit
+    #[test]
+    fn test_tp_sftp_03_read_bounded_enforces_cap() {
+        let data = vec![b'A'; 1024];
+        let ok_res = read_bounded(Cursor::new(&data), 1024).expect("within limit should succeed");
+        assert_eq!(ok_res.len(), 1024);
+
+        let over_res = read_bounded(Cursor::new(&data), 1023);
+        assert!(
+            over_res.is_err(),
+            "Stream exceeding max_bytes by 1 byte must be rejected"
+        );
+    }
+
+    // TP-SFTP-04: Directory copy recursion depth, self-copy prevention, and symlink detection
+    #[test]
+    fn test_tp_sftp_04_copy_directory_validation_and_symlink_detection() {
+        assert!(validate_copy_directory_targets("/data/src", "/data/dst", 0).is_ok());
+        assert!(validate_copy_directory_targets("/data/src", "/data/src", 0).is_err());
+        assert!(validate_copy_directory_targets("/data/src/", "/data/src/sub", 0).is_err());
+        assert!(
+            validate_copy_directory_targets("/data/src", "/data/dst", MAX_COPY_DIR_DEPTH + 1)
+                .is_err()
+        );
+
+        let symlink_stat = FileStat {
+            size: Some(10),
+            uid: None,
+            gid: None,
+            perm: Some(0o120777),
+            atime: None,
+            mtime: None,
+        };
+        let regular_stat = FileStat {
+            size: Some(10),
+            uid: None,
+            gid: None,
+            perm: Some(0o100644),
+            atime: None,
+            mtime: None,
+        };
+        assert!(is_sftp_symlink(&symlink_stat));
+        assert!(!is_sftp_symlink(&regular_stat));
+    }
+
+    // TP-SFTP-05 & BUG-057: Unique temp download directories, recursive cleanup, and credential zeroization
+    #[test]
+    fn test_tp_sftp_05_unique_temp_dirs_recursive_cleanup_and_credentials() {
+        let temp_root = TempDir::new().expect("create temp root");
+
+        let path_a = create_unique_sftp_temp_file_path(temp_root.path(), "/a/report.txt")
+            .expect("create unique path A");
+        let path_b = create_unique_sftp_temp_file_path(temp_root.path(), "/b/report.txt")
+            .expect("create unique path B");
+
+        assert_ne!(
+            path_a, path_b,
+            "Same-named files from different paths must not collide"
+        );
+        assert_ne!(path_a.parent(), path_b.parent());
+
+        fs::write(&path_a, b"content A").expect("write A");
+        fs::write(&path_b, b"content B").expect("write B");
+        assert_eq!(fs::read(&path_a).expect("read A"), b"content A");
+        assert_eq!(fs::read(&path_b).expect("read B"), b"content B");
+
+        // Cleanup with 1-hour threshold should keep freshly created directories
+        let cleaned_fresh = cleanup_sftp_temp_files_in(temp_root.path(), Duration::from_secs(3600))
+            .expect("cleanup fresh");
+        assert_eq!(cleaned_fresh, 0);
+        assert!(path_a.exists() && path_b.exists());
+
+        // Cleanup with Duration::ZERO removes nested subdirectories and files
+        let cleaned_all =
+            cleanup_sftp_temp_files_in(temp_root.path(), Duration::ZERO).expect("cleanup expired");
+        assert_eq!(cleaned_all, 2);
+        assert!(!path_a.exists() && !path_b.exists());
+
+        // Test SftpCredentialStore lifecycle
+        let key = format_sftp_connection_key("alice", "sftp.example.internal", 2222);
+        assert!(!has_sftp_credentials(key.clone()).expect("has_sftp_credentials before store"));
+
+        store_sftp_credentials(key.clone(), "s3cr3t-p@ss".to_string())
+            .expect("store_sftp_credentials");
+        assert!(has_sftp_credentials(key.clone()).expect("has_sftp_credentials after store"));
+
+        let resolved = resolve_sftp_password("sftp.example.internal", 2222, "alice", String::new())
+            .expect("resolve stored password when empty password passed");
+        assert_eq!(resolved.as_str(), "s3cr3t-p@ss");
+
+        remove_sftp_credentials(key.clone()).expect("remove_sftp_credentials");
+        assert!(!has_sftp_credentials(key).expect("has_sftp_credentials after remove"));
+        assert!(
+            resolve_sftp_password("sftp.example.internal", 2222, "alice", String::new()).is_err()
+        );
+    }
 }
 
 #[cfg(test)]
 #[cfg(feature = "sftp-tests")]
 mod sftp_file_system_operation_commands_tests {
     use super::*;
+    use std::sync::OnceLock;
+    use tempfile::TempDir;
 
-    // Test data
     const TEST_HOST: &str = "localhost";
     const TEST_PORT: u16 = 2222;
     const TEST_USERNAME: &str = "explorer";
@@ -597,214 +1758,302 @@ mod sftp_file_system_operation_commands_tests {
     const TEST_WRONG_PASSWORD: &str = "wrong_password";
     const TEST_WRONG_HOST: &str = "nonexistent.host";
 
-    // Helper function to create test file content
-    #[allow(dead_code)]
-    fn get_test_file_content() -> &'static str {
-        "This is a test file content for SFTP operations."
+    static SFTP_TEST_ENV_LOCK: OnceLock<Mutex<Option<TempDir>>> = OnceLock::new();
+
+    fn setup_trusted_test_host() {
+        let mutex = SFTP_TEST_ENV_LOCK.get_or_init(|| Mutex::new(None));
+        let mut guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() && std::env::var_os("EXPLR_DATA_DIR").is_none() {
+            if let Ok(tmp) = TempDir::new() {
+                std::env::set_var("EXPLR_DATA_DIR", tmp.path());
+                *guard = Some(tmp);
+            }
+        }
+        if let Ok((_session, live_fp)) = connect_ssh_session(TEST_HOST, TEST_PORT) {
+            let kh_path = get_app_known_hosts_path();
+            let _ = persist_trusted_host_key_to_path(&kh_path, TEST_HOST, TEST_PORT, &live_fp);
+        }
+    }
+
+    #[test]
+    fn test_connect_to_sftp_via_password_untrusted_and_mismatch_rejected() {
+        let mutex = SFTP_TEST_ENV_LOCK.get_or_init(|| Mutex::new(None));
+        let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let kh_path = get_app_known_hosts_path();
+        let _ = fs::remove_file(&kh_path);
+
+        // 1. Untrusted host key must be rejected before password auth
+        let untrusted_err = connect_to_sftp_via_password(
+            TEST_HOST.to_string(),
+            TEST_PORT,
+            TEST_USERNAME.to_string(),
+            TEST_PASSWORD.to_string(),
+        )
+        .err()
+        .expect("Untrusted host key must be rejected");
+        assert!(
+            untrusted_err.starts_with("HOST_KEY_UNTRUSTED:SHA256:"),
+            "Expected HOST_KEY_UNTRUSTED error, got: {untrusted_err}"
+        );
+        let live_fp = untrusted_err
+            .strip_prefix("HOST_KEY_UNTRUSTED:")
+            .unwrap()
+            .to_string();
+
+        // 2. Mismatched host key in known_hosts must be rejected
+        persist_trusted_host_key_to_path(
+            &kh_path,
+            TEST_HOST,
+            TEST_PORT,
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        .expect("write dummy host key");
+        let mismatch_err = connect_to_sftp_via_password(
+            TEST_HOST.to_string(),
+            TEST_PORT,
+            TEST_USERNAME.to_string(),
+            TEST_PASSWORD.to_string(),
+        )
+        .err()
+        .expect("Mismatched host key must be rejected");
+        assert!(
+            mismatch_err.starts_with("HOST_KEY_MISMATCH:"),
+            "Expected HOST_KEY_MISMATCH error, got: {mismatch_err}"
+        );
+
+        // 3. Trusting actual live fingerprint allows connection
+        trust_sftp_host_key_impl(TEST_HOST.to_string(), TEST_PORT, live_fp)
+            .expect("trust live host key");
+        let ok_res = connect_to_sftp_via_password(
+            TEST_HOST.to_string(),
+            TEST_PORT,
+            TEST_USERNAME.to_string(),
+            TEST_PASSWORD.to_string(),
+        );
+        assert!(
+            ok_res.is_ok(),
+            "Connection should succeed after trusting host key"
+        );
     }
 
     #[test]
     fn test_connect_to_sftp_via_password_success() {
+        setup_trusted_test_host();
         let result = connect_to_sftp_via_password(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
         );
-        
+
         assert!(result.is_ok(), "Should successfully connect to SFTP server");
     }
 
     #[test]
     fn test_connect_to_sftp_via_password_failure_wrong_password() {
+        setup_trusted_test_host();
         let result = connect_to_sftp_via_password(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_WRONG_PASSWORD.to_string(),
         );
-        
+
         assert!(result.is_err(), "Should fail with wrong password");
     }
 
     #[test]
     fn test_connect_to_sftp_via_password_failure_wrong_host() {
+        setup_trusted_test_host();
         let result = connect_to_sftp_via_password(
             TEST_WRONG_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
         );
-        
+
         assert!(result.is_err(), "Should fail with wrong host");
     }
 
     #[test]
     fn test_connect_to_sftp_success() {
+        setup_trusted_test_host();
         let result = connect_to_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
         );
-        
+
         assert!(result.is_ok(), "Should successfully connect to SFTP server");
     }
 
     #[test]
     fn test_connect_to_sftp_failure() {
+        setup_trusted_test_host();
         let result = connect_to_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_WRONG_PASSWORD.to_string(),
         );
-        
+
         assert!(result.is_err(), "Should fail with wrong credentials");
     }
 
-    #[test]
-    fn test_load_dir_success() {
+    #[tokio::test]
+    async fn test_load_dir_success() {
+        setup_trusted_test_host();
         let result = load_dir(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             ".".to_string(),
-        );
-        
+        )
+        .await;
+
         match result {
             Ok(json) => {
-                println!("SFTP Directory JSON: {}", json);
                 assert!(!json.is_empty(), "JSON should not be empty");
-                // Try to parse the JSON to ensure it's valid
                 let parsed: Result<SFTPDirectory, _> = serde_json::from_str(&json);
                 assert!(parsed.is_ok(), "Should be valid JSON");
-            },
+            }
             Err(e) => {
-                panic!("Should successfully load directory: {}", e);
+                panic!("Should successfully load directory: {e}");
             }
         }
     }
 
-    #[test]
-    fn test_load_dir_failure_wrong_credentials() {
+    #[tokio::test]
+    async fn test_load_dir_failure_wrong_credentials() {
+        setup_trusted_test_host();
         let result = load_dir(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_WRONG_PASSWORD.to_string(),
             ".".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with wrong credentials");
     }
 
-    #[test]
-    fn test_load_dir_failure_nonexistent_directory() {
+    #[tokio::test]
+    async fn test_load_dir_failure_nonexistent_directory() {
+        setup_trusted_test_host();
         let result = load_dir(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             "/nonexistent/directory".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with nonexistent directory");
     }
 
-    #[test]
-    fn test_create_file_sftp_success() {
+    #[tokio::test]
+    async fn test_create_file_sftp_success() {
+        setup_trusted_test_host();
         let test_file = "test_create_file.txt";
-        
+
         let result = create_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_file.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully create file");
-        
-        // Clean up - delete the test file
+
         let _ = delete_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_file.to_string(),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn test_create_file_sftp_failure() {
+    #[tokio::test]
+    async fn test_create_file_sftp_failure() {
+        setup_trusted_test_host();
         let result = create_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_WRONG_PASSWORD.to_string(),
             "test_file.txt".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with wrong credentials");
     }
 
-    #[test]
-    fn test_delete_file_sftp_success() {
+    #[tokio::test]
+    async fn test_delete_file_sftp_success() {
+        setup_trusted_test_host();
         let test_file = "test_delete_file.txt";
-        
-        // First create a file
+
         let create_result = create_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_file.to_string(),
-        );
+        )
+        .await;
         assert!(create_result.is_ok(), "Should create test file first");
-        
-        // Then delete it
+
         let result = delete_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_file.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully delete file");
     }
 
-    #[test]
-    fn test_delete_file_sftp_failure_nonexistent_file() {
+    #[tokio::test]
+    async fn test_delete_file_sftp_failure_nonexistent_file() {
+        setup_trusted_test_host();
         let result = delete_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             "nonexistent_file.txt".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with nonexistent file");
     }
 
-    #[test]
-    fn test_rename_file_sftp_success() {
+    #[tokio::test]
+    async fn test_rename_file_sftp_success() {
+        setup_trusted_test_host();
         let original_file = "test_rename_original.txt";
         let renamed_file = "test_rename_new.txt";
-        
-        // First create a file
+
         let create_result = create_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             original_file.to_string(),
-        );
+        )
+        .await;
         assert!(create_result.is_ok(), "Should create test file first");
-        
-        // Then rename it
+
         let result = rename_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -812,22 +2061,24 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             original_file.to_string(),
             renamed_file.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully rename file");
-        
-        // Clean up
+
         let _ = delete_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             renamed_file.to_string(),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn test_rename_file_sftp_failure() {
+    #[tokio::test]
+    async fn test_rename_file_sftp_failure() {
+        setup_trusted_test_host();
         let result = rename_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -835,27 +2086,28 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             "nonexistent_file.txt".to_string(),
             "new_name.txt".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with nonexistent file");
     }
 
-    #[test]
-    fn test_copy_file_sftp_success() {
+    #[tokio::test]
+    async fn test_copy_file_sftp_success() {
+        setup_trusted_test_host();
         let source_file = "test_copy_source.txt";
         let dest_file = "test_copy_dest.txt";
-        
-        // First create a source file
+
         let create_result = create_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             source_file.to_string(),
-        );
+        )
+        .await;
         assert!(create_result.is_ok(), "Should create source file first");
-        
-        // Then copy it
+
         let result = copy_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -863,29 +2115,32 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             source_file.to_string(),
             dest_file.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully copy file");
-        
-        // Clean up
+
         let _ = delete_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             source_file.to_string(),
-        );
+        )
+        .await;
         let _ = delete_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             dest_file.to_string(),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn test_copy_file_sftp_failure() {
+    #[tokio::test]
+    async fn test_copy_file_sftp_failure() {
+        setup_trusted_test_host();
         let result = copy_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -893,27 +2148,28 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             "nonexistent_source.txt".to_string(),
             "dest.txt".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with nonexistent source file");
     }
 
-    #[test]
-    fn test_move_file_sftp_success() {
+    #[tokio::test]
+    async fn test_move_file_sftp_success() {
+        setup_trusted_test_host();
         let source_file = "test_move_source.txt";
         let dest_file = "test_move_dest.txt";
-        
-        // First create a source file
+
         let create_result = create_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             source_file.to_string(),
-        );
+        )
+        .await;
         assert!(create_result.is_ok(), "Should create source file first");
-        
-        // Then move it
+
         let result = move_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -921,22 +2177,24 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             source_file.to_string(),
             dest_file.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully move file");
-        
-        // Clean up
+
         let _ = delete_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             dest_file.to_string(),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn test_move_file_sftp_failure() {
+    #[tokio::test]
+    async fn test_move_file_sftp_failure() {
+        setup_trusted_test_host();
         let result = move_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -944,103 +2202,111 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             "nonexistent_file.txt".to_string(),
             "dest.txt".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with nonexistent file");
     }
 
-    #[test]
-    fn test_create_directory_sftp_success() {
+    #[tokio::test]
+    async fn test_create_directory_sftp_success() {
+        setup_trusted_test_host();
         let test_dir = "test_create_directory";
-        
+
         let result = create_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_dir.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully create directory");
-        
-        // Clean up
+
         let _ = delete_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_dir.to_string(),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn test_create_directory_sftp_failure() {
+    #[tokio::test]
+    async fn test_create_directory_sftp_failure() {
+        setup_trusted_test_host();
         let result = create_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_WRONG_PASSWORD.to_string(),
             "test_dir".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with wrong credentials");
     }
 
-    #[test]
-    fn test_delete_directory_sftp_success() {
+    #[tokio::test]
+    async fn test_delete_directory_sftp_success() {
+        setup_trusted_test_host();
         let test_dir = "test_delete_directory";
-        
-        // First create a directory
+
         let create_result = create_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_dir.to_string(),
-        );
+        )
+        .await;
         assert!(create_result.is_ok(), "Should create test directory first");
-        
-        // Then delete it
+
         let result = delete_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_dir.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully delete directory");
     }
 
-    #[test]
-    fn test_delete_directory_sftp_failure() {
+    #[tokio::test]
+    async fn test_delete_directory_sftp_failure() {
+        setup_trusted_test_host();
         let result = delete_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             "nonexistent_directory".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with nonexistent directory");
     }
 
-    #[test]
-    fn test_rename_directory_sftp_success() {
+    #[tokio::test]
+    async fn test_rename_directory_sftp_success() {
+        setup_trusted_test_host();
         let original_dir = "test_rename_dir_original";
         let renamed_dir = "test_rename_dir_new";
-        
-        // First create a directory
+
         let create_result = create_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             original_dir.to_string(),
-        );
+        )
+        .await;
         assert!(create_result.is_ok(), "Should create test directory first");
-        
-        // Then rename it
+
         let result = rename_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -1048,22 +2314,24 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             original_dir.to_string(),
             renamed_dir.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully rename directory");
-        
-        // Clean up
+
         let _ = delete_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             renamed_dir.to_string(),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn test_rename_directory_sftp_failure() {
+    #[tokio::test]
+    async fn test_rename_directory_sftp_failure() {
+        setup_trusted_test_host();
         let result = rename_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -1071,27 +2339,31 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             "nonexistent_directory".to_string(),
             "new_name".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with nonexistent directory");
     }
 
-    #[test]
-    fn test_move_directory_sftp_success() {
+    #[tokio::test]
+    async fn test_move_directory_sftp_success() {
+        setup_trusted_test_host();
         let source_dir = "test_move_dir_source";
         let dest_dir = "test_move_dir_dest";
-        
-        // First create a source directory
+
         let create_result = create_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             source_dir.to_string(),
+        )
+        .await;
+        assert!(
+            create_result.is_ok(),
+            "Should create source directory first"
         );
-        assert!(create_result.is_ok(), "Should create source directory first");
-        
-        // Then move it
+
         let result = move_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -1099,22 +2371,24 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             source_dir.to_string(),
             dest_dir.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully move directory");
-        
-        // Clean up
+
         let _ = delete_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             dest_dir.to_string(),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn test_move_directory_sftp_failure() {
+    #[tokio::test]
+    async fn test_move_directory_sftp_failure() {
+        setup_trusted_test_host();
         let result = move_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -1122,27 +2396,31 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             "nonexistent_directory".to_string(),
             "dest_dir".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with nonexistent directory");
     }
 
-    #[test]
-    fn test_copy_directory_sftp_success() {
+    #[tokio::test]
+    async fn test_copy_directory_sftp_success() {
+        setup_trusted_test_host();
         let source_dir = "test_copy_dir_source";
         let dest_dir = "test_copy_dir_dest";
-        
-        // First create a source directory
+
         let create_result = create_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             source_dir.to_string(),
+        )
+        .await;
+        assert!(
+            create_result.is_ok(),
+            "Should create source directory first"
         );
-        assert!(create_result.is_ok(), "Should create source directory first");
-        
-        // Then copy it
+
         let result = copy_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -1150,29 +2428,32 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             source_dir.to_string(),
             dest_dir.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully copy directory");
-        
-        // Clean up
+
         let _ = delete_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             source_dir.to_string(),
-        );
+        )
+        .await;
         let _ = delete_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             dest_dir.to_string(),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn test_copy_directory_sftp_failure() {
+    #[tokio::test]
+    async fn test_copy_directory_sftp_failure() {
+        setup_trusted_test_host();
         let result = copy_directory_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
@@ -1180,58 +2461,60 @@ mod sftp_file_system_operation_commands_tests {
             TEST_PASSWORD.to_string(),
             "nonexistent_directory".to_string(),
             "dest_dir".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with nonexistent directory");
     }
 
-    #[test]
-    fn test_open_file_sftp_success() {
-        // Test with an existing file - let's assume there's at least one file in the test directory
-        // We'll create a file first, then read it
+    #[tokio::test]
+    async fn test_open_file_sftp_success() {
+        setup_trusted_test_host();
         let test_file = "test_read_file.txt";
-        
-        // First create a file
+
         let create_result = create_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_file.to_string(),
-        );
+        )
+        .await;
         assert!(create_result.is_ok(), "Should create test file first");
-        
-        // Then try to read it
+
         let result = open_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_file.to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_ok(), "Should successfully read file");
-        
-        // Clean up
+
         let _ = delete_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             test_file.to_string(),
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn test_open_file_sftp_failure() {
+    #[tokio::test]
+    async fn test_open_file_sftp_failure() {
+        setup_trusted_test_host();
         let result = open_file_sftp(
             TEST_HOST.to_string(),
             TEST_PORT,
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             "nonexistent_file.txt".to_string(),
-        );
-        
+        )
+        .await;
+
         assert!(result.is_err(), "Should fail with nonexistent file");
     }
 }

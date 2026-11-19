@@ -1,6 +1,10 @@
-use std::time::Duration;
-use serde::{Deserialize, Serialize};
 use crate::models::ranking_config::RankingConfig;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+fn default_fuzzy_search_enabled() -> bool {
+    true
+}
 
 /// Configuration options for the search engine.
 ///
@@ -16,6 +20,12 @@ pub struct SearchEngineConfig {
     pub ranking_config: RankingConfig,
     pub prefer_directories: bool,
     pub cache_ttl: Option<Duration>,
+    #[serde(default)]
+    pub index_hidden_files: bool,
+    #[serde(default = "default_fuzzy_search_enabled")]
+    pub fuzzy_search_enabled: bool,
+    #[serde(default)]
+    pub case_sensitive_search: bool,
     // To be implemented
     //pub collect_usage_stats: bool,
     //pub indexing_logging_enabled: bool,
@@ -25,11 +35,8 @@ pub struct SearchEngineConfig {
     //pub min_query_length: Option<usize>,
     //pub max_indexed_files: Option<usize>,
     //pub max_index_depth: Option<usize>,
-    //pub index_hidden_files: bool,
     //pub follow_symlinks: bool,
     //pub fuzzy_trigram_threshold: Option<f32>,
-    //pub fuzzy_search_enabled: bool,
-    //pub case_sensitive_search: bool,
     //pub group_results_by_directory: bool,
     //pub persistent_index_path: Option<String>,
     //pub index_compression_enabled: bool,
@@ -75,30 +82,66 @@ impl Default for SearchEngineConfig {
                 "Temp".to_string(),
             ]),
             cache_size: 1000,
-            
-            cache_ttl: Duration::from_secs(300).into(), // 5 minutes
+            cache_ttl: Some(Duration::from_secs(300)), // 5 minutes
             prefer_directories: false,
+            index_hidden_files: false,
+            fuzzy_search_enabled: true,
+            case_sensitive_search: false,
             //collect_usage_stats: true,
             //indexing_logging_enabled: false,
             //search_logging_enabled: false,
             //search_timeout_ms: Some(5000), // 5 seconds
             //result_score_threshold: Some(0.1),
-            //min_query_length: None,           
-            //max_indexed_files: None, 
-            //max_index_depth: None,            
-            //index_hidden_files: false, 
-            //follow_symlinks: false,  
+            //min_query_length: None,
+            //max_indexed_files: None,
+            //max_index_depth: None,
+            //follow_symlinks: false,
             //fuzzy_trigram_threshold: Some(0.5),
-            //fuzzy_search_enabled: true,
-            //case_sensitive_search: false,
             //group_results_by_directory: true,
             //persistent_index_path: None,
             //index_compression_enabled: true,
             //indexing_priority: Some(1),
-            //default_search_operator: Some("AND".to_string()), 
+            //default_search_operator: Some("AND".to_string()),
             //enable_wildcard_search: false,
-            //indexing_batch_size: Some(100), 
-            //retry_failed_indexing: true, 
+            //indexing_batch_size: Some(100),
+            //retry_failed_indexing: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_search_engine_config_defaults() {
+        let config = SearchEngineConfig::default();
+        assert!(!config.index_hidden_files);
+        assert!(config.fuzzy_search_enabled);
+        assert!(!config.case_sensitive_search);
+    }
+
+    #[test]
+    fn test_search_engine_config_deserializes_legacy_json_without_new_flags() {
+        let legacy_json = json!({
+            "search_engine_enabled": true,
+            "max_results": 50,
+            "preferred_extensions": ["txt"],
+            "excluded_patterns": [".git"],
+            "cache_size": 500,
+            "ranking_config": RankingConfig::default(),
+            "prefer_directories": true,
+            "cache_ttl": { "secs": 60, "nanos": 0 }
+        });
+
+        let config: SearchEngineConfig = serde_json::from_value(legacy_json)
+            .expect("Legacy SearchEngineConfig should deserialize");
+        assert!(config.search_engine_enabled);
+        assert_eq!(config.max_results, 50);
+        assert!(config.prefer_directories);
+        assert!(!config.index_hidden_files);
+        assert!(config.fuzzy_search_enabled);
+        assert!(!config.case_sensitive_search);
     }
 }

@@ -54,13 +54,13 @@ use crate::error_handling::{Error, ErrorCode};
 use crate::models::LoggingLevel;
 use crate::state::SettingsState;
 use chrono::Local;
+use serde_json::json;
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use serde_json::json;
 
 #[macro_export]
 macro_rules! log_info {
@@ -201,10 +201,10 @@ impl Logger {
     pub fn init(state: Arc<Mutex<SettingsState>>) {
         // Ensure log directories exist before initializing the logger
         Self::ensure_log_directories_exist();
-        
+
         // Create empty log files if they don't exist
         Self::ensure_log_files_exist();
-        
+
         Self::init_global_logger(state);
     }
 
@@ -212,31 +212,39 @@ impl Logger {
     fn ensure_log_directories_exist() {
         if let Some(parent) = LOG_FILE_ABS_PATH.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("Failed to create parent log directory: {}", e);
+                eprintln!("Failed to create parent log directory: {e}");
             }
         }
-        
+
         if let Some(parent) = ERROR_LOG_FILE_ABS_PATH.parent() {
             if let Some(log_parent) = LOG_FILE_ABS_PATH.parent() {
                 if parent != log_parent {
                     if let Err(e) = std::fs::create_dir_all(parent) {
-                        eprintln!("Failed to create parent error log directory: {}", e);
+                        eprintln!("Failed to create parent error log directory: {e}");
                     }
                 }
             }
         }
     }
-    
+
     // Create empty log files if they don't exist
     fn ensure_log_files_exist() {
         // Create empty app.log if it doesn't exist
-        if let Err(e) = OpenOptions::new().write(true).create(true).open(&*LOG_FILE_ABS_PATH) {
-            eprintln!("Failed to create log file: {}", e);
+        if let Err(e) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&*LOG_FILE_ABS_PATH)
+        {
+            eprintln!("Failed to create log file: {e}");
         }
-        
+
         // Create empty error.log if it doesn't exist
-        if let Err(e) = OpenOptions::new().write(true).create(true).open(&*ERROR_LOG_FILE_ABS_PATH) {
-            eprintln!("Failed to create error log file: {}", e);
+        if let Err(e) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&*ERROR_LOG_FILE_ABS_PATH)
+        {
+            eprintln!("Failed to create error log file: {e}");
         }
     }
 
@@ -261,14 +269,21 @@ impl Logger {
         // Retrieve the logging state with proper error handling
         let (logging_state, json_log) = match self.state.lock() {
             Ok(state_guard) => match state_guard.0.lock() {
-                Ok(settings) => (settings.backend_settings.logging_config.logging_level.clone(), settings.backend_settings.logging_config.json_log.clone()),
+                Ok(settings) => (
+                    settings
+                        .backend_settings
+                        .logging_config
+                        .logging_level
+                        .clone(),
+                    settings.backend_settings.logging_config.json_log,
+                ),
                 Err(e) => {
-                    eprintln!("Failed to acquire inner settings lock: {}", e);
+                    eprintln!("Failed to acquire inner settings lock: {e}");
                     (LoggingLevel::Minimal, false)
                 }
             },
             Err(e) => {
-                eprintln!("Failed to acquire settings state lock: {}", e);
+                eprintln!("Failed to acquire settings state lock: {e}");
                 (LoggingLevel::Minimal, false)
             }
         };
@@ -286,7 +301,7 @@ impl Logger {
                 "line": line,
                 "message": message,
             })
-                .to_string()
+            .to_string()
         } else {
             match logging_state {
                 LoggingLevel::Full => format!(
@@ -304,29 +319,36 @@ impl Logger {
         }
     }
 
-    /// Called when file_size > MAX_FILE_SIZE.
-    fn rotate_logs(&self, path: &PathBuf) {
-        // Use timestamp-based naming for archived logs
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        let stem = path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("log");
-        let archive_path = path.with_file_name(format!("{}.{}.log", stem, timestamp));
+    /// Called when file_size > MAX_FILE_SIZE (under WRITE_LOCK).
+    fn rotate_logs(&self, path: &Path) {
+        // Use millisecond-precision timestamp plus a collision suffix so rapid
+        // rotations within the same second/millisecond never overwrite each other.
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S_%3f");
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("log");
+        let mut archive_path = path.with_file_name(format!("{stem}.{timestamp}.log"));
+        let mut collision_counter: u32 = 1;
+        while archive_path.exists() {
+            archive_path =
+                path.with_file_name(format!("{stem}.{timestamp}_{collision_counter}.log"));
+            collision_counter += 1;
+        }
 
         // Move current log to archive and create new file
         if let Err(e) = fs::rename(path, &archive_path) {
-            eprintln!("Failed to rotate log file: {}", e);
+            eprintln!("Failed to rotate log file: {e}");
             return;
         }
 
-        // Enforce the 3-file limit after successful rotation
+        // Enforce the configured archive file limit after successful rotation
         self.enforce_log_file_limit(path);
     }
 
-    fn enforce_log_file_limit(&self, current_log_path: &PathBuf) {
+    fn enforce_log_file_limit(&self, current_log_path: &Path) {
         if let Some(parent) = current_log_path.parent() {
             if let Some(base_name) = current_log_path.file_stem() {
                 let base_name = base_name.to_string_lossy();
+                let archive_prefix = format!("{base_name}.");
+                let active_file_name = format!("{base_name}.log");
 
                 // Collect all archived log files
                 let mut archived_logs: Vec<_> = fs::read_dir(parent)
@@ -337,40 +359,50 @@ impl Logger {
                         // Store the file name first to avoid the temporary value being dropped
                         let name = entry.file_name();
                         let name = name.to_string_lossy();
-                        name.starts_with(&*base_name) &&
-                            name.ends_with(".log") &&
-                            name != format!("{}.log", base_name)
+                        name.starts_with(&archive_prefix)
+                            && name.ends_with(".log")
+                            && name != active_file_name
                     })
                     .collect();
 
-                // Sort by modification time (oldest first)
+                // Sort by modification time (oldest first), breaking sub-millisecond ties by name
                 archived_logs.sort_by(|a, b| {
-                    a.metadata()
+                    let a_time = a
+                        .metadata()
                         .and_then(|m| m.modified())
-                        .unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH)
-                        .cmp(&b.metadata()
-                            .and_then(|m| m.modified())
-                            .unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH))
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    let b_time = b
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    a_time
+                        .cmp(&b_time)
+                        .then_with(|| a.file_name().cmp(&b.file_name()))
                 });
 
-                // If we have more than 2 archived files (3 total including current), remove the oldest
+                // Keep at most max_log_files.saturating_sub(1) archived files (+ 1 active file)
                 let max_log_files = match self.state.lock() {
                     Ok(state_guard) => match state_guard.0.lock() {
-                        Ok(settings) => settings.backend_settings.logging_config.max_log_files.unwrap_or(MAX_NUMBER_OF_LOG_FILES),
-                        Err(_) => MAX_NUMBER_OF_LOG_FILES // Fallback to default if lock fails
+                        Ok(settings) => settings
+                            .backend_settings
+                            .logging_config
+                            .max_log_files
+                            .unwrap_or(MAX_NUMBER_OF_LOG_FILES),
+                        Err(_) => MAX_NUMBER_OF_LOG_FILES, // Fallback to default if lock fails
                     },
-                    Err(_) => MAX_NUMBER_OF_LOG_FILES // Fallback to default if lock fails
+                    Err(_) => MAX_NUMBER_OF_LOG_FILES, // Fallback to default if lock fails
                 };
 
-
-                while archived_logs.len() > max_log_files - 1 {
-                    if let Some(oldest) = archived_logs.first() {
-                        if let Err(e) = fs::remove_file(oldest.path()) {
-                            eprintln!("Failed to remove oldest log file {}: {}",
-                                      oldest.path().display(), e);
-                        }
+                let max_archived_files = max_log_files.saturating_sub(1);
+                while archived_logs.len() > max_archived_files {
+                    let oldest = archived_logs.remove(0);
+                    if let Err(e) = fs::remove_file(oldest.path()) {
+                        eprintln!(
+                            "Failed to remove oldest log file {}: {}",
+                            oldest.path().display(),
+                            e
+                        );
                     }
-                    archived_logs.remove(0);
                 }
             }
         }
@@ -384,10 +416,10 @@ impl Logger {
         self.write_to_file(&self.error_log_path, entry);
     }
 
-    fn write_to_file(&self, path: &PathBuf, entry: &str) {
+    fn write_to_file(&self, path: &Path, entry: &str) {
         // Double-check parent directory exists before attempting to write to file
         if let Some(parent) = path.parent() {
-            if !parent.exists() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     eprintln!("Failed to create log directory {}: {}", parent.display(), e);
                     return;
@@ -395,27 +427,29 @@ impl Logger {
             }
         }
 
-        let metadata = fs::metadata(path).ok();
-        let file_size = metadata.map(|m| m.len()).unwrap_or(0);
-        let _guard = WRITE_LOCK.lock().unwrap();
+        // Acquire WRITE_LOCK first (recovering if poisoned) and check file size inside the lock
+        // to prevent TOCTOU double-rotation across concurrent logging threads.
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-        // If file size exceeds the limit, truncate before writing new entry
+        // If file size exceeds the limit, rotate before writing new entry
         let max_log_size = match self.state.lock() {
             Ok(state_guard) => match state_guard.0.lock() {
-                Ok(settings) => settings.backend_settings.logging_config.max_log_size.unwrap_or(5 * 1024 * 1024),
-                Err(_) => 5 * 1024 * 1024 // Fallback to constant if lock fails
+                Ok(settings) => settings
+                    .backend_settings
+                    .logging_config
+                    .max_log_size
+                    .unwrap_or(5 * 1024 * 1024),
+                Err(_) => 5 * 1024 * 1024, // Fallback to constant if lock fails
             },
-            Err(_) => 5 * 1024 * 1024 // Fallback to constant if lock fails
+            Err(_) => 5 * 1024 * 1024, // Fallback to constant if lock fails
         };
-        
+
         if file_size > max_log_size {
             // For test purposes, print the file size before truncation
             #[cfg(test)]
-            println!(
-                "File exceeds size limit: {} bytes. Rotating...",
-                file_size
-            );
-        
+            println!("File exceeds size limit: {file_size} bytes. Rotating...");
+
             self.rotate_logs(path);
         }
 
@@ -425,28 +459,31 @@ impl Logger {
         // Process the entry to handle any embedded newlines
         let formatted_entry = entry.replace('\n', "\n    | ");
 
-        let to_write = format!("{}\n", formatted_entry);
+        let to_write = format!("{formatted_entry}\n");
 
         match OpenOptions::new().create(true).append(true).open(path) {
             Ok(mut file) => {
                 if let Err(e) = file.write_all(to_write.as_bytes()) {
-                    eprintln!("Failed to write to log file: {}", e);
+                    eprintln!("Failed to write to log file: {e}");
                     // Create an error using our error handling module but just log it
                     let error = Error::new(
                         ErrorCode::InternalError,
-                        format!("Failed to write to log file: {}", e)
+                        format!("Failed to write to log file: {e}"),
                     );
                     eprintln!("Logging error: {}", error.to_json());
                 }
             }
             Err(e) => {
-                eprintln!("Failed to open log file for writing: {}", e);
+                eprintln!("Failed to open log file for writing: {e}");
                 eprintln!("Path: {}", path.display());
-                eprintln!("Parent exists: {}", path.parent().map_or(false, |p| p.exists()));
+                eprintln!(
+                    "Parent exists: {}",
+                    path.parent().is_some_and(|p| p.exists())
+                );
                 // Create an error using our error handling module but just log it
                 let error = Error::new(
                     ErrorCode::ResourceNotFound,
-                    format!("Failed to open log file for writing: {}", e)
+                    format!("Failed to open log file for writing: {e}"),
                 );
                 eprintln!("Logging error: {}", error.to_json());
             }
@@ -686,17 +723,22 @@ mod tests_logging {
         // Write entries until we exceed the test max size
         for i in 0..60 {
             // Should create ~60KB of data
-            logger.write_log(&format!("Log entry #{}: {}", i, large_entry));
+            logger.write_log(&format!("Log entry #{i}: {large_entry}"));
         }
 
         // Get the file size before triggering rotation
         let metadata_before = fs::metadata(&logger.log_path).expect("Failed to read file metadata");
         let size_before = metadata_before.len();
-        println!("Size before rotation: {} bytes", size_before);
+        println!("Size before rotation: {size_before} bytes");
 
         // Keep track of original log path for later comparison
         let original_log_path = logger.log_path.clone();
-        let log_filename = original_log_path.file_name().unwrap().to_str().unwrap().to_string();
+        let log_filename = original_log_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
 
         // Force log rotation by directly calling the rotate_logs method
         logger.rotate_logs(&logger.log_path);
@@ -716,17 +758,15 @@ mod tests_logging {
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
 
-        // Find the archived log file (should be named like "test_app.20230101_123456.log")
-        let archived_log = entries
-            .iter()
-            .find(|entry| {
-                let name = entry.file_name().to_string_lossy().to_string();
-                // Check if file name contains the original name and has timestamp pattern
-                name.starts_with(log_filename.trim_end_matches(".log")) &&
-                name != log_filename &&
-                name.ends_with(".log") &&
-                name.contains(".")
-            });
+        // Find the archived log file (should be named like "test_app.20230101_123456_789.log")
+        let archived_log = entries.iter().find(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Check if file name contains the original name and has timestamp pattern
+            name.starts_with(log_filename.trim_end_matches(".log"))
+                && name != log_filename
+                && name.ends_with(".log")
+                && name.contains('.')
+        });
 
         assert!(
             archived_log.is_some(),
@@ -737,8 +777,8 @@ mod tests_logging {
             let archived_path = archived_log.path();
 
             // Check if the archived log has content
-            let archived_content = fs::read_to_string(&archived_path)
-                .expect("Failed to read archived log file");
+            let archived_content =
+                fs::read_to_string(&archived_path).expect("Failed to read archived log file");
 
             assert!(
                 !archived_content.is_empty(),
@@ -758,8 +798,8 @@ mod tests_logging {
         logger.write_log("This entry should be added after rotation");
 
         // Verify the new entry is in the original log file path
-        let new_log_content = fs::read_to_string(&original_log_path)
-            .expect("Failed to read new log file");
+        let new_log_content =
+            fs::read_to_string(&original_log_path).expect("Failed to read new log file");
 
         assert!(
             new_log_content.contains("This entry should be added after rotation"),
@@ -777,8 +817,8 @@ mod tests_logging {
 
         // Create 5 archived log files
         for i in 0..5 {
-            let path = temp_path.join(format!("app.202301010000{}.log", i));
-            fs::write(&path, format!("archived content {}", i))
+            let path = temp_path.join(format!("app.202301010000{i}.log"));
+            fs::write(&path, format!("archived content {i}"))
                 .expect("Failed to create archived log");
         }
 
@@ -797,45 +837,65 @@ mod tests_logging {
             .unwrap()
             .filter_map(Result::ok)
             .collect();
-        
+
         // Should have base log file (app.log) + 3 archived files
-        assert_eq!(remaining_files.len(), 4, "Should have base log file + 3 archived files");
-        let base_file_exists = remaining_files.iter()
+        assert_eq!(
+            remaining_files.len(),
+            4,
+            "Should have base log file + 3 archived files"
+        );
+        let base_file_exists = remaining_files
+            .iter()
             .any(|entry| entry.file_name() == "app.log");
         assert!(base_file_exists, "Base log file should exist");
     }
-    
+
     #[test]
     fn test_log_file_creation() {
         let (logger, _temp_dir) = setup_test_logger();
         let log_path = &logger.log_path;
 
         // Ensure the log file is created
-        assert!(!log_path.exists(), "Log file should not exist before logging");
+        assert!(
+            !log_path.exists(),
+            "Log file should not exist before logging"
+        );
 
         logger.write_log("Test log entry");
 
         // Check if the log file was created
-        assert!(log_path.exists(), "Log file should be created after logging");
-        
+        assert!(
+            log_path.exists(),
+            "Log file should be created after logging"
+        );
+
         // Verify the content of the log file
         let content = fs::read_to_string(log_path).expect("Failed to read log file");
-        assert!(content.contains("Test log entry"), "Log file should contain the logged message");
+        assert!(
+            content.contains("Test log entry"),
+            "Log file should contain the logged message"
+        );
     }
-    
+
     #[test]
     fn test_log_file_creation_after_rotation() {
         let (logger, _temp_dir) = setup_test_logger();
         let log_path = &logger.log_path;
 
         // Ensure the log file is created
-        assert!(!log_path.exists(), "Log file should not exist before logging");
+        assert!(
+            !log_path.exists(),
+            "Log file should not exist before logging"
+        );
 
         logger.write_log("Test log entry");
 
         // Check if the log file was created
-        assert!(log_path.exists(), "Log file should be created after logging");
-        
+        assert!(
+            log_path.exists(),
+            "Log file should be created after logging"
+        );
+
         // Simulate log rotation by manually calling rotate_logs
         logger.rotate_logs(log_path);
 
@@ -852,16 +912,163 @@ mod tests_logging {
                 name.starts_with("test_app.") && name.ends_with(".log")
             });
         assert!(has_archive, "Archived log file should exist after rotation");
-        
+
         // Create new log entry after rotation
         logger.write_log("Test log entry after rotation");
-        
+
         // Check if the log file was recreated
-        assert!(log_path.exists(), "Log file should be recreated after rotation");
+        assert!(
+            log_path.exists(),
+            "Log file should be recreated after rotation"
+        );
 
         // Verify the content of the log file
         let content = fs::read_to_string(log_path).expect("Failed to read log file");
-        assert!(content.contains("Test log entry after rotation"), 
-                "Log file should contain the new logged message after rotation");
+        assert!(
+            content.contains("Test log entry after rotation"),
+            "Log file should contain the new logged message after rotation"
+        );
+    }
+
+    /// TP-BE-08: Verify max_log_files = 0 does not panic with integer underflow or poison WRITE_LOCK.
+    #[test]
+    fn test_max_log_files_zero_no_underflow() {
+        let (logger, temp_dir) = setup_test_logger();
+        {
+            let state = logger.state.lock().unwrap();
+            let mut inner_settings = state.0.lock().unwrap();
+            inner_settings.backend_settings.logging_config.max_log_files = Some(0);
+            inner_settings.backend_settings.logging_config.max_log_size = Some(64);
+        }
+
+        let payload = "A".repeat(120);
+        for i in 0..8 {
+            logger.write_log(&format!("zero-limit entry #{i}: {payload}"));
+        }
+
+        assert!(
+            logger.log_path.exists(),
+            "Active log file must exist after rotations with max_log_files = 0"
+        );
+        let content = fs::read_to_string(&logger.log_path).expect("Should read active log");
+        assert!(content.contains("zero-limit entry #7:"));
+
+        // With max_log_files = 0, all archived logs should be pruned
+        let archived_count = fs::read_dir(temp_dir.path())
+            .expect("Should read logs dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                name.starts_with("test_app.") && name.ends_with(".log") && name != TEST_LOG_FILE
+            })
+            .count();
+        assert_eq!(
+            archived_count, 0,
+            "No archived logs should be retained when max_log_files = 0"
+        );
+    }
+
+    /// TP-BE-08: Sub-second / sub-millisecond rotations never overwrite each other.
+    #[test]
+    fn test_subsecond_rotation_collision_unique_archives() {
+        let (logger, temp_dir) = setup_test_logger();
+        {
+            let state = logger.state.lock().unwrap();
+            let mut inner_settings = state.0.lock().unwrap();
+            inner_settings.backend_settings.logging_config.max_log_files = Some(50);
+            inner_settings.backend_settings.logging_config.max_log_size = Some(32);
+        }
+
+        let padding = "B".repeat(64);
+        for i in 0..10 {
+            logger.write_log(&format!("rapid-rotation-marker-{i}: {padding}"));
+        }
+
+        // Collect all contents across active + archived log files
+        let mut combined_logs = String::new();
+        let mut log_file_count = 0usize;
+        for entry in fs::read_dir(temp_dir.path())
+            .expect("Should read logs dir")
+            .filter_map(Result::ok)
+        {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == TEST_LOG_FILE || (name.starts_with("test_app.") && name.ends_with(".log")) {
+                log_file_count += 1;
+                combined_logs.push_str(&fs::read_to_string(entry.path()).unwrap_or_default());
+            }
+        }
+
+        assert!(
+            log_file_count >= 10,
+            "Expected active log + 9 unique archives without collision overwrites, found {log_file_count}"
+        );
+        for i in 0..10 {
+            let marker = format!("rapid-rotation-marker-{i}:");
+            assert!(
+                combined_logs.contains(&marker),
+                "Missing log entry '{marker}' due to archive rotation collision"
+            );
+        }
+    }
+
+    /// TP-BE-08: Concurrent multi-threaded logging and poisoned WRITE_LOCK resilience.
+    #[test]
+    fn test_concurrent_logging_and_poisoned_write_lock_resilience() {
+        let (logger, temp_dir) = setup_test_logger();
+        {
+            let state = logger.state.lock().unwrap();
+            let mut inner_settings = state.0.lock().unwrap();
+            inner_settings.backend_settings.logging_config.max_log_files = Some(100);
+            inner_settings.backend_settings.logging_config.max_log_size = Some(64);
+        }
+
+        // Intentionally poison WRITE_LOCK on a worker thread and ensure Logger recovers
+        let _ = std::thread::spawn(|| {
+            let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("intentional WRITE_LOCK poison");
+        })
+        .join();
+
+        let shared_logger = Arc::new(logger);
+        let mut handles = Vec::new();
+        for thread_id in 0..4 {
+            let logger_ref = shared_logger.clone();
+            handles.push(std::thread::spawn(move || {
+                let pad = "C".repeat(60);
+                for msg_id in 0..5 {
+                    logger_ref.log(
+                        LogLevel::Info,
+                        "logging.rs",
+                        "concurrent_worker",
+                        &format!("thread-{thread_id}-msg-{msg_id}: {pad}"),
+                        1,
+                    );
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("Worker logging thread should not panic");
+        }
+
+        let mut combined_logs = String::new();
+        for entry in fs::read_dir(temp_dir.path())
+            .expect("Should read logs dir")
+            .filter_map(Result::ok)
+        {
+            combined_logs.push_str(&fs::read_to_string(entry.path()).unwrap_or_default());
+        }
+
+        for thread_id in 0..4 {
+            for msg_id in 0..5 {
+                let expected = format!("thread-{thread_id}-msg-{msg_id}:");
+                assert!(
+                    combined_logs.contains(&expected),
+                    "Concurrent log entry '{expected}' was lost"
+                );
+            }
+        }
     }
 }

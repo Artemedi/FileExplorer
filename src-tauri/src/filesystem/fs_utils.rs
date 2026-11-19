@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
 
 pub fn _get_mount_point(path: String) -> Option<String> {
     let path = Path::new(&path);
@@ -7,6 +7,6 @@ pub fn _get_mount_point(path: String) -> Option<String> {
 
     let mut mount_point_path = PathBuf::new();
     mount_point_path.push(&mount_point);
-    mount_point_path.push("\\");
+    mount_point_path.push(MAIN_SEPARATOR_STR);
     Some(mount_point_path.to_string_lossy().into_owned())
 }

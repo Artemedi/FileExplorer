@@ -15,37 +15,43 @@ use tauri::State;
 ///
 /// # Returns
 ///
-/// * A JSON string representation of the current settings.
+/// * `Ok(String)` - A JSON string representation of the current settings.
+/// * `Err(String)` - A serialized error JSON if acquiring the lock or serialization fails.
 ///
 /// # Example
 ///
 /// ```rust
-/// let settings_json = get_settings_as_json(state);
+/// let settings_json = get_settings_as_json(state)?;
 /// println!("Current settings: {}", settings_json);
 /// ```
 #[tauri::command]
-pub fn get_settings_as_json(state: State<Arc<Mutex<SettingsState>>>) -> String {
+pub fn get_settings_as_json(state: State<Arc<Mutex<SettingsState>>>) -> Result<String, String> {
     get_settings_as_json_impl(state.inner().clone())
 }
 
-pub fn get_settings_as_json_impl(state: Arc<Mutex<SettingsState>>) -> String {
-    let settings_inner = match state.lock() {
-        Ok(guard) => guard.0.clone(),
-        Err(_) => {
-            return Error::new(
-                ErrorCode::InternalError,
-                "Failed to acquire lock on settings state".to_string(),
-            ).to_json();
-        }
-    };
-    
-    match to_string(&settings_inner) {
-        Ok(json) => json,
-        Err(_) => Error::new(
+pub fn get_settings_as_json_impl(state: Arc<Mutex<SettingsState>>) -> Result<String, String> {
+    let settings_guard = state.lock().map_err(|_| {
+        Error::new(
+            ErrorCode::InternalError,
+            "Failed to acquire lock on settings state".to_string(),
+        )
+        .to_json()
+    })?;
+    let inner_settings = settings_guard.0.lock().map_err(|_| {
+        Error::new(
+            ErrorCode::InternalError,
+            "Failed to acquire inner lock on settings state".to_string(),
+        )
+        .to_json()
+    })?;
+
+    to_string(&*inner_settings).map_err(|_| {
+        Error::new(
             ErrorCode::InternalError,
             "Failed to serialize settings to JSON".to_string(),
-        ).to_json()
-    }
+        )
+        .to_json()
+    })
 }
 
 /// Retrieves the value of a specific setting field.
@@ -87,12 +93,13 @@ pub fn get_setting_field_impl(
         Error::new(
             ErrorCode::InternalError,
             "Failed to acquire lock on settings state".to_string(),
-        ).to_json()
+        )
+        .to_json()
     })?;
     settings_state.get_setting_field(&key).map_err(|e| {
         Error::new(
             ErrorCode::InternalError,
-            format!("Failed to get setting field: {}", e),
+            format!("Failed to get setting field: {e}"),
         )
         .to_json()
     })
@@ -140,17 +147,16 @@ pub fn update_settings_field_impl(
         Error::new(
             ErrorCode::InternalError,
             "Failed to acquire lock on settings state".to_string(),
-        ).to_json()
+        )
+        .to_json()
     })?;
     settings_state
         .update_setting_field(&key, value)
-        .and_then(|updated| {
-            to_string(&updated).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        })
+        .and_then(|updated| to_string(&updated).map_err(io::Error::other))
         .map_err(|e| {
             Error::new(
                 ErrorCode::InternalError,
-                format!("Failed to update settings field: {}", e),
+                format!("Failed to update settings field: {e}"),
             )
             .to_json()
         })
@@ -199,17 +205,16 @@ pub fn update_multiple_settings_impl(
         Error::new(
             ErrorCode::InternalError,
             "Failed to acquire lock on settings state".to_string(),
-        ).to_json()
+        )
+        .to_json()
     })?;
     settings_state
         .update_multiple_settings(&updates)
-        .and_then(|updated| {
-            to_string(&updated).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        })
+        .and_then(|updated| to_string(&updated).map_err(io::Error::other))
         .map_err(|e| {
             Error::new(
                 ErrorCode::InternalError,
-                format!("Failed to update multiple settings: {}", e),
+                format!("Failed to update multiple settings: {e}"),
             )
             .to_json()
         })
@@ -217,21 +222,21 @@ pub fn update_multiple_settings_impl(
 
 /// Resets the current settings file and resets settings to their default values.
 ///
-/// reinitializes the in-memory settings state to default values by reusing the default state logic.
+/// Reinitializes the in-memory settings state to default values while preserving the file path.
 ///
 /// # Arguments
 ///
-/// * `settings_state` - A Tauri state containing a thread-safe reference to the application's settings.
+/// * `state` - A Tauri state containing a thread-safe reference to the application's settings.
 ///
 /// # Returns
 ///
-/// * `Ok(())` - If the settings file was successfully deleted and the state reset.
-/// * `Err(String)` - An error message if deletion or reset fails.
+/// * `Ok(String)` - A JSON string representation of the reset settings.
+/// * `Err(String)` - An error message if reset fails.
 ///
 /// # Example
 ///
 /// ```rust
-/// let result = reset_settings(state);
+/// let result = reset_settings_command(state);
 /// match result {
 ///     Ok(_) => println!("Settings were reset to default."),
 ///     Err(err) => println!("Failed to reset settings: {}", err),
@@ -247,17 +252,16 @@ pub fn reset_settings_impl(state: Arc<Mutex<SettingsState>>) -> Result<String, S
         Error::new(
             ErrorCode::InternalError,
             "Failed to acquire lock on settings state".to_string(),
-        ).to_json()
+        )
+        .to_json()
     })?;
     settings_state
         .reset_settings()
-        .and_then(|updated| {
-            to_string(&updated).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        })
+        .and_then(|updated| to_string(&updated).map_err(io::Error::other))
         .map_err(|e| {
             Error::new(
                 ErrorCode::InternalError,
-                format!("Failed to reset settings: {}", e),
+                format!("Failed to reset settings: {e}"),
             )
             .to_json()
         })
@@ -281,9 +285,24 @@ mod tests_settings_commands {
     #[test]
     fn test_get_settings_as_json_contains_default() {
         let (state, _temp_dir) = create_test_settings_state();
-        let json = get_settings_as_json_impl(state);
+        let json = get_settings_as_json_impl(state).expect("get_settings_as_json should succeed");
         assert!(json.contains("\"darkmode\":false"));
         assert!(json.contains("\"logging_level\":\"Full\""));
+    }
+
+    #[test]
+    fn test_get_settings_as_json_poisoned_mutex_returns_err() {
+        let (state, _temp_dir) = create_test_settings_state();
+        let state_clone = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state_clone.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+
+        let err =
+            get_settings_as_json_impl(state).expect_err("Poisoned settings mutex must return Err");
+        assert!(err.contains("InternalError"));
     }
 
     #[test]
@@ -319,6 +338,19 @@ mod tests_settings_commands {
     }
 
     #[test]
+    fn test_update_settings_field_rejects_abs_file_path_buf() {
+        let (state, temp_dir) = create_test_settings_state();
+        let target = temp_dir.path().join("other.json");
+        let result = update_settings_field_impl(
+            state.clone(),
+            "abs_file_path_buf".to_string(),
+            json!(target.to_string_lossy()),
+        );
+        assert!(result.is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn test_update_multiple_settings_success() {
         let (state, _temp_dir) = create_test_settings_state();
 
@@ -341,32 +373,42 @@ mod tests_settings_commands {
         let (state, _temp_dir) = create_test_settings_state();
 
         let mut updates = serde_json::Map::new();
+        updates.insert("darkmode".to_string(), json!(true));
         updates.insert("nonexistent".to_string(), json!("oops"));
 
         let result = update_multiple_settings_impl(state.clone(), updates);
         assert!(result.is_err());
+
+        let darkmode = get_setting_field_impl(state.clone(), "darkmode".to_string()).unwrap();
+        assert_eq!(darkmode, json!(false));
     }
 
     #[test]
     fn test_reset_settings_command_success() {
-        // BUG-013 / BUG-073: SettingsState::reset_settings() currently resets abs_file_path_buf
-        // to constants::SETTINGS_CONFIG_ABS_PATH until Wave 1C preserves the path.
-        // Skip modifying user config outside TempDir unless EXPLR_DATA_DIR is set.
-        if std::env::var_os("EXPLR_DATA_DIR").is_none() {
-            eprintln!(
-                "Skipping test_reset_settings_command_success: EXPLR_DATA_DIR not set (protects real user config)"
-            );
-            return;
-        }
+        let (state, temp_dir) = create_test_settings_state();
+        let expected_path = temp_dir.path().join("settings.json");
 
-        let (state, _temp_dir) = create_test_settings_state();
-        let _updated_data =
-            update_settings_field_impl(state.clone(), "darkmode".to_string(), json!(true));
+        update_settings_field_impl(state.clone(), "darkmode".to_string(), json!(true))
+            .expect("Initial update should succeed");
+        update_settings_field_impl(
+            state.clone(),
+            "case_sensitive_search".to_string(),
+            json!(true),
+        )
+        .expect("Search flag update should succeed");
 
         let result = reset_settings_impl(state.clone());
         assert!(result.is_ok());
 
         let darkmode = get_setting_field_impl(state.clone(), "darkmode".to_string()).unwrap();
         assert_eq!(darkmode, json!(false));
+
+        let case_sensitive =
+            get_setting_field_impl(state.clone(), "case_sensitive_search".to_string()).unwrap();
+        assert_eq!(case_sensitive, json!(false));
+
+        let file_path =
+            get_setting_field_impl(state.clone(), "abs_file_path_buf".to_string()).unwrap();
+        assert_eq!(file_path, json!(expected_path));
     }
 }

@@ -11,10 +11,10 @@
   },
   "app": {
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost; frame-src 'self' asset: http://asset.localhost data: blob; object-src 'self' asset: http://asset.localhost data: blob",
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost; frame-src 'self' asset: http://asset.localhost data: blob; object-src 'none'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["*/**"]
+        "scope": []
       }
     },
     "withGlobalTauri": false,

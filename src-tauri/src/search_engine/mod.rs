@@ -224,7 +224,10 @@ pub mod test_generate_test_data {
             "readme.md",
         ];
         for file_name in &seed_files {
-            std::fs::write(root.join(file_name), format!("seed content for {}", file_name))?;
+            std::fs::write(
+                root.join(file_name),
+                format!("seed content for {}", file_name),
+            )?;
         }
 
         let subdir_alpha = root.join("subdir_alpha");
@@ -257,13 +260,7 @@ pub mod test_generate_test_data {
         }
 
         if folders_per_level > 0 || files_per_folder > 0 {
-            generate_test_data_locked(
-                root,
-                folders_per_level,
-                files_per_folder,
-                max_depth,
-                false,
-            )?;
+            generate_test_data_locked(root, folders_per_level, files_per_folder, max_depth, false)?;
         }
 
         Ok(temp_dir)

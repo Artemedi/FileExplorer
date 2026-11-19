@@ -1,12 +1,10 @@
 use crate::constants;
+use crate::models::backend_settings::BackendSettings;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::File;
-use std::io;
-use std::io::{Error, Write};
-use std::path::PathBuf;
+use std::io::{self, Error};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use crate::models::backend_settings::BackendSettings;
 
 //In this file we should change everything to lowercase for the json -> first step is done in DefaultView
 /// File view mode for directories.
@@ -142,9 +140,8 @@ impl Default for Settings {
             enable_animations_and_transitions: true,
             enable_virtual_scroll_for_large_directories: false,
             enable_suggestions: true, //implement?
-            highlight_matches: true, // implement?
+            highlight_matches: true,  // implement?
             backend_settings: BackendSettings::default(),
-            
         }
     }
 }
@@ -155,13 +152,20 @@ impl Default for Settings {
 /// while ensuring thread safety through a mutex-protected shared state.
 pub struct SettingsState(pub Arc<Mutex<Settings>>);
 
+impl Default for SettingsState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SettingsState {
     /// Creates a new SettingsState instance.
     ///
     /// This method initializes settings by:
     /// 1. Checking if a settings file exists at the default path
     /// 2. If it exists, attempting to read settings from that file
-    /// 3. If reading fails or no file exists, creating default settings
+    /// 3. If reading/parsing fails, backing up the corrupt file as `<filename>.corrupt.bak`
+    ///    before writing default settings
     ///
     /// # Returns
     ///
@@ -173,12 +177,44 @@ impl SettingsState {
     /// let settings_state = SettingsState::new();
     /// ```
     pub fn new() -> Self {
-        let path = Settings::default().abs_file_path_buf.to_path_buf();
+        Self::load_or_init_with_path(constants::SETTINGS_CONFIG_ABS_PATH.to_path_buf())
+    }
+
+    /// Loads settings from `path` if present, backing up corrupt files before writing defaults.
+    pub(crate) fn load_or_init_with_path(path: PathBuf) -> Self {
+        let defaults = Settings {
+            abs_file_path_buf: path.clone(),
+            ..Settings::default()
+        };
 
         let settings = if path.exists() {
-            Self::read_settings_from_file(&path).unwrap_or_else(|_| Self::write_default_settings_to_file_and_save_in_state())
+            match Self::read_settings_from_file(&path) {
+                Ok(mut loaded) => {
+                    loaded.abs_file_path_buf = path;
+                    loaded
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Failed to read/parse settings file '{}': {}. Backing up before restoring defaults.",
+                        path.display(),
+                        err
+                    );
+                    if let Some(file_name) = path.file_name() {
+                        let backup_path = path
+                            .with_file_name(format!("{}.corrupt.bak", file_name.to_string_lossy()));
+                        if let Err(backup_err) = std::fs::rename(&path, &backup_path) {
+                            eprintln!(
+                                "Failed to back up corrupt settings file to '{}': {}",
+                                backup_path.display(),
+                                backup_err
+                            );
+                        }
+                    }
+                    Self::write_settings_to_file_and_save_in_state(defaults)
+                }
+            }
         } else {
-            Self::write_default_settings_to_file_and_save_in_state()
+            Self::write_settings_to_file_and_save_in_state(defaults)
         };
         Self(Arc::new(Mutex::new(settings)))
     }
@@ -207,15 +243,12 @@ impl SettingsState {
     pub fn settings_to_json_map(
         settings: &Settings,
     ) -> Result<serde_json::Map<String, Value>, Error> {
-        let settings_value = serde_json::to_value(settings)
-            .map_err(|e| Error::new(io::ErrorKind::Other, e))?;
+        let settings_value = serde_json::to_value(settings).map_err(io::Error::other)?;
 
-        settings_value.as_object().cloned().ok_or_else(|| {
-            Error::new(
-                io::ErrorKind::InvalidData,
-                "Settings is not a JSON object",
-            )
-        })
+        settings_value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| Error::new(io::ErrorKind::InvalidData, "Settings is not a JSON object"))
     }
 
     /// Converts a JSON map back to a Settings struct.
@@ -240,9 +273,7 @@ impl SettingsState {
     /// let settings = json_map_to_settings(map)?;
     /// println!("Converted settings: {:?}", settings);
     /// ```
-    pub fn json_map_to_settings(
-        map: serde_json::Map<String, Value>,
-    ) -> Result<Settings, Error> {
+    pub fn json_map_to_settings(map: serde_json::Map<String, Value>) -> Result<Settings, Error> {
         serde_json::from_value(Value::Object(map))
             .map_err(|e| Error::new(io::ErrorKind::InvalidData, e))
     }
@@ -271,8 +302,12 @@ impl SettingsState {
     /// ```
     fn resolve_setting_key(key: &str) -> &str {
         match key {
-            "search_engine_enabled" => "backend_settings.search_engine_config.search_engine_enabled",
-            "case_sensitive_search" => "backend_settings.search_engine_config.case_sensitive_search",
+            "search_engine_enabled" => {
+                "backend_settings.search_engine_config.search_engine_enabled"
+            }
+            "case_sensitive_search" => {
+                "backend_settings.search_engine_config.case_sensitive_search"
+            }
             "index_hidden_files" => "backend_settings.search_engine_config.index_hidden_files",
             "fuzzy_search_enabled" => "backend_settings.search_engine_config.fuzzy_search_enabled",
             "default_checksum_hash" => "backend_settings.default_checksum_hash",
@@ -281,90 +316,121 @@ impl SettingsState {
         }
     }
 
-    pub fn update_setting_field(&self, key: &str, value: Value) -> Result<Settings, Error> {
-        let mut settings = self.0.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to acquire settings lock"))?;
+    fn is_protected_key(key: &str, resolved_key: &str) -> bool {
+        key == "abs_file_path_buf"
+            || resolved_key == "abs_file_path_buf"
+            || resolved_key.starts_with("abs_file_path_buf.")
+    }
 
-        let mut settings_map = Self::settings_to_json_map(&settings)?;
+    fn apply_setting_update(
+        settings_map: &mut serde_json::Map<String, Value>,
+        key: &str,
+        value: Value,
+    ) -> Result<(), Error> {
         let resolved_key = Self::resolve_setting_key(key);
+        if key.is_empty() || resolved_key.split('.').any(str::is_empty) {
+            return Err(Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unknown settings key: {key}"),
+            ));
+        }
+        if Self::is_protected_key(key, resolved_key) {
+            return Err(Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Cannot modify protected settings key: abs_file_path_buf",
+            ));
+        }
 
         // Handle nested fields with dot notation (e.g., "backend_settings.logging_config.logging_level")
         if resolved_key.contains('.') {
             let path: Vec<&str> = resolved_key.split('.').collect();
 
-            // Check if top-level key exists
             if !settings_map.contains_key(path[0]) {
                 return Err(Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Unknown settings key: {}", key),
+                    format!("Unknown settings key: {key}"),
                 ));
             }
 
-            let success = Self::update_nested_field(&mut settings_map, &path, value.clone())?;
-
-            if !success {
-                return Err(Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Failed to update nested field: {}", key),
-                ));
-            }
+            Self::update_nested_field(settings_map, &path, key, value)
+        } else if settings_map.contains_key(resolved_key) {
+            settings_map.insert(resolved_key.to_string(), value);
+            Ok(())
         } else {
-            // Update the top-level field
-            if settings_map.contains_key(resolved_key) {
-                settings_map.insert(resolved_key.to_string(), value);
-            } else {
-                return Err(Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Unknown settings key: {}", key),
-                ));
-            }
+            Err(Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unknown settings key: {key}"),
+            ))
+        }
+    }
+
+    fn apply_and_persist_updates<'a, I>(&self, updates: I) -> Result<Settings, Error>
+    where
+        I: IntoIterator<Item = (&'a str, Value)>,
+    {
+        let mut settings = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("Failed to acquire settings lock"))?;
+
+        let mut settings_map = Self::settings_to_json_map(&settings)?;
+        for (key, value) in updates {
+            Self::apply_setting_update(&mut settings_map, key, value)?;
         }
 
         let updated_settings = Self::json_map_to_settings(settings_map)?;
-        *settings = updated_settings.clone();
         self.write_settings_to_file(&updated_settings)?;
+        *settings = updated_settings.clone();
 
         Ok(updated_settings)
     }
 
-    /// Helper method to update a nested field in a JSON object using a path.
+    pub fn update_setting_field(&self, key: &str, value: Value) -> Result<Settings, Error> {
+        self.apply_and_persist_updates(std::iter::once((key, value)))
+    }
+
+    /// Helper method to update an existing nested field in a JSON object using a path.
     ///
-    /// # Arguments
-    ///
-    /// * `obj` - The JSON object to modify
-    /// * `path` - Vector of path segments (field names)
-    /// * `value` - The new value to set
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(bool)` - True if the update was successful
-    /// * `Err(Error)` - If the path is invalid
+    /// Rejects unknown leaf or intermediate keys instead of inserting new fields that
+    /// `serde` would silently ignore on deserialization.
     fn update_nested_field(
         obj: &mut serde_json::Map<String, Value>,
         path: &[&str],
+        full_key: &str,
         value: Value,
-    ) -> Result<bool, Error> {
+    ) -> Result<(), Error> {
         if path.is_empty() {
-            return Ok(false);
+            return Err(Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unknown settings key: {full_key}"),
+            ));
         }
 
-        if path.len() == 1 {
-            // Base case: directly update the field
-            obj.insert(path[0].to_string(), value);
-            return Ok(true);
-        }
-
-        // Recursive case: traverse the path
         let field = path[0];
-
-        if let Some(Value::Object(nested_obj)) = obj.get_mut(field) {
-            let sub_path = &path[1..];
-            return Self::update_nested_field(nested_obj, sub_path, value);
+        if path.len() == 1 {
+            if obj.contains_key(field) {
+                obj.insert(field.to_string(), value);
+                return Ok(());
+            }
+            return Err(Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unknown settings key: {full_key}"),
+            ));
         }
 
-        Err(Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid nested path at: {}", field),
-        ))
+        match obj.get_mut(field) {
+            Some(Value::Object(nested_obj)) => {
+                Self::update_nested_field(nested_obj, &path[1..], full_key, value)
+            }
+            Some(_) => Err(Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid nested path at: {field}"),
+            )),
+            None => Err(Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unknown settings key: {full_key}"),
+            )),
+        }
     }
 
     /// Retrieves the value of a specific setting field.
@@ -388,9 +454,11 @@ impl SettingsState {
     /// println!("Current theme: {}", theme);
     /// ```
     pub fn get_setting_field(&self, key: &str) -> Result<Value, Error> {
-        let settings = self.0.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to acquire settings lock"))?;
-        let settings_value =
-            serde_json::to_value(&*settings).map_err(|e| Error::new(io::ErrorKind::Other, e))?;
+        let settings = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("Failed to acquire settings lock"))?;
+        let settings_value = serde_json::to_value(&*settings).map_err(io::Error::other)?;
 
         if let Some(obj) = settings_value.as_object() {
             let resolved_key = Self::resolve_setting_key(key);
@@ -405,7 +473,7 @@ impl SettingsState {
             obj.get(resolved_key).cloned().ok_or_else(|| {
                 Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Unknown settings key: {}", key),
+                    format!("Unknown settings key: {key}"),
                 )
             })
         } else {
@@ -452,7 +520,7 @@ impl SettingsState {
             } else {
                 return Err(Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Cannot traverse into non-object field: {}", field),
+                    format!("Cannot traverse into non-object field: {field}"),
                 ));
             }
         }
@@ -463,215 +531,75 @@ impl SettingsState {
         ))
     }
 
-    /// Updates multiple settings fields at once.
+    /// Updates multiple settings fields atomically (all-or-nothing).
     ///
-    /// This method applies a batch of updates to the settings in a single operation,
-    /// writing the updated settings to file.
-    ///
-    /// # Arguments
-    ///
-    /// * `&self` - Reference to the settings state.
-    /// * `updates` - A map of setting keys to their new values.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Settings)` - The final updated Settings struct if successful.
-    /// * `Err(io::Error)` - If any key doesn't exist, no updates were provided, or there's an error saving the settings.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let mut updates = serde_json::Map::new();
-    /// updates.insert("theme".to_string(), json!("dark"));
-    /// updates.insert("notifications".to_string(), json!(true));
-    ///
-    /// let result = settings_state.update_multiple_settings(&updates)?;
-    /// println!("Updated settings: {:?}", result);
-    /// ```
+    /// Validates and applies all updates to a working copy first, then writes
+    /// the updated settings to disk once before committing in-memory state.
     pub fn update_multiple_settings(
         &self,
         updates: &serde_json::Map<String, Value>,
     ) -> Result<Settings, Error> {
-        let mut last_updated_settings = None;
-
-        for (key, value) in updates {
-            // We reuse the existing function here
-            let updated = self.update_setting_field(key, value.clone())?;
-            last_updated_settings = Some(updated);
+        if updates.is_empty() {
+            return Err(Error::new(
+                io::ErrorKind::InvalidInput,
+                "No settings were provided",
+            ));
         }
 
-        // Return the last successful update
-        last_updated_settings
-            .ok_or_else(|| Error::new(io::ErrorKind::InvalidInput, "No settings were provided"))
+        self.apply_and_persist_updates(updates.iter().map(|(k, v)| (k.as_str(), v.clone())))
     }
 
-    /// Resets all settings to their default values.
-    ///
-    /// This method replaces the current settings with the default values
-    /// and writes these defaults to the settings file.
-    ///
-    /// # Arguments
-    ///
-    /// * `&self` - Reference to the settings state.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Settings)` - The default Settings struct if successful.
-    /// * `Err(io::Error)` - If there was an error during the reset process.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let result = settings_state.reset_settings();
-    /// match result {
-    ///     Ok(settings) => println!("Settings have been reset to defaults."),
-    ///     Err(e) => eprintln!("Failed to reset settings: {}", e),
-    /// }
-    /// ```
+    /// Resets all settings to their default values while preserving the settings file path.
     pub fn reset_settings(&self) -> Result<Settings, Error> {
-        let mut settings = self.0.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to acquire settings lock"))?;
+        let mut settings = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("Failed to acquire settings lock"))?;
 
-        let default_settings = Settings::default();
-        *settings = default_settings.clone();
+        let default_settings = Settings {
+            abs_file_path_buf: settings.abs_file_path_buf.clone(),
+            ..Settings::default()
+        };
         self.write_settings_to_file(&default_settings)?;
+        *settings = default_settings.clone();
 
         Ok(default_settings)
     }
 
     /// Creates a new SettingsState with a custom path for testing purposes.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - The file path where settings will be stored.
-    ///
-    /// # Returns
-    ///
-    /// A new SettingsState instance configured with the specified path.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let test_path = PathBuf::from("test_settings.json");
-    /// let settings_state = SettingsState::new_with_path(test_path);
-    /// ```
-    // For testing - allows creating a SettingsState with a custom path
     #[cfg(test)]
     pub fn new_with_path(path: PathBuf) -> Self {
-        let mut defaults = Settings::default();
-        defaults.abs_file_path_buf = path;
+        let defaults = Settings {
+            abs_file_path_buf: path,
+            ..Settings::default()
+        };
         Self(Arc::new(Mutex::new(
             Self::write_settings_to_file_and_save_in_state(defaults),
         )))
     }
 
-    /// Writes the current settings to the configured file path.
-    ///
-    /// This method serializes the settings to JSON and saves them to disk.
-    ///
-    /// # Arguments
-    ///
-    /// * `&self` - Reference to the settings state.
-    /// * `settings` - A reference to the Settings struct to be saved.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` - If the settings were successfully written to file.
-    /// * `Err(io::Error)` - If there was an error creating directories, opening the file, or writing to it.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let settings = Settings::default();
-    /// settings_state.write_settings_to_file(&settings)?;
-    /// ```
+    /// Writes the current settings atomically to the configured file path.
     fn write_settings_to_file(&self, settings: &Settings) -> io::Result<()> {
         let user_config_file_path = &settings.abs_file_path_buf;
-        let serialized = serde_json::to_string_pretty(&settings)
-            .map_err(|e| Error::new(io::ErrorKind::Other, e))?;
+        let serialized = serde_json::to_string_pretty(&settings).map_err(io::Error::other)?;
 
-        // Makes sure the parent directory exists
-        if let Some(parent) = user_config_file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Write to the file
-        let mut file = File::create(user_config_file_path)?;
-        file.write_all(serialized.as_bytes())?;
-        Ok(())
-    }
-
-    /// Creates a default settings instance and writes it to file.
-    ///
-    /// This method initializes a new Settings with default values and saves it to disk.
-    ///
-    /// # Returns
-    ///
-    /// The created Settings instance with default values.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let default_settings = SettingsState::write_default_settings_to_file_and_save_in_state();
-    /// ```
-    fn write_default_settings_to_file_and_save_in_state() -> Settings {
-        let defaults = Settings::default();
-        Self::write_settings_to_file_and_save_in_state(defaults)
+        crate::state::atomic_write_file(user_config_file_path, serialized.as_bytes())
     }
 
     /// Helper method to write settings to a file and return the settings instance.
-    ///
-    /// This method creates a settings state with the provided defaults, writes them to file,
-    /// and returns the settings instance.
-    ///
-    /// # Arguments
-    ///
-    /// * `defaults` - The Settings instance to be written to file.
-    ///
-    /// # Returns
-    ///
-    /// The provided Settings instance.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let settings = Settings::default();
-    /// let saved_settings = SettingsState::write_settings_to_file_and_save_in_state(settings);
-    /// ```
     fn write_settings_to_file_and_save_in_state(defaults: Settings) -> Settings {
         let settings_state = Self(Arc::new(Mutex::new(defaults.clone())));
 
         if let Err(e) = settings_state.write_settings_to_file(&defaults) {
-            eprintln!("Error writing settings to file: {}", e);
+            eprintln!("Error writing settings to file: {e}");
         }
 
         defaults
     }
 
     /// Reads settings from a file path.
-    ///
-    /// This method loads and deserializes Settings from a JSON file.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - The file path from which to read the settings.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Settings)` - The deserialized Settings struct if successful.
-    /// * `Err(io::Error)` - If there was an error reading or parsing the file.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let test_path = PathBuf::from("test_settings.json");
-    /// let settings = SettingsState::read_settings_from_file(&test_path)?;
-    /// println!("Read settings: {:?}", settings);
-    /// ```
-    pub fn read_settings_from_file(path: &PathBuf) -> io::Result<Settings> {
-        use std::io::Read;
-        let mut file = File::open(path)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
+    pub fn read_settings_from_file(path: &Path) -> io::Result<Settings> {
+        let contents = std::fs::read_to_string(path)?;
         serde_json::from_str(&contents).map_err(|e| Error::new(io::ErrorKind::InvalidData, e))
     }
 }
@@ -679,10 +607,10 @@ impl SettingsState {
 #[cfg(test)]
 mod tests_settings {
     use super::*;
+    use crate::commands::hash_commands::ChecksumMethod;
+    use crate::models::LoggingLevel;
     use serde_json::{json, Map, Value};
     use tempfile::tempdir;
-    use crate::models::LoggingLevel;
-    use crate::commands::hash_commands::ChecksumMethod;
 
     /// Tests that the default settings have the expected initial values.
     ///
@@ -691,13 +619,37 @@ mod tests_settings {
     #[test]
     fn test_default_settings() {
         let settings = Settings::default();
-        assert_eq!(settings.darkmode, false);
+        assert!(!settings.darkmode);
         //assert_eq!(settings.custom_themes, vec![]);
         assert_eq!(settings.default_theme, "".to_string());
         //assert_eq!(settings.default_themes_path, Default::default());
         //assert_eq!(settings.default_folder_path_on_opening, Default::default());
-        assert_eq!(settings.backend_settings.default_checksum_hash, ChecksumMethod::SHA256);
-        assert_eq!(settings.backend_settings.logging_config.logging_level, LoggingLevel::Full);
+        assert_eq!(
+            settings.backend_settings.default_checksum_hash,
+            ChecksumMethod::SHA256
+        );
+        assert_eq!(
+            settings.backend_settings.logging_config.logging_level,
+            LoggingLevel::Full
+        );
+        assert!(
+            !settings
+                .backend_settings
+                .search_engine_config
+                .case_sensitive_search
+        );
+        assert!(
+            !settings
+                .backend_settings
+                .search_engine_config
+                .index_hidden_files
+        );
+        assert!(
+            settings
+                .backend_settings
+                .search_engine_config
+                .fuzzy_search_enabled
+        );
         assert_eq!(
             settings.abs_file_path_buf,
             constants::SETTINGS_CONFIG_ABS_PATH.to_path_buf()
@@ -731,7 +683,7 @@ mod tests_settings {
         assert!(read_result.is_ok(), "Should be able to read settings file");
 
         let settings = read_result.unwrap();
-        assert_eq!(settings.darkmode, false);
+        assert!(!settings.darkmode);
         assert_eq!(settings.default_theme, "".to_string());
         //assert_eq!(settings.default_themes_path, Default::default());
         //assert_eq!(settings.default_folder_path_on_opening, Default::default());
@@ -764,7 +716,7 @@ mod tests_settings {
         );
 
         let loaded_settings = loaded.unwrap();
-        assert_eq!(loaded_settings.darkmode, true);
+        assert!(loaded_settings.darkmode);
         assert_eq!(loaded_settings.default_theme, "solarized");
     }
 
@@ -780,11 +732,13 @@ mod tests_settings {
         let temp_dir = tempdir().expect("Failed to create temporary directory");
         let test_path = temp_dir.path().join("settings.json");
 
-        // Create a custom metadata object
-        let mut settings = Settings::default();
-        settings.abs_file_path_buf = test_path.clone();
+        // Create a custom settings object
+        let mut settings = Settings {
+            abs_file_path_buf: test_path.clone(),
+            default_folder_path_on_opening: PathBuf::from("temp_dir"),
+            ..Settings::default()
+        };
         settings.backend_settings.logging_config.logging_level = LoggingLevel::Partial;
-        settings.default_folder_path_on_opening = PathBuf::from("temp_dir");
 
         // Create a MetaDataState and write the custom metadata
         // Construct a MetaDataState with the custom metadata (is the struct from above)
@@ -821,7 +775,7 @@ mod tests_settings {
 
         let result = state.update_setting_field("darkmode", json!(true));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().darkmode, true);
+        assert!(result.unwrap().darkmode);
     }
 
     /// Tests updating the default_theme setting field.
@@ -847,9 +801,13 @@ mod tests_settings {
     fn test_update_default_checksum_hash_field() {
         let (state, _temp_dir) = create_test_settings_state();
 
-        let result = state.update_setting_field("backend_settings.default_checksum_hash", json!("MD5"));
+        let result =
+            state.update_setting_field("backend_settings.default_checksum_hash", json!("MD5"));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().backend_settings.default_checksum_hash, ChecksumMethod::MD5);
+        assert_eq!(
+            result.unwrap().backend_settings.default_checksum_hash,
+            ChecksumMethod::MD5
+        );
     }
 
     /// Tests updating the custom_themes setting field.
@@ -899,9 +857,19 @@ mod tests_settings {
     fn test_update_logging_level_field() {
         let (state, _temp_dir) = create_test_settings_state();
 
-        let result = state.update_setting_field("backend_settings.logging_config.logging_level", json!("Minimal"));
+        let result = state.update_setting_field(
+            "backend_settings.logging_config.logging_level",
+            json!("Minimal"),
+        );
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().backend_settings.logging_config.logging_level, LoggingLevel::Minimal);
+        assert_eq!(
+            result
+                .unwrap()
+                .backend_settings
+                .logging_config
+                .logging_level,
+            LoggingLevel::Minimal
+        );
     }
 
     /// Tests error handling when attempting to update a non-existent key.
@@ -1008,7 +976,7 @@ mod tests_settings {
         assert!(result.is_ok());
 
         let updated = result.unwrap();
-        assert_eq!(updated.darkmode, true);
+        assert!(updated.darkmode);
         assert_eq!(updated.default_theme, "gruvbox");
     }
 
@@ -1037,14 +1005,14 @@ mod tests_settings {
     /// Verifies that:
     /// 1. When attempting to update multiple settings with both valid and invalid keys,
     ///    the operation fails with an error
-    /// 2. No partial updates are applied (all-or-nothing behavior)
+    /// 2. No partial updates are applied (all-or-nothing behavior) in memory or on disk
     /// 3. The error message identifies the specific invalid key
     #[test]
     fn test_update_with_mixed_valid_and_invalid_keys() {
-        let (settings_state, _temp_dir) = create_test_settings_state();
+        let (settings_state, temp_dir) = create_test_settings_state();
 
         let mut updates: Map<String, Value> = Map::new();
-        updates.insert("darkmode".into(), Value::Bool(false));
+        updates.insert("darkmode".into(), Value::Bool(true));
         updates.insert("unknown".into(), Value::String("oops".into()));
 
         let result = settings_state.update_multiple_settings(&updates);
@@ -1053,6 +1021,16 @@ mod tests_settings {
             .unwrap_err()
             .to_string()
             .contains("Unknown settings key: unknown"));
+
+        // Verify all-or-nothing rollback in memory and on disk
+        assert_eq!(
+            settings_state.get_setting_field("darkmode").unwrap(),
+            json!(false)
+        );
+        let on_disk =
+            SettingsState::read_settings_from_file(&temp_dir.path().join("settings.json"))
+                .expect("Should read settings from disk");
+        assert!(!on_disk.darkmode);
     }
 
     /// Tests error handling when updating with an empty updates map.
@@ -1078,9 +1056,10 @@ mod tests_settings {
     /// 2. The error message indicates the type mismatch
     #[test]
     fn test_update_with_invalid_value_type() {
-        let (settings_state, _temp_dir) = create_test_settings_state();
+        let (settings_state, temp_dir) = create_test_settings_state();
 
         let mut updates: Map<String, Value> = Map::new();
+        updates.insert("default_theme".into(), Value::String("changed".into()));
         updates.insert("darkmode".into(), Value::String("not_a_bool".into())); // darkmode expects bool
 
         let result = settings_state.update_multiple_settings(&updates);
@@ -1089,5 +1068,210 @@ mod tests_settings {
             .unwrap_err()
             .to_string()
             .contains("invalid type: string"));
+
+        // Verify default_theme was NOT partially applied
+        assert_eq!(
+            settings_state.get_setting_field("default_theme").unwrap(),
+            json!("")
+        );
+        let on_disk =
+            SettingsState::read_settings_from_file(&temp_dir.path().join("settings.json"))
+                .expect("Should read settings from disk");
+        assert_eq!(on_disk.default_theme, "");
+    }
+
+    /// TP-BE-06: Verify SearchEngineConfig boolean flags round-trip via flat keys and resolve_setting_key.
+    #[test]
+    fn test_search_engine_boolean_flags_roundtrip() {
+        let (settings_state, temp_dir) = create_test_settings_state();
+
+        assert_eq!(
+            settings_state
+                .get_setting_field("case_sensitive_search")
+                .unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            settings_state
+                .get_setting_field("index_hidden_files")
+                .unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            settings_state
+                .get_setting_field("fuzzy_search_enabled")
+                .unwrap(),
+            json!(true)
+        );
+
+        settings_state
+            .update_setting_field("case_sensitive_search", json!(true))
+            .expect("case_sensitive_search update should succeed");
+        settings_state
+            .update_setting_field("index_hidden_files", json!(true))
+            .expect("index_hidden_files update should succeed");
+        settings_state
+            .update_setting_field("fuzzy_search_enabled", json!(false))
+            .expect("fuzzy_search_enabled update should succeed");
+
+        assert_eq!(
+            settings_state
+                .get_setting_field("case_sensitive_search")
+                .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            settings_state
+                .get_setting_field("index_hidden_files")
+                .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            settings_state
+                .get_setting_field("fuzzy_search_enabled")
+                .unwrap(),
+            json!(false)
+        );
+
+        let reloaded =
+            SettingsState::read_settings_from_file(&temp_dir.path().join("settings.json"))
+                .expect("Should reload settings from disk");
+        assert!(
+            reloaded
+                .backend_settings
+                .search_engine_config
+                .case_sensitive_search
+        );
+        assert!(
+            reloaded
+                .backend_settings
+                .search_engine_config
+                .index_hidden_files
+        );
+        assert!(
+            !reloaded
+                .backend_settings
+                .search_engine_config
+                .fuzzy_search_enabled
+        );
+    }
+
+    /// TP-BE-06: Reject unknown nested keys explicitly instead of silently dropping them.
+    #[test]
+    fn test_update_nested_unknown_key_rejected() {
+        let (settings_state, _temp_dir) = create_test_settings_state();
+
+        let err1 = settings_state
+            .update_setting_field(
+                "backend_settings.search_engine_config.nonexistent_flag",
+                json!(true),
+            )
+            .expect_err("Unknown nested leaf key must be rejected");
+        assert!(err1.to_string().contains("Unknown settings key"));
+
+        let err2 = settings_state
+            .update_setting_field("backend_settings.nonexistent_section.field", json!(true))
+            .expect_err("Unknown nested object key must be rejected");
+        assert!(err2.to_string().contains("Unknown settings key"));
+    }
+
+    /// TP-SEC-05: Reject external mutation of abs_file_path_buf.
+    #[test]
+    fn test_update_rejects_abs_file_path_buf() {
+        let (settings_state, temp_dir) = create_test_settings_state();
+        let original_path = temp_dir.path().join("settings.json");
+        let redirected_path = temp_dir.path().join("hijacked_settings.json");
+
+        let single_res = settings_state.update_setting_field(
+            "abs_file_path_buf",
+            json!(redirected_path.to_string_lossy()),
+        );
+        assert!(
+            single_res.is_err(),
+            "Direct mutation of abs_file_path_buf must be rejected"
+        );
+        assert!(!redirected_path.exists());
+
+        let mut batch = Map::new();
+        batch.insert("darkmode".into(), json!(true));
+        batch.insert(
+            "abs_file_path_buf".into(),
+            json!(redirected_path.to_string_lossy()),
+        );
+        let batch_res = settings_state.update_multiple_settings(&batch);
+        assert!(
+            batch_res.is_err(),
+            "Batch mutation containing abs_file_path_buf must be rejected"
+        );
+        assert!(!redirected_path.exists());
+        assert_eq!(
+            settings_state.get_setting_field("darkmode").unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            settings_state.0.lock().unwrap().abs_file_path_buf,
+            original_path
+        );
+    }
+
+    /// TP-BE-06: reset_settings preserves the instance's abs_file_path_buf.
+    #[test]
+    fn test_reset_settings_preserves_abs_file_path_buf() {
+        let (settings_state, temp_dir) = create_test_settings_state();
+        let expected_path = temp_dir.path().join("settings.json");
+
+        settings_state
+            .update_setting_field("darkmode", json!(true))
+            .expect("Update should succeed");
+        settings_state
+            .update_setting_field("case_sensitive_search", json!(true))
+            .expect("Search flag update should succeed");
+
+        let reset = settings_state
+            .reset_settings()
+            .expect("reset_settings should succeed");
+        assert!(!reset.darkmode);
+        assert!(
+            !reset
+                .backend_settings
+                .search_engine_config
+                .case_sensitive_search
+        );
+        assert_eq!(reset.abs_file_path_buf, expected_path);
+
+        let on_disk = SettingsState::read_settings_from_file(&expected_path)
+            .expect("Should read reset settings from custom file");
+        assert!(!on_disk.darkmode);
+        assert_eq!(on_disk.abs_file_path_buf, expected_path);
+    }
+
+    /// TP-BE-06: Corrupt settings.json is backed up to settings.json.corrupt.bak before restoring defaults.
+    #[test]
+    fn test_corrupt_settings_backed_up_before_defaults() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let settings_path = temp_dir.path().join("settings.json");
+        let backup_path = temp_dir.path().join("settings.json.corrupt.bak");
+
+        let corrupt_payload = "{ \"darkmode\": \"corrupt_boolean\", broken json";
+        std::fs::write(&settings_path, corrupt_payload).expect("Should write corrupt file");
+
+        let state = SettingsState::load_or_init_with_path(settings_path.clone());
+        assert!(
+            backup_path.exists(),
+            "Corrupt settings file should be backed up to settings.json.corrupt.bak"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).unwrap(),
+            corrupt_payload
+        );
+
+        let recovered = state.0.lock().unwrap().clone();
+        assert!(!recovered.darkmode);
+        assert_eq!(recovered.abs_file_path_buf, settings_path);
+
+        let on_disk = SettingsState::read_settings_from_file(&settings_path)
+            .expect("New default settings file should be valid JSON");
+        assert!(!on_disk.darkmode);
+        assert_eq!(on_disk.abs_file_path_buf, settings_path);
     }
 }

@@ -1360,14 +1360,15 @@ pub struct EngineStats {
 #[cfg(test)]
 mod tests_search_core {
     use super::*;
-    use std::fs;
-    use std::thread::sleep;
     use crate::log_info;
     use crate::search_engine::test_generate_test_data::create_isolated_test_fixture;
+    use std::fs;
+    use std::thread::sleep;
 
     #[test]
     fn test_basic_search() {
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // Add some test paths
         engine.add_path("/home/user/documents/report.pdf");
@@ -1378,10 +1379,7 @@ mod tests_search_core {
         let results = engine.search("doc");
         assert!(!results.is_empty());
         assert!(results.iter().any(|(path, _)| path.contains("documents")));
-        log_info!(
-            "First search for 'doc' found {} results",
-            results.len()
-        );
+        log_info!("First search for 'doc' found {} results", results.len());
 
         // Test cache hit on repeat search
         let cached_results = engine.search("doc");
@@ -1394,7 +1392,8 @@ mod tests_search_core {
 
     #[test]
     fn test_fuzzy_search_fallback() {
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // Add some test paths
         engine.add_path("/home/user/documents/report.pdf");
@@ -1413,7 +1412,8 @@ mod tests_search_core {
 
     #[test]
     fn test_recency_and_frequency_ranking() {
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // Add some test paths
         engine.add_path("/path/a.txt");
@@ -1442,7 +1442,8 @@ mod tests_search_core {
 
     #[test]
     fn test_current_directory_context() {
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // Add paths in different directories
         engine.add_path("/home/user/docs/file1.txt");
@@ -1462,7 +1463,8 @@ mod tests_search_core {
 
     #[test]
     fn test_extension_preference() {
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // Add paths with different extensions
         engine.add_path("/docs/report.pdf");
@@ -1479,7 +1481,8 @@ mod tests_search_core {
 
     #[test]
     fn test_removal() {
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // Add paths
         engine.add_path("/path/file1.txt");
@@ -1525,7 +1528,8 @@ mod tests_search_core {
 
     #[test]
     fn test_stats() {
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // Add some paths
         for i in 0..5 {
@@ -1599,10 +1603,11 @@ mod tests_search_core {
 
     #[tokio::test]
     async fn test_add_paths_recursive() {
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
-        let temp_dir = create_isolated_test_fixture(2, 3, 2)
-            .expect("Failed to create isolated test fixture");
+        let temp_dir =
+            create_isolated_test_fixture(2, 3, 2).expect("Failed to create isolated test fixture");
         let root = temp_dir.path().to_string_lossy().to_string();
 
         engine.add_paths_recursive(&root, None).await;
@@ -1621,19 +1626,32 @@ mod tests_search_core {
         let temp_dir = create_temp_dir_structure();
         let temp_dir_str = temp_dir.to_str().unwrap();
 
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // Add paths recursively with exclusions
         let excluded_patterns = vec!["nested".to_string(), "file2".to_string()];
-        engine.add_paths_recursive(temp_dir_str, Some(&excluded_patterns)).await;
+        engine
+            .add_paths_recursive(temp_dir_str, Some(&excluded_patterns))
+            .await;
 
         // Test that excluded files are not indexed
         let nested_results = engine.search("nested_file.txt");
         log_info!("Nested results: {:?}", nested_results);
-        assert!(!nested_results.iter().any(|(path, _)| path.contains("nested")), "Should not find nested file");
+        assert!(
+            !nested_results
+                .iter()
+                .any(|(path, _)| path.contains("nested")),
+            "Should not find nested file"
+        );
 
         let file2_results = engine.search("file2.txt");
-        assert!(!file2_results.iter().any(|(path, _)| path.contains("file2.txt")), "Should not find file2");
+        assert!(
+            !file2_results
+                .iter()
+                .any(|(path, _)| path.contains("file2.txt")),
+            "Should not find file2"
+        );
 
         // Test that other files are still indexed
         let root_file_results = engine.search("root_file.txt");
@@ -1652,7 +1670,8 @@ mod tests_search_core {
         let temp_dir_str = temp_dir.to_str().unwrap();
         let subdir1_str = temp_dir.join("subdir1").to_str().unwrap().to_string();
 
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // First add all paths recursively
         engine.add_paths_recursive(temp_dir_str, None).await;
@@ -1729,7 +1748,8 @@ mod tests_search_core {
             fs::set_permissions(&restricted_dir, perms).expect("Failed to set permissions");
         }
 
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // Add paths recursively - should handle the permission error gracefully
         engine.add_paths_recursive(temp_dir_str, None).await;
@@ -1767,7 +1787,8 @@ mod tests_search_core {
 
     #[tokio::test]
     async fn test_add_and_remove_with_nonexistent_paths() {
-        let mut engine = SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 10, Duration::from_secs(300), RankingConfig::default());
 
         // Try to add a non-existent path recursively
         let nonexistent_path = "/path/that/does/not/exist";
@@ -1850,7 +1871,8 @@ mod tests_search_core {
         log_info!("Testing search core with real-world test data");
 
         // Create a new engine with reasonable parameters
-        let mut engine = SearchCore::new(100, 20, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 20, Duration::from_secs(300), RankingConfig::default());
 
         // Get real-world paths from isolated fixture
         let (_test_dir, paths) = collect_test_paths(Some(500));
@@ -1895,12 +1917,7 @@ mod tests_search_core {
 
                 // Log top results
                 for (i, (path, score)) in prefix_results.iter().take(3).enumerate() {
-                    log_info!(
-                        "  Result #{}: {} (score: {:.4})",
-                        i + 1,
-                        path,
-                        score
-                    );
+                    log_info!("  Result #{}: {} (score: {:.4})", i + 1, path, score);
                 }
             }
         }
@@ -1938,7 +1955,8 @@ mod tests_search_core {
             if !term_results.is_empty() {
                 log_info!(
                     "  First result: {} (score: {:.4})",
-                    term_results[0].0, term_results[0].1
+                    term_results[0].0,
+                    term_results[0].1
                 );
             }
         }
@@ -2027,17 +2045,15 @@ mod tests_search_core {
             if !freq_results.is_empty() {
                 log_info!(
                     "  Top result: {} (score: {:.4})",
-                    freq_results[0].0, freq_results[0].1
+                    freq_results[0].0,
+                    freq_results[0].1
                 );
 
                 // The most frequently used path should be ranked high
                 let frequent_path_pos = freq_results.iter().position(|(path, _)| path == &paths[0]);
 
                 if let Some(pos) = frequent_path_pos {
-                    log_info!(
-                        "  Most frequently used path is at position {}",
-                        pos
-                    );
+                    log_info!("  Most frequently used path is at position {}", pos);
                     // Should be in the top results
                     //assert!(pos < 4, "Frequently used path should be ranked high");
                 }
@@ -2048,7 +2064,8 @@ mod tests_search_core {
         let stats = engine.get_stats();
         log_info!(
             "Engine stats - Cache size: {}, Trie size: {}",
-            stats.cache_size, stats.trie_size
+            stats.cache_size,
+            stats.trie_size
         );
 
         assert!(
@@ -2082,7 +2099,8 @@ mod tests_search_core {
 
             log_info!(
                 "Cached search for '{}' took {:?}",
-                repeat_term, cache_elapsed
+                repeat_term,
+                cache_elapsed
             );
 
             // Cache hit should be very fast
@@ -2099,7 +2117,8 @@ mod tests_search_core {
         log_info!("Testing search core with all available test data paths");
 
         // Create a new engine with reasonable parameters
-        let mut engine = SearchCore::new(100, 20, Duration::from_secs(300), RankingConfig::default());
+        let mut engine =
+            SearchCore::new(100, 20, Duration::from_secs(300), RankingConfig::default());
 
         // Get ALL available test paths from isolated fixture
         let (_test_dir, paths) = collect_test_paths(None);
@@ -2286,9 +2305,10 @@ mod tests_search_core {
         let stats = engine.get_stats();
         log_info!(
             "Engine stats - Cache size: {}, Trie size: {}",
-            stats.cache_size, stats.trie_size
+            stats.cache_size,
+            stats.trie_size
         );
-        
+
         // TODO: Test is failing due to bug in the radix trie implementation, need to be fixed in future!!! Radix contains 85603 instead of 85605 entries
         //assert!(
         //    stats.trie_size >= paths.len(),
@@ -2306,16 +2326,14 @@ mod tests_search_core {
             }
             let removal_elapsed = removal_start.elapsed();
 
-            log_info!(
-                "Removed {} paths in {:?}",
-                to_remove, removal_elapsed
-            );
+            log_info!("Removed {} paths in {:?}", to_remove, removal_elapsed);
 
             // Check that engine stats reflect the removals
             let after_stats = engine.get_stats();
             log_info!(
                 "Engine stats after removal - Cache size: {}, Trie size: {}",
-                after_stats.cache_size, after_stats.trie_size
+                after_stats.cache_size,
+                after_stats.trie_size
             );
 
             assert!(
@@ -2505,7 +2523,8 @@ mod tests_search_core {
             let subset_size = batch_size.min(all_paths.len());
 
             // Create a fresh engine with only the needed paths
-            let mut subset_engine = SearchCore::new(1000, 20, Duration::from_secs(300), RankingConfig::default());
+            let mut subset_engine =
+                SearchCore::new(1000, 20, Duration::from_secs(300), RankingConfig::default());
             let start_insert_subset = Instant::now();
 
             for i in 0..subset_size {
@@ -2538,10 +2557,7 @@ mod tests_search_core {
                 .collect::<Vec<_>>();
             let subset_queries = extract_guaranteed_queries(&subset_paths, 15);
 
-            log_info!(
-                "Generated {} subset-specific queries",
-                subset_queries.len()
-            );
+            log_info!("Generated {} subset-specific queries", subset_queries.len());
 
             // Additional test: Set current directory context if possible
             if !subset_paths.is_empty() {
@@ -2593,8 +2609,8 @@ mod tests_search_core {
 
                 // Print top results for each search
                 //log_info!(
-                  //  "Results for '{}' (found {})",
-                  //  query,
+                //  "Results for '{}' (found {})",
+                //  query,
                 //    completions.len()
                 //);
                 //for (i, (path, score)) in completions.iter().take(3).enumerate() {
@@ -2636,17 +2652,15 @@ mod tests_search_core {
             log_info!("Ran {} searches", subset_queries.len());
             log_info!("Average search time: {:?}", avg_time);
             log_info!("Average results per search: {}", avg_results);
-            log_info!(
-                "Average fuzzy matches per search: {:.1}",
-                avg_fuzzy
-            );
+            log_info!("Average fuzzy matches per search: {:.1}", avg_fuzzy);
             log_info!("Cache hit rate: {:.1}%", cache_hit_rate);
 
             // Get engine stats
             let stats = subset_engine.get_stats();
             log_info!(
                 "Engine stats - Cache size: {}, Trie size: {}",
-                stats.cache_size, stats.trie_size
+                stats.cache_size,
+                stats.trie_size
             );
 
             // Sort searches by time and log
@@ -2695,7 +2709,9 @@ mod tests_search_core {
             for (count, avg_time, num_searches) in by_result_count {
                 log_info!(
                     "  ≥ {:3} results: {:?} (from {} searches)",
-                    count, avg_time, num_searches
+                    count,
+                    avg_time,
+                    num_searches
                 );
             }
 
@@ -2820,11 +2836,13 @@ mod tests_search_core {
                         if !cached_results.is_empty() && !uncached_results.is_empty() {
                             log_info!(
                                 "  Expected top result: '{}' (score: {:.3})",
-                                uncached_results[0].0, uncached_results[0].1
+                                uncached_results[0].0,
+                                uncached_results[0].1
                             );
                             log_info!(
                                 "  Actual cached result: '{}' (score: {:.3})",
-                                cached_results[0].0, cached_results[0].1
+                                cached_results[0].0,
+                                cached_results[0].1
                             );
                         }
                     } else {
@@ -2856,10 +2874,7 @@ mod tests_search_core {
 
                 // Output cache stats
                 let cache_stats = subset_engine.get_stats();
-                log_info!(
-                    "Cache size after tests: {}",
-                    cache_stats.cache_size
-                );
+                log_info!("Cache size after tests: {}", cache_stats.cache_size);
             }
         }
     }

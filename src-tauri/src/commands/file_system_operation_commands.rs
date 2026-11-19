@@ -1,15 +1,93 @@
 use crate::error_handling::{Error, ErrorCode};
 use crate::models::{
-    count_subdirectories, count_subfiles, format_system_time, get_access_permission_number,
-    get_access_permission_string, Entries,
+    format_system_time, get_access_permission_number, get_access_permission_string, Entries,
 };
 use crate::{log_error, models};
+use std::collections::HashSet;
 use std::fs;
 use std::fs::read_dir;
+use std::io::Read;
+#[cfg(test)]
 use std::io::Write;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use zip::write::FileOptions;
 use zip::ZipWriter;
+
+/// Maximum number of `name (n)` collision retries before returning an error.
+const MAX_UNIQUE_PATH_ATTEMPTS: u32 = 9999;
+
+/// Maximum number of entries permitted when extracting a zip archive.
+const MAX_UNZIP_ENTRIES: usize = 50_000;
+
+/// Maximum total uncompressed bytes permitted when extracting a zip archive (512 MiB).
+const MAX_UNZIP_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Runs a blocking filesystem closure on Tokio's blocking thread pool.
+async fn run_blocking<T, F>(job: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(job).await.map_err(|err| {
+        log_error!("Blocking filesystem task failed: {}", err);
+        Error::new(
+            ErrorCode::InternalError,
+            format!("Background filesystem task failed: {err}"),
+        )
+        .to_json()
+    })?
+}
+
+/// Validates that `name` is a single normal file or directory name with no path traversal,
+/// directory separators, root/prefix components, or control characters.
+fn validate_single_entry_name(name: &str) -> Result<(), Error> {
+    if name.trim().is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(Error::new(
+            ErrorCode::InvalidInput,
+            format!("Invalid file or directory name: '{name}'"),
+        ));
+    }
+
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(Error::new(
+            ErrorCode::InvalidInput,
+            format!("Invalid file or directory name: '{name}'"),
+        )),
+    }
+}
+
+/// Counts immediate files and subdirectories of `dir_path` in a single `read_dir` pass.
+fn count_subentries_single_pass(dir_path: &Path) -> (usize, usize) {
+    let mut file_count = 0;
+    let mut dir_count = 0;
+
+    if let Ok(entries) = fs::read_dir(dir_path) {
+        for entry in entries.filter_map(Result::ok) {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    dir_count += 1;
+                } else if ft.is_file() {
+                    file_count += 1;
+                } else if ft.is_symlink() {
+                    match fs::metadata(entry.path()) {
+                        Ok(md) if md.is_dir() => dir_count += 1,
+                        _ => file_count += 1,
+                    }
+                }
+            }
+        }
+    }
+
+    (file_count, dir_count)
+}
 
 /// Opens a file at the given path and returns its contents as a string.
 /// Should only be used for text files.
@@ -35,58 +113,64 @@ use zip::ZipWriter;
 #[allow(dead_code)] //remove once the command is used again
 #[tauri::command]
 pub async fn open_file(path: &str) -> Result<String, String> {
-    let path_obj = Path::new(path);
+    let path_owned = path.to_string();
+    run_blocking(move || {
+        let path_obj = Path::new(&path_owned);
 
-    // Check if path exists
-    if !path_obj.exists() {
-        log_error!("File does not exist: {}", path);
-        return Err(Error::new(
-            ErrorCode::ResourceNotFound,
-            format!("File does not exist: {}", path),
-        )
-        .to_json());
-    }
+        if !path_obj.exists() {
+            log_error!("File does not exist: {}", path_owned);
+            return Err(Error::new(
+                ErrorCode::ResourceNotFound,
+                format!("File does not exist: {path_owned}"),
+            )
+            .to_json());
+        }
 
-    // Check if path is a file
-    if !path_obj.is_file() {
-        log_error!("Path is not a file: {}", path);
-        return Err(Error::new(
-            ErrorCode::InvalidInput,
-            format!("Path is not a file: {}", path),
-        )
-        .to_json());
-    }
+        if !path_obj.is_file() {
+            log_error!("Path is not a file: {}", path_owned);
+            return Err(Error::new(
+                ErrorCode::InvalidInput,
+                format!("Path is not a file: {path_owned}"),
+            )
+            .to_json());
+        }
 
-    // Read the file
-    //fs::read_to_string(path).map_err(|err| format!("Failed to read file: {}", err))
-    fs::read_to_string(path).map_err(|err| {
-        log_error!("Failed to open file: {}", err);
-        Error::new(
-            ErrorCode::InternalError,
-            format!("Failed to read file: {}", err),
-        )
-        .to_json()
+        fs::read_to_string(&path_owned).map_err(|err| {
+            log_error!("Failed to open file: {}", err);
+            Error::new(
+                ErrorCode::InternalError,
+                format!("Failed to read file: {err}"),
+            )
+            .to_json()
+        })
     })
+    .await
 }
 
 #[tauri::command]
 pub async fn open_in_default_app(path: &str) -> Result<(), String> {
-    let path_obj = Path::new(path);
+    let path_owned = path.to_string();
+    run_blocking(move || {
+        let path_obj = Path::new(&path_owned);
 
-    // Check if path exists
-    if !path_obj.exists() {
-        log_error!("File does not exist: {}", path);
-        return Err(format!("File does not exist: {}", path));
-    }
+        if !path_obj.exists() {
+            log_error!("File does not exist: {}", path_owned);
+            return Err(Error::new(
+                ErrorCode::ResourceNotFound,
+                format!("File does not exist: {path_owned}"),
+            )
+            .to_json());
+        }
 
-    // Open the file in the default application
-    open::that(path).map_err(|err| {
-        Error::new(
-            ErrorCode::InternalError,
-            format!("Failed to open file in default app: {}", err),
-        )
-        .to_json()
+        open::that(&path_owned).map_err(|err| {
+            Error::new(
+                ErrorCode::InternalError,
+                format!("Failed to open file in default app: {err}"),
+            )
+            .to_json()
+        })
     })
+    .await
 }
 
 /// Opens a directory at the given path and returns its contents as a json string.
@@ -115,24 +199,26 @@ pub async fn open_in_default_app(path: &str) -> Result<(), String> {
 /// ```
 #[tauri::command]
 pub async fn open_directory(path: String) -> Result<String, String> {
-    let path_obj = Path::new(&path);
+    run_blocking(move || open_directory_sync(&path)).await
+}
 
-    // Check if path exists
+fn open_directory_sync(path: &str) -> Result<String, String> {
+    let path_obj = Path::new(path);
+
     if !path_obj.exists() {
         log_error!("Directory does not exist: {}", path);
         return Err(Error::new(
             ErrorCode::ResourceNotFound,
-            format!("Directory does not exist: {}", path),
+            format!("Directory does not exist: {path}"),
         )
         .to_json());
     }
 
-    // Check if path is a directory
     if !path_obj.is_dir() {
         log_error!("Path is not a directory: {}", path);
         return Err(Error::new(
             ErrorCode::InvalidInput,
-            format!("Path is not a directory: {}", path),
+            format!("Path is not a directory: {path}"),
         )
         .to_json());
     }
@@ -144,7 +230,7 @@ pub async fn open_directory(path: String) -> Result<String, String> {
         log_error!("Failed to read directory: {}", err);
         Error::new(
             ErrorCode::InternalError,
-            format!("Failed to read directory: {}", err),
+            format!("Failed to read directory: {err}"),
         )
         .to_json()
     })? {
@@ -165,45 +251,67 @@ pub async fn open_directory(path: String) -> Result<String, String> {
         };
 
         let path_of_entry = entry.path();
-        let metadata = match entry.metadata() {
-            Ok(md) => md,
-            Err(err) => {
-                log_error!("Skipping entry with unreadable metadata ({}): {}", path_of_entry.display(), err);
-                continue;
+        let is_symlink = file_type.is_symlink();
+
+        let (is_dir, is_file, metadata) = if is_symlink {
+            match fs::metadata(&path_of_entry) {
+                Ok(target_md) => (target_md.is_dir(), !target_md.is_dir(), target_md),
+                Err(_) => match fs::symlink_metadata(&path_of_entry) {
+                    // Broken symlink: surface it in the UI as a file entry with `is_symlink: true`
+                    Ok(link_md) => (false, true, link_md),
+                    Err(err) => {
+                        log_error!(
+                            "Skipping symlink entry with unreadable metadata ({}): {}",
+                            path_of_entry.display(),
+                            err
+                        );
+                        continue;
+                    }
+                },
+            }
+        } else {
+            match entry.metadata() {
+                Ok(md) => (file_type.is_dir(), file_type.is_file(), md),
+                Err(err) => {
+                    log_error!(
+                        "Skipping entry with unreadable metadata ({}): {}",
+                        path_of_entry.display(),
+                        err
+                    );
+                    continue;
+                }
             }
         };
 
-        if file_type.is_dir() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let entry_path_str = path_of_entry.to_string_lossy().into_owned();
+
+        if is_dir {
+            let (sub_file_count, sub_dir_count) = count_subentries_single_pass(&path_of_entry);
             directories.push(models::Directory {
-                name: entry.file_name().to_str().unwrap_or("[invalid name]").to_string(),
-                path: path_of_entry.to_str().unwrap_or("[invalid path]").to_string(),
-                is_symlink: path_of_entry.is_symlink(),
+                name,
+                path: entry_path_str,
+                is_symlink,
                 access_rights_as_string: get_access_permission_string(metadata.permissions(), true),
                 access_rights_as_number: get_access_permission_number(metadata.permissions(), true),
                 size_in_bytes: 0,
-                sub_file_count: path_of_entry.to_str().map(count_subfiles).unwrap_or(0),
-                sub_dir_count: path_of_entry.to_str().map(count_subdirectories).unwrap_or(0),
+                sub_file_count,
+                sub_dir_count,
                 created: metadata
                     .created()
-                    .map_or("1970-01-01 00:00:00".to_string(), |time| {
-                        format_system_time(time)
-                    }),
+                    .map_or_else(|_| "1970-01-01 00:00:00".to_string(), format_system_time),
                 last_modified: metadata
                     .modified()
-                    .map_or("1970-01-01 00:00:00".to_string(), |time| {
-                        format_system_time(time)
-                    }),
+                    .map_or_else(|_| "1970-01-01 00:00:00".to_string(), format_system_time),
                 accessed: metadata
                     .accessed()
-                    .map_or("1970-01-01 00:00:00".to_string(), |time| {
-                        format_system_time(time)
-                    }),
+                    .map_or_else(|_| "1970-01-01 00:00:00".to_string(), format_system_time),
             });
-        } else if file_type.is_file() {
+        } else if is_file {
             files.push(models::File {
-                name: entry.file_name().to_str().unwrap_or("[invalid name]").to_string(),
-                path: path_of_entry.to_str().unwrap_or("[invalid path]").to_string(),
-                is_symlink: path_of_entry.is_symlink(),
+                name,
+                path: entry_path_str,
+                is_symlink,
                 access_rights_as_string: get_access_permission_string(
                     metadata.permissions(),
                     false,
@@ -215,35 +323,27 @@ pub async fn open_directory(path: String) -> Result<String, String> {
                 size_in_bytes: metadata.len(),
                 created: metadata
                     .created()
-                    .map_or("1970-01-01 00:00:00".to_string(), |time| {
-                        format_system_time(time)
-                    }),
+                    .map_or_else(|_| "1970-01-01 00:00:00".to_string(), format_system_time),
                 last_modified: metadata
                     .modified()
-                    .map_or("1970-01-01 00:00:00".to_string(), |time| {
-                        format_system_time(time)
-                    }),
+                    .map_or_else(|_| "1970-01-01 00:00:00".to_string(), format_system_time),
                 accessed: metadata
                     .accessed()
-                    .map_or("1970-01-01 00:00:00".to_string(), |time| {
-                        format_system_time(time)
-                    }),
+                    .map_or_else(|_| "1970-01-01 00:00:00".to_string(), format_system_time),
             });
         }
     }
 
     let entries = Entries { directories, files };
 
-    // Convert the Entries struct to a JSON string
-    let json = serde_json::to_string(&entries).map_err(|err| {
+    serde_json::to_string(&entries).map_err(|err| {
         log_error!("Failed to serialize entries: {}", err);
         Error::new(
             ErrorCode::InternalError,
-            format!("Failed to serialize entries: {}", err),
+            format!("Failed to serialize entries: {err}"),
         )
         .to_json()
-    })?;
-    Ok(json)
+    })
 }
 
 /// Creates a file at the given absolute path. Returns a string if there was an error.
@@ -266,14 +366,12 @@ pub async fn open_directory(path: String) -> Result<String, String> {
 /// ```
 #[tauri::command]
 pub async fn create_file(folder_path_abs: &str, file_name: &str) -> Result<(), String> {
-    // Check if the folder path exists and is valid
     let path = Path::new(folder_path_abs);
     if !path.exists() {
         log_error!("Directory does not exist: {}", folder_path_abs);
-        // Check if the folder path exists
         return Err(Error::new(
             ErrorCode::ResourceNotFound,
-            format!("Directory does not exist: {}", folder_path_abs),
+            format!("Directory does not exist: {folder_path_abs}"),
         )
         .to_json());
     }
@@ -281,16 +379,24 @@ pub async fn create_file(folder_path_abs: &str, file_name: &str) -> Result<(), S
         log_error!("Path is no directory: {}", folder_path_abs);
         return Err(Error::new(
             ErrorCode::InvalidInput,
-            format!("Path is no directory: {}", folder_path_abs),
+            format!("Path is no directory: {folder_path_abs}"),
         )
         .to_json());
     }
 
-    // Concatenate the folder path and filename
+    if let Err(err) = validate_single_entry_name(file_name) {
+        log_error!("Invalid file name '{}': {}", file_name, err.custom_message);
+        return Err(err.to_json());
+    }
+
     let file_path = path.join(file_name);
 
     // Create the file without overwriting existing files
-    match fs::OpenOptions::new().write(true).create_new(true).open(&file_path) {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file_path)
+    {
         Ok(_) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             log_error!("File already exists: {}", file_path.display());
@@ -303,13 +409,14 @@ pub async fn create_file(folder_path_abs: &str, file_name: &str) -> Result<(), S
         Err(err) => {
             log_error!(
                 "File could not be created: {} error: {}",
-                file_path.display(), err
+                file_path.display(),
+                err
             );
             Err(Error::new(
                 ErrorCode::InternalError,
                 format!(
-                    "File could not be created: {} error: {}",
-                    file_path.display(), err
+                    "File could not be created: {} error: {err}",
+                    file_path.display()
                 ),
             )
             .to_json())
@@ -337,30 +444,37 @@ pub async fn create_file(folder_path_abs: &str, file_name: &str) -> Result<(), S
 /// ```
 #[tauri::command]
 pub async fn create_directory(folder_path_abs: &str, folder_name: &str) -> Result<(), String> {
-    // Check if the folder path exists and is valid
     let parent_path = Path::new(folder_path_abs);
     if !parent_path.exists() {
         log_error!("Parent directory does not exist: {}", folder_path_abs);
         return Err(Error::new(
             ErrorCode::ResourceNotFound,
-            format!("Parent directory does not exist: {}", folder_path_abs),
+            format!("Parent directory does not exist: {folder_path_abs}"),
         )
         .to_json());
     }
 
     if !parent_path.is_dir() {
-        log_error!(format!("Path is no directory: {}", folder_path_abs).as_str());
+        log_error!("Path is no directory: {}", folder_path_abs);
         return Err(Error::new(
             ErrorCode::InvalidInput,
-            format!("Path is no directory: {}", folder_path_abs),
+            format!("Path is no directory: {folder_path_abs}"),
         )
         .to_json());
     }
 
-    // Concatenate the parent path and new directory name
+    if let Err(err) = validate_single_entry_name(folder_name) {
+        log_error!(
+            "Invalid directory name '{}': {}",
+            folder_name,
+            err.custom_message
+        );
+        return Err(err.to_json());
+    }
+
     let dir_path = parent_path.join(folder_name);
 
-    if dir_path.exists() {
+    if fs::symlink_metadata(&dir_path).is_ok() {
         log_error!("Directory already exists: {}", dir_path.display());
         return Err(Error::new(
             ErrorCode::ResourceAlreadyExists,
@@ -369,22 +483,84 @@ pub async fn create_directory(folder_path_abs: &str, folder_name: &str) -> Resul
         .to_json());
     }
 
-    // Create the directory
     match fs::create_dir(&dir_path) {
         Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            log_error!("Directory already exists: {}", dir_path.display());
+            Err(Error::new(
+                ErrorCode::ResourceAlreadyExists,
+                format!("Directory already exists: {}", dir_path.display()),
+            )
+            .to_json())
+        }
         Err(err) => {
             log_error!(
                 "Failed to create directory: {} err: {}",
-                dir_path.display(), err
+                dir_path.display(),
+                err
             );
             Err(Error::new(
                 ErrorCode::InternalError,
                 format!(
-                    "Failed to create directory: {} err: {}",
-                    dir_path.display(), err
+                    "Failed to create directory: {} err: {err}",
+                    dir_path.display()
                 ),
             )
             .to_json())
+        }
+    }
+}
+
+/// Checks if two path strings represent a case-only rename within the same directory
+/// (supporting non-ASCII Unicode like Cyrillic and mixed `/` vs `\` separators).
+fn names_differ_only_by_case(old_path: &Path, new_path: &Path) -> bool {
+    let old_norm = old_path.to_string_lossy().replace('\\', "/");
+    let new_norm = new_path.to_string_lossy().replace('\\', "/");
+    let old_trimmed = old_norm.trim_end_matches('/');
+    let new_trimmed = new_norm.trim_end_matches('/');
+
+    if old_trimmed == new_trimmed {
+        return false;
+    }
+
+    let (old_parent, old_name) = match old_trimmed.rsplit_once('/') {
+        Some((p, n)) => (p, n),
+        None => ("", old_trimmed),
+    };
+    let (new_parent, new_name) = match new_trimmed.rsplit_once('/') {
+        Some((p, n)) => (p, n),
+        None => ("", new_trimmed),
+    };
+
+    old_name != new_name
+        && old_name.to_lowercase() == new_name.to_lowercase()
+        && old_parent.to_lowercase() == new_parent.to_lowercase()
+}
+
+/// Determines whether `old_path` and `new_path` point to the exact same existing filesystem object
+/// undergoing a case-only rename on a case-insensitive filesystem.
+fn is_same_entry_case_only_rename(old_path: &Path, new_path: &Path) -> bool {
+    if !names_differ_only_by_case(old_path, new_path) {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(old_md), Ok(new_md)) = (
+            fs::symlink_metadata(old_path),
+            fs::symlink_metadata(new_path),
+        ) {
+            return old_md.dev() == new_md.dev() && old_md.ino() == new_md.ino();
+        }
+        false
+    }
+
+    #[cfg(not(unix))]
+    {
+        match (fs::canonicalize(old_path), fs::canonicalize(new_path)) {
+            (Ok(canon_old), Ok(canon_new)) => canon_old == canon_new,
+            _ => false,
         }
     }
 }
@@ -412,37 +588,35 @@ pub async fn rename(old_path: &str, new_path: &str) -> Result<(), String> {
     let old_path_obj = Path::new(old_path);
     let new_path_obj = Path::new(new_path);
 
-    // Check if the old path exists
-    if !old_path_obj.exists() {
+    // Use symlink_metadata so broken symlinks can also be renamed and are detected as existing
+    if fs::symlink_metadata(old_path_obj).is_err() {
         log_error!("File does not exist: {}", old_path);
         return Err(Error::new(
             ErrorCode::ResourceNotFound,
-            format!("File does not exist: {}", old_path),
+            format!("File does not exist: {old_path}"),
         )
         .to_json());
     }
 
-    // Check if the new path already exists (allow case-only rename on case-insensitive filesystems)
-    let is_case_only_rename = old_path.eq_ignore_ascii_case(new_path) && old_path != new_path;
-    if new_path_obj.exists() && !is_case_only_rename {
+    // Check if the new path already exists (including broken symlinks).
+    // Only allow when `old_path` and `new_path` resolve to the exact same file on a
+    // case-insensitive filesystem (never overwrite a distinct file on case-sensitive Linux).
+    if fs::symlink_metadata(new_path_obj).is_ok()
+        && !is_same_entry_case_only_rename(old_path_obj, new_path_obj)
+    {
         log_error!("New path already exists: {}", new_path);
         return Err(Error::new(
             ErrorCode::ResourceAlreadyExists,
-            format!("New path already exists: {}", new_path),
+            format!("New path already exists: {new_path}"),
         )
         .to_json());
     }
 
-    // Rename the file or directory
     match fs::rename(old_path, new_path) {
         Ok(_) => Ok(()),
         Err(err) => {
             log_error!("Failed to rename: {}", err);
-            Err(Error::new(
-                ErrorCode::InternalError,
-                format!("Failed to rename: {}", err),
-            )
-            .to_json())
+            Err(Error::new(ErrorCode::InternalError, format!("Failed to rename: {err}")).to_json())
         }
     }
 }
@@ -467,66 +641,99 @@ pub async fn rename(old_path: &str, new_path: &str) -> Result<(), String> {
 /// ```
 #[tauri::command]
 pub async fn move_to_trash(path: &str) -> Result<(), String> {
-    match trash::delete(path) {
+    let path_owned = path.to_string();
+    run_blocking(move || match trash::delete(&path_owned) {
         Ok(_) => Ok(()),
         Err(err) => {
             log_error!("Failed to move file or directory to trash: {}", err);
             Err(Error::new(
                 ErrorCode::InternalError,
-                format!("Failed to move file or directory to trash: {}", err),
+                format!("Failed to move file or directory to trash: {err}"),
             )
             .to_json())
         }
-    }
+    })
+    .await
 }
 
-/// Generates a unique destination path by appending a number if the path already exists.
-/// For example: "file.txt" -> "file (1).txt" -> "file (2).txt"
-/// For directories: "folder" -> "folder (1)" -> "folder (2)"
-fn generate_unique_path(original_path: &str) -> String {
-    let path = Path::new(original_path);
-    
-    if !path.exists() {
-        return original_path.to_string();
+/// Generates a unique destination path by appending ` (n)` if the path already exists.
+/// - For files (`is_dir == false`): `"file.txt"` -> `"file (1).txt"` -> `"file (2).txt"`
+/// - For directories (`is_dir == true`): `"a.b"` -> `"a.b (1)"` -> `"a.b (2)"`
+///
+/// Returns `Err(Error)` if no free candidate is found within `max_attempts`.
+fn generate_unique_path_with_limit(
+    original_path: &Path,
+    is_dir: bool,
+    max_attempts: u32,
+) -> Result<PathBuf, Error> {
+    if fs::symlink_metadata(original_path).is_err() {
+        return Ok(original_path.to_path_buf());
     }
-    
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_else(|| "[invalid_name]".into());
-    
-    // Check if it's a file with extension or a directory
-    if let Some(extension) = path.extension() {
-        // It's a file with extension
-        let stem = path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_else(|| "[invalid_stem]".into());
-        let ext = extension.to_string_lossy();
-        
-        for i in 1..=9999 {
-            let new_name = format!("{} ({}).{}", stem, i, ext);
-            let new_path = parent.join(&new_name);
-            
-            if !new_path.exists() {
-                return new_path.to_string_lossy().to_string();
+
+    let parent = original_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = original_path
+        .file_name()
+        .ok_or_else(|| Error::invalid_input("Invalid destination path"))?
+        .to_string_lossy();
+
+    if !is_dir {
+        if let (Some(stem), Some(extension)) =
+            (original_path.file_stem(), original_path.extension())
+        {
+            let stem_str = stem.to_string_lossy();
+            let ext_str = extension.to_string_lossy();
+
+            for i in 1..=max_attempts {
+                let new_name = format!("{stem_str} ({i}).{ext_str}");
+                let new_path = parent.join(new_name);
+                if fs::symlink_metadata(&new_path).is_err() {
+                    return Ok(new_path);
+                }
+            }
+        } else {
+            for i in 1..=max_attempts {
+                let new_name = format!("{file_name} ({i})");
+                let new_path = parent.join(new_name);
+                if fs::symlink_metadata(&new_path).is_err() {
+                    return Ok(new_path);
+                }
             }
         }
     } else {
-        // It's a directory or file without extension
-        for i in 1..=9999 {
-            let new_name = format!("{} ({})", file_name, i);
-            let new_path = parent.join(&new_name);
-            
-            if !new_path.exists() {
-                return new_path.to_string_lossy().to_string();
+        for i in 1..=max_attempts {
+            let new_name = format!("{file_name} ({i})");
+            let new_path = parent.join(new_name);
+            if fs::symlink_metadata(&new_path).is_err() {
+                return Ok(new_path);
             }
         }
     }
-    
-    // Fallback - this should rarely happen
-    original_path.to_string()
+
+    Err(Error::new(
+        ErrorCode::ResourceAlreadyExists,
+        format!(
+            "Could not generate a unique destination path for '{}' after {max_attempts} attempts",
+            original_path.display()
+        ),
+    ))
+}
+
+fn generate_unique_path_buf(original_path: &Path, is_dir: bool) -> Result<PathBuf, Error> {
+    generate_unique_path_with_limit(original_path, is_dir, MAX_UNIQUE_PATH_ATTEMPTS)
+}
+
+#[allow(dead_code)]
+fn generate_unique_path(original_path: &str, is_dir: bool) -> Result<String, Error> {
+    generate_unique_path_buf(Path::new(original_path), is_dir)
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Copies a file or directory from the source path to the destination path.
 /// This function does not create any parent directories.
 /// If the destination already exists, it will generate a unique name by appending a number.
-/// If the source is a directory, it will recursively copy all files and subdirectories.
 /// If the source is a directory, it will recursively copy all files and subdirectories.
 ///
 /// # Arguments
@@ -547,31 +754,42 @@ fn generate_unique_path(original_path: &str) -> String {
 /// ```
 #[tauri::command]
 pub async fn copy_file_or_dir(source_path: &str, destination_path: &str) -> Result<u64, String> {
-    // Check if the source path exists
-    if !Path::new(source_path).exists() {
-        log_error!("Source path does not exist: {}", source_path);
+    let src_owned = PathBuf::from(source_path);
+    let dst_owned = PathBuf::from(destination_path);
+    run_blocking(move || copy_file_or_dir_sync(&src_owned, &dst_owned)).await
+}
+
+fn copy_file_or_dir_sync(source_path: &Path, destination_path: &Path) -> Result<u64, String> {
+    if !source_path.exists() {
+        log_error!("Source path does not exist: {}", source_path.display());
         return Err(Error::new(
             ErrorCode::InvalidInput,
-            format!("Source path does not exist: {}", source_path),
+            format!("Source path does not exist: {}", source_path.display()),
         )
         .to_json());
     }
 
-    // Generate a unique destination path if the original already exists
-    let final_destination_path = generate_unique_path(destination_path);
+    let is_dir = source_path.is_dir();
+    let final_destination_path =
+        generate_unique_path_buf(destination_path, is_dir).map_err(|err| {
+            log_error!("{}", err.custom_message);
+            err.to_json()
+        })?;
 
-    if Path::new(source_path).is_dir() {
-        // Guard against infinite recursion when copying a directory into itself or a subdirectory
+    if is_dir {
         if let Ok(canon_src) = fs::canonicalize(source_path) {
-            let dest_parent = Path::new(&final_destination_path)
+            let dest_parent = final_destination_path
                 .parent()
-                .and_then(|p| fs::canonicalize(p).ok());
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .canonicalize()
+                .ok();
             if let Some(canon_dest_parent) = dest_parent {
                 if canon_dest_parent == canon_src || canon_dest_parent.starts_with(&canon_src) {
                     log_error!(
                         "Cannot copy directory into itself: {} -> {}",
-                        source_path,
-                        final_destination_path
+                        source_path.display(),
+                        final_destination_path.display()
                     );
                     return Err(Error::new(
                         ErrorCode::InvalidInput,
@@ -583,77 +801,99 @@ pub async fn copy_file_or_dir(source_path: &str, destination_path: &str) -> Resu
             }
         }
 
-        // If the source is a directory, recursively copy it
-        let mut total_size = 0;
-
-        // Create the destination directory
-        fs::create_dir_all(&final_destination_path).map_err(|err| {
-            log_error!("Failed to create destination directory: {}", err);
-            Error::new(
-                ErrorCode::InternalError,
-                format!("Failed to create destination directory: {}", err),
-            )
-            .to_json()
-        })?;
-
-        // Read all entries in the source directory
-        for entry in read_dir(source_path).map_err(|err| {
-            log_error!("Failed to read source directory: {}", err);
-            Error::new(
-                ErrorCode::InternalError,
-                format!("Failed to read source directory: {}", err),
-            )
-            .to_json()
-        })? {
-            let entry = entry.map_err(|err| {
-                log_error!("Failed to read directory entry: {}", err);
-                Error::new(
-                    ErrorCode::InternalError,
-                    format!("Failed to read directory entry: {}", err),
-                )
-                .to_json()
-            })?;
-
-            let entry_path = entry.path();
-            let file_name = entry.file_name();
-            let dest_path = Path::new(&final_destination_path).join(file_name);
-
-            if entry_path.is_file() {
-                // Copy file
-                let size = fs::copy(&entry_path, &dest_path).map_err(|err| {
-                    log_error!("Failed to copy file: {}", err);
-                    Error::new(
-                        ErrorCode::InternalError,
-                        format!("Failed to copy file '{}': {}", entry_path.display(), err),
-                    )
-                    .to_json()
-                })?;
-                total_size += size;
-            } else if entry_path.is_dir() {
-                // Recursively copy subdirectory
-                let sub_size = Box::pin(copy_file_or_dir(
-                    entry_path.to_str().unwrap_or("[invalid source path]"),
-                    dest_path.to_str().unwrap_or("[invalid dest path]"),
-                ))
-                .await?;
-                total_size += sub_size;
-            }
-        }
-
-        Ok(total_size)
+        let mut visited = HashSet::new();
+        copy_dir_recursive_sync(source_path, &final_destination_path, &mut visited).map_err(|err| {
+            log_error!("{}", err.custom_message);
+            err.to_json()
+        })
     } else {
-        // Copy a single file
-        let size = fs::copy(source_path, &final_destination_path).map_err(|err| {
+        fs::copy(source_path, &final_destination_path).map_err(|err| {
             log_error!("Failed to copy file: {}", err);
             Error::new(
                 ErrorCode::InternalError,
-                format!("Failed to copy file: {}", err),
+                format!("Failed to copy file: {err}"),
             )
             .to_json()
-        })?;
-        Ok(size)
+        })
     }
 }
+
+fn copy_dir_recursive_sync(
+    source_dir: &Path,
+    dest_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<u64, Error> {
+    let canon_src = fs::canonicalize(source_dir).map_err(|err| {
+        Error::new(
+            ErrorCode::InternalError,
+            format!(
+                "Failed to resolve source directory '{}': {err}",
+                source_dir.display()
+            ),
+        )
+    })?;
+
+    if !visited.insert(canon_src) {
+        // Directory was already visited in this traversal (symlink / junction cycle)
+        return Ok(0);
+    }
+
+    fs::create_dir_all(dest_dir).map_err(|err| {
+        Error::new(
+            ErrorCode::InternalError,
+            format!("Failed to create destination directory: {err}"),
+        )
+    })?;
+
+    let mut total_size = 0;
+
+    let entries = read_dir(source_dir).map_err(|err| {
+        Error::new(
+            ErrorCode::InternalError,
+            format!("Failed to read source directory: {err}"),
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            Error::new(
+                ErrorCode::InternalError,
+                format!("Failed to read directory entry: {err}"),
+            )
+        })?;
+
+        let file_type = entry.file_type().map_err(|err| {
+            Error::new(
+                ErrorCode::InternalError,
+                format!("Failed to inspect directory entry type: {err}"),
+            )
+        })?;
+
+        // Never follow symlinks / junctions during recursive directory copy
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        let entry_path = entry.path();
+        let dest_path = dest_dir.join(entry.file_name());
+
+        if file_type.is_file() {
+            let size = fs::copy(&entry_path, &dest_path).map_err(|err| {
+                Error::new(
+                    ErrorCode::InternalError,
+                    format!("Failed to copy file '{}': {err}", entry_path.display()),
+                )
+            })?;
+            total_size += size;
+        } else if file_type.is_dir() {
+            let sub_size = copy_dir_recursive_sync(&entry_path, &dest_path, visited)?;
+            total_size += sub_size;
+        }
+    }
+
+    Ok(total_size)
+}
+
 /// Zips files and directories to a destination zip file.
 /// If only one source path is provided and no destination is specified, creates a zip file with the same name.
 /// For multiple source paths, the destination path must be specified.
@@ -682,6 +922,10 @@ pub async fn zip(
     source_paths: Vec<String>,
     destination_path: Option<String>,
 ) -> Result<(), String> {
+    run_blocking(move || zip_sync(source_paths, destination_path)).await
+}
+
+fn zip_sync(source_paths: Vec<String>, destination_path: Option<String>) -> Result<(), String> {
     if source_paths.is_empty() {
         log_error!("No source paths provided");
         return Err(Error::new(
@@ -691,26 +935,103 @@ pub async fn zip(
         .to_json());
     }
 
-    // If single source and no destination, use source name with .zip
-    let zip_path = if source_paths.len() == 1 && destination_path.is_none() {
-        Path::new(&source_paths[0]).with_extension("zip")
-    } else if let Some(dest) = destination_path {
-        Path::new(&dest).to_path_buf()
-    } else {
+    if source_paths.len() > 1 && destination_path.is_none() {
         log_error!("Destination path required for multiple sources");
         return Err(Error::new(
             ErrorCode::InvalidInput,
             "Destination path required for multiple sources".to_string(),
         )
         .to_json());
+    }
+
+    // 1. Validate ALL source paths before creating any output file on disk
+    let mut validated_sources: Vec<(PathBuf, PathBuf, String)> =
+        Vec::with_capacity(source_paths.len());
+    for source_path in &source_paths {
+        let source = PathBuf::from(source_path);
+        if !source.exists() {
+            log_error!("Source path does not exist: {}", source_path);
+            return Err(Error::new(
+                ErrorCode::ResourceNotFound,
+                format!("Source path does not exist: {source_path}"),
+            )
+            .to_json());
+        }
+        let base_name = source
+            .file_name()
+            .ok_or_else(|| {
+                Error::new(ErrorCode::InvalidInput, "Invalid source name".to_string()).to_json()
+            })?
+            .to_string_lossy()
+            .into_owned();
+        let canon = fs::canonicalize(&source).unwrap_or_else(|_| source.clone());
+        validated_sources.push((source, canon, base_name));
+    }
+
+    // 2. Compute safe target zip path (never truncate an existing source .zip or strip dot from folder names)
+    let requested_zip_path = if let Some(dest) = &destination_path {
+        PathBuf::from(dest)
+    } else {
+        let single_source = &validated_sources[0].0;
+        if single_source.is_dir() {
+            let mut os = single_source.as_os_str().to_os_string();
+            os.push(".zip");
+            PathBuf::from(os)
+        } else {
+            single_source.with_extension("zip")
+        }
     };
 
-    // Create zip file
-    let zip_file = fs::File::create(&zip_path).map_err(|e| {
-        log_error!("Failed to create zip file: {}", e);
+    let collides_with_source = fs::canonicalize(&requested_zip_path)
+        .ok()
+        .map(|canon_dest| {
+            validated_sources
+                .iter()
+                .any(|(_, canon_src, _)| &canon_dest == canon_src)
+        })
+        .unwrap_or_else(|| {
+            validated_sources
+                .iter()
+                .any(|(src, _, _)| src == &requested_zip_path)
+        });
+
+    let zip_path = if destination_path.is_none() || collides_with_source {
+        generate_unique_path_buf(&requested_zip_path, false).map_err(|err| {
+            log_error!("{}", err.custom_message);
+            err.to_json()
+        })?
+    } else {
+        requested_zip_path
+    };
+
+    let zip_parent = zip_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    // 3. Write to a temporary file in the same directory and only rename on completion
+    let temp_zip = tempfile::Builder::new()
+        .prefix(".explr_zip_")
+        .suffix(".tmp")
+        .tempfile_in(zip_parent)
+        .map_err(|e| {
+            log_error!("Failed to create temporary zip file: {}", e);
+            Error::new(
+                ErrorCode::InternalError,
+                format!("Failed to create zip file: {e}"),
+            )
+            .to_json()
+        })?;
+
+    let temp_zip_path = temp_zip.path().to_path_buf();
+    let canon_temp_zip = fs::canonicalize(&temp_zip_path).ok();
+    let canon_final_zip = fs::canonicalize(&zip_path).ok();
+
+    let zip_file = temp_zip.as_file().try_clone().map_err(|e| {
+        log_error!("Failed to clone temporary zip file handle: {}", e);
         Error::new(
             ErrorCode::InternalError,
-            format!("Failed to create zip file: {}", e),
+            format!("Failed to create zip file: {e}"),
         )
         .to_json()
     })?;
@@ -720,88 +1041,113 @@ pub async fn zip(
         .compression_method(zip::CompressionMethod::Deflated)
         .unix_permissions(0o755);
 
-    // Process each source path
-    for source_path in source_paths {
-        let source = Path::new(&source_path);
-        if !source.exists() {
-            log_error!("Source path does not exist: {}", source_path);
-            return Err(Error::new(
-                ErrorCode::ResourceNotFound,
-                format!("Source path does not exist: {}", source_path),
+    for (source, _, base_name) in &validated_sources {
+        let symlink_meta = fs::symlink_metadata(source).map_err(|e| {
+            log_error!("Failed to inspect source metadata: {}", e);
+            Error::new(
+                ErrorCode::InternalError,
+                format!("Failed to inspect source metadata: {e}"),
             )
-            .to_json());
+            .to_json()
+        })?;
+
+        if symlink_meta.file_type().is_symlink() {
+            continue;
         }
 
-        let base_name = source
-            .file_name()
-            .ok_or_else(|| "Invalid source name".to_string())?
-            .to_str()
-            .ok_or_else(|| "Invalid characters in source name".to_string())?;
-
         if source.is_file() {
-            zip.start_file(base_name, options).map_err(|e| {
-                let err_msg = format!("Error adding file to zip: {}", e);
-                log_error!(&err_msg);
-                err_msg
+            zip.start_file(base_name.as_str(), options).map_err(|e| {
+                log_error!("Error adding file to zip: {}", e);
+                Error::new(
+                    ErrorCode::InternalError,
+                    format!("Error adding file to zip: {e}"),
+                )
+                .to_json()
             })?;
-            let content = fs::read(source).map_err(|e| {
-                let err_msg = format!("Error reading file: {}", e);
-                log_error!(&err_msg);
-                err_msg
+            let mut f = fs::File::open(source).map_err(|e| {
+                log_error!("Error opening file for zip: {}", e);
+                Error::new(ErrorCode::InternalError, format!("Error reading file: {e}")).to_json()
             })?;
-            zip.write_all(&content).map_err(|e| {
-                let err_msg = format!("Error writing to zip: {}", e);
-                log_error!(&err_msg);
-                err_msg
+            std::io::copy(&mut f, &mut zip).map_err(|e| {
+                log_error!("Error streaming file to zip: {}", e);
+                Error::new(
+                    ErrorCode::InternalError,
+                    format!("Error writing to zip: {e}"),
+                )
+                .to_json()
             })?;
         } else if source.is_dir() {
-            for entry in walkdir::WalkDir::new(source) {
+            for entry in walkdir::WalkDir::new(source).follow_links(false) {
                 let entry = entry.map_err(|e| {
-                    let err_msg = format!("Error reading directory: {}", e);
-                    log_error!(&err_msg);
-                    err_msg
+                    log_error!("Error reading directory: {}", e);
+                    Error::new(
+                        ErrorCode::InternalError,
+                        format!("Error reading directory: {e}"),
+                    )
+                    .to_json()
                 })?;
                 let path = entry.path();
 
-                if path.is_file() {
-                    let relative = path.strip_prefix(source).map_err(|e| {
-                        log_error!("Failed to strip prefix: {}", e);
-                        Error::new(
-                            ErrorCode::InternalError,
-                            format!("Error creating relative path: {}", e),
-                        )
-                        .to_json()
-                    })?;
-                    let name = format!(
-                        "{}/{}",
-                        base_name,
-                        relative
-                            .to_str()
-                            .ok_or_else(|| "Invalid characters in path".to_string())?
-                            .replace('\\', "/")
-                    );
+                if entry.path_is_symlink() || entry.file_type().is_symlink() {
+                    continue;
+                }
 
+                if path == temp_zip_path || path == zip_path {
+                    continue;
+                }
+                if let Ok(canon_entry) = fs::canonicalize(path) {
+                    if canon_temp_zip.as_ref() == Some(&canon_entry)
+                        || canon_final_zip.as_ref() == Some(&canon_entry)
+                    {
+                        continue;
+                    }
+                }
+
+                let relative = path.strip_prefix(source).map_err(|e| {
+                    log_error!("Failed to strip prefix: {}", e);
+                    Error::new(
+                        ErrorCode::InternalError,
+                        format!("Error creating relative path: {e}"),
+                    )
+                    .to_json()
+                })?;
+
+                if relative.as_os_str().is_empty() {
+                    continue;
+                }
+
+                let rel_str = relative.to_string_lossy().replace('\\', "/");
+                let name = format!("{base_name}/{rel_str}");
+
+                if entry.file_type().is_file() {
                     zip.start_file(&name, options).map_err(|e| {
                         log_error!("Error adding file to zip: {}", e);
                         Error::new(
                             ErrorCode::InternalError,
-                            format!("Error adding file to zip: {}", e),
+                            format!("Error adding file to zip: {e}"),
                         )
                         .to_json()
                     })?;
-                    let content = fs::read(path).map_err(|e| {
+                    let mut f = fs::File::open(path).map_err(|e| {
                         log_error!("Error reading file: {}", e);
-                        Error::new(
-                            ErrorCode::InternalError,
-                            format!("Error reading file: {}", e),
-                        )
-                        .to_json()
+                        Error::new(ErrorCode::InternalError, format!("Error reading file: {e}"))
+                            .to_json()
                     })?;
-                    zip.write_all(&content).map_err(|e| {
+                    std::io::copy(&mut f, &mut zip).map_err(|e| {
                         log_error!("Error writing to zip: {}", e);
                         Error::new(
                             ErrorCode::InternalError,
-                            format!("Error writing to zip: {}", e),
+                            format!("Error writing to zip: {e}"),
+                        )
+                        .to_json()
+                    })?;
+                } else if entry.file_type().is_dir() {
+                    let dir_entry_name = format!("{name}/");
+                    zip.add_directory(&dir_entry_name, options).map_err(|e| {
+                        log_error!("Error adding directory to zip: {}", e);
+                        Error::new(
+                            ErrorCode::InternalError,
+                            format!("Error adding directory to zip: {e}"),
                         )
                         .to_json()
                     })?;
@@ -810,14 +1156,113 @@ pub async fn zip(
         }
     }
 
-    zip.finish().map_err(|e| {
+    let finished_file = zip.finish().map_err(|e| {
         log_error!("Error finalizing zip file: {}", e);
         Error::new(
             ErrorCode::InternalError,
-            format!("Error finalizing zip file: {}", e),
+            format!("Error finalizing zip file: {e}"),
         )
         .to_json()
     })?;
+    drop(finished_file);
+
+    temp_zip.persist(&zip_path).map_err(|e| {
+        log_error!("Failed to persist zip archive: {}", e.error);
+        Error::new(
+            ErrorCode::InternalError,
+            format!("Failed to finalize zip file: {}", e.error),
+        )
+        .to_json()
+    })?;
+
+    Ok(())
+}
+
+/// Validates a zip archive entry name, returning its safe relative `PathBuf` inside the extraction root.
+/// Rejects empty paths, `.`/`..`, path traversal (`..` with `/` or `\`), absolute prefixes, and null bytes.
+fn validate_zip_entry_path(raw_name: &str, enclosed: Option<PathBuf>) -> Result<PathBuf, Error> {
+    if raw_name.contains('\0') {
+        return Err(Error::invalid_input(
+            "Zip entry contains null byte in file name",
+        ));
+    }
+
+    // Explicitly reject any `.` or `..` segments across both `/` and `\` separators
+    let trimmed = raw_name.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return Err(Error::invalid_input(format!(
+            "Zip entry has unsafe or empty path: '{raw_name}'"
+        )));
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return Err(Error::invalid_input(format!(
+            "Zip entry has absolute path: '{raw_name}'"
+        )));
+    }
+    for segment in trimmed.split(['/', '\\']) {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(Error::invalid_input(format!(
+                "Zip entry contains path traversal segment: '{raw_name}'"
+            )));
+        }
+    }
+
+    let enclosed = enclosed.ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Zip entry escapes extraction directory: '{raw_name}'"
+        ))
+    })?;
+
+    let mut normalized = PathBuf::new();
+    for comp in enclosed.components() {
+        match comp {
+            Component::Normal(part) => {
+                let s = part.to_string_lossy();
+                for sub in s.split('\\') {
+                    if sub.is_empty() || sub == "." || sub == ".." {
+                        return Err(Error::invalid_input(format!(
+                            "Zip entry contains invalid component: '{raw_name}'"
+                        )));
+                    }
+                    normalized.push(sub);
+                }
+            }
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Zip entry contains non-normal path component: '{raw_name}'"
+                )));
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Err(Error::invalid_input(format!(
+            "Zip entry resolves to empty path: '{raw_name}'"
+        )));
+    }
+
+    Ok(normalized)
+}
+
+/// Verifies that no existing component along `target` under `base_dir` is a symlink.
+fn ensure_no_symlink_components(base_dir: &Path, target: &Path) -> Result<(), Error> {
+    if let Ok(rel) = target.strip_prefix(base_dir) {
+        let mut cur = base_dir.to_path_buf();
+        for comp in rel.components() {
+            cur.push(comp);
+            if let Ok(md) = fs::symlink_metadata(&cur) {
+                if md.file_type().is_symlink() {
+                    return Err(Error::new(
+                        ErrorCode::Unauthorized,
+                        format!(
+                            "Refusing to extract through symbolic link component: {}",
+                            cur.display()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -846,6 +1291,23 @@ pub async fn zip(
 /// ```
 #[tauri::command]
 pub async fn unzip(zip_paths: Vec<String>, destination_path: Option<String>) -> Result<(), String> {
+    run_blocking(move || {
+        unzip_with_limits_sync(
+            zip_paths,
+            destination_path,
+            MAX_UNZIP_ENTRIES,
+            MAX_UNZIP_TOTAL_BYTES,
+        )
+    })
+    .await
+}
+
+fn unzip_with_limits_sync(
+    zip_paths: Vec<String>,
+    destination_path: Option<String>,
+    max_entries: usize,
+    max_total_bytes: u64,
+) -> Result<(), String> {
     if zip_paths.is_empty() {
         log_error!("No zip files provided");
         return Err(
@@ -853,7 +1315,6 @@ pub async fn unzip(zip_paths: Vec<String>, destination_path: Option<String>) -> 
         );
     }
 
-    // Check if destination path is needed for multiple zips
     if zip_paths.len() > 1 && destination_path.is_none() {
         log_error!("Destination path required for multiple zip files");
         return Err(Error::new(
@@ -863,26 +1324,17 @@ pub async fn unzip(zip_paths: Vec<String>, destination_path: Option<String>) -> 
         .to_json());
     }
 
-    // Create destination directory path
-    let dest_path = match &destination_path {
-        Some(dest) => Path::new(dest),
-        None => {
-            // For single file without explicit destination, use parent directory
-            if zip_paths.len() == 1 {
-                Path::new(&zip_paths[0]).parent().unwrap_or(Path::new("."))
-            } else {
-                log_error!("Destination path required for multiple zip files");
-                return Err(Error::new(
-                    ErrorCode::InvalidInput,
-                    "Destination path required for multiple zip files".to_string(),
-                )
-                .to_json());
-            }
-        }
+    let dest_path_buf = match &destination_path {
+        Some(dest) => PathBuf::from(dest),
+        None => Path::new(&zip_paths[0])
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
     };
+    let dest_path = dest_path_buf.as_path();
 
-    // If destination path is provided, and we have multiple files, validate it exists
-    if zip_paths.len() > 1 && !dest_path.exists() {
+    if !dest_path.exists() {
         log_error!("Destination path does not exist");
         return Err(Error::new(
             ErrorCode::ResourceNotFound,
@@ -891,8 +1343,7 @@ pub async fn unzip(zip_paths: Vec<String>, destination_path: Option<String>) -> 
         .to_json());
     }
 
-    // If destination path exists, ensure it's a directory
-    if dest_path.exists() && !dest_path.is_dir() {
+    if !dest_path.is_dir() {
         log_error!("Destination path exists but is not a directory");
         return Err(Error::new(
             ErrorCode::InvalidInput,
@@ -901,8 +1352,10 @@ pub async fn unzip(zip_paths: Vec<String>, destination_path: Option<String>) -> 
         .to_json());
     }
 
-    for zip_path in zip_paths.clone() {
-        let zip_path = Path::new(&zip_path);
+    let mut total_extracted_bytes: u64 = 0;
+
+    for zip_path_str in &zip_paths {
+        let zip_path = Path::new(zip_path_str);
         if !zip_path.exists() {
             log_error!("Zip file does not exist: {}", zip_path.display());
             return Err(Error::new(
@@ -912,7 +1365,6 @@ pub async fn unzip(zip_paths: Vec<String>, destination_path: Option<String>) -> 
             .to_json());
         }
 
-        // Determine extraction path for this zip
         let zip_name = match zip_path.file_stem() {
             Some(name) => name,
             None => {
@@ -925,12 +1377,11 @@ pub async fn unzip(zip_paths: Vec<String>, destination_path: Option<String>) -> 
             }
         };
 
-        // Open and read zip file first to analyze contents
         let file = fs::File::open(zip_path).map_err(|e| {
             log_error!("Failed to open zip file: {}", e);
             Error::new(
                 ErrorCode::InternalError,
-                format!("Failed to open zip file: {}", e),
+                format!("Failed to open zip file: {e}"),
             )
             .to_json()
         })?;
@@ -939,86 +1390,149 @@ pub async fn unzip(zip_paths: Vec<String>, destination_path: Option<String>) -> 
             log_error!("Failed to read zip archive: {}", e);
             Error::new(
                 ErrorCode::InternalError,
-                format!("Failed to read zip archive: {}", e),
+                format!("Failed to read zip archive: {e}"),
             )
             .to_json()
         })?;
 
-        // Check if zip contains only a single file (not directory)
-        let file_entries: Vec<_> = (0..archive.len())
-            .filter_map(|i| {
-                archive.by_index(i).ok().and_then(|file| {
-                    if !file.name().ends_with('/') {
-                        Some(file.name().to_string())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
+        if archive.len() > max_entries {
+            log_error!(
+                "Zip archive exceeds maximum entry limit ({} > {})",
+                archive.len(),
+                max_entries
+            );
+            return Err(Error::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "Zip archive contains too many entries ({}, max allowed is {max_entries})",
+                    archive.len()
+                ),
+            )
+            .to_json());
+        }
 
-        let is_single_file = file_entries.len() == 1 && archive.len() == 1;
+        // First pass: validate all entry names, reject symlinks, and check declared uncompressed size
+        // before creating any directories or files on disk.
+        let mut validated_entries: Vec<(PathBuf, bool)> = Vec::with_capacity(archive.len());
+        let mut declared_bytes: u64 = total_extracted_bytes;
+        let mut non_dir_count = 0usize;
 
-        // Determine extraction path based on content
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i).map_err(|e| {
+                log_error!("Failed to read zip entry: {}", e);
+                Error::new(
+                    ErrorCode::InternalError,
+                    format!("Failed to read zip entry: {e}"),
+                )
+                .to_json()
+            })?;
+
+            let is_unix_symlink = entry
+                .unix_mode()
+                .map(|mode| (mode & 0o170000) == 0o120000)
+                .unwrap_or(false);
+            if entry.is_symlink() || is_unix_symlink {
+                log_error!("Rejecting symlink entry in zip archive: {}", entry.name());
+                return Err(Error::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "Zip archive contains unsupported symbolic link entry: '{}'",
+                        entry.name()
+                    ),
+                )
+                .to_json());
+            }
+
+            let raw_name = entry.name();
+            let is_dir_entry =
+                entry.is_dir() || raw_name.ends_with('/') || raw_name.ends_with('\\');
+            let safe_rel_path =
+                validate_zip_entry_path(raw_name, entry.enclosed_name()).map_err(|err| {
+                    log_error!("{}", err.custom_message);
+                    err.to_json()
+                })?;
+
+            if !is_dir_entry {
+                non_dir_count += 1;
+                declared_bytes = declared_bytes.saturating_add(entry.size());
+                if declared_bytes > max_total_bytes {
+                    log_error!(
+                        "Zip archive exceeds maximum uncompressed size limit ({} > {})",
+                        declared_bytes,
+                        max_total_bytes
+                    );
+                    return Err(Error::new(
+                        ErrorCode::InvalidInput,
+                        format!(
+                            "Zip archive exceeds maximum allowed uncompressed size ({max_total_bytes} bytes)"
+                        ),
+                    )
+                    .to_json());
+                }
+            }
+
+            validated_entries.push((safe_rel_path, is_dir_entry));
+        }
+
+        let is_single_file = non_dir_count == 1 && archive.len() == 1;
+
         let extract_path = if is_single_file {
-            // For single file, extract directly to destination directory
             dest_path.to_path_buf()
         } else {
-            // For multiple files or directories, create subdirectory
             let extract_path_initial = dest_path.join(zip_name);
-            let unique_extract_path_string = generate_unique_path(&extract_path_initial.to_string_lossy());
-            Path::new(&unique_extract_path_string).to_path_buf()
+            generate_unique_path_buf(&extract_path_initial, true).map_err(|err| {
+                log_error!("{}", err.custom_message);
+                err.to_json()
+            })?
         };
 
-        // Create extraction directory only if needed (not for single file to current dir)
         if !is_single_file {
             if let Err(e) = fs::create_dir_all(&extract_path) {
                 log_error!("Failed to create extraction directory: {}", e);
                 return Err(Error::new(
                     ErrorCode::InternalError,
-                    format!("Failed to create extraction directory: {}", e),
+                    format!("Failed to create extraction directory: {e}"),
                 )
                 .to_json());
             }
         }
 
-        for i in 0..archive.len() {
+        for (i, (safe_rel_path, is_dir_entry)) in validated_entries.into_iter().enumerate() {
             let mut file = archive.by_index(i).map_err(|e| {
                 log_error!("Failed to read zip entry: {}", e);
                 Error::new(
                     ErrorCode::InternalError,
-                    format!("Failed to read zip entry: {}", e),
+                    format!("Failed to read zip entry: {e}"),
                 )
                 .to_json()
             })?;
 
-            if file.name().ends_with('/') {
-                // For directories, create them if they don't exist
-                let outpath = extract_path.join(file.mangled_name());
+            let outpath = extract_path.join(&safe_rel_path);
+            ensure_no_symlink_components(&extract_path, &outpath).map_err(|err| {
+                log_error!("{}", err.custom_message);
+                err.to_json()
+            })?;
+
+            if is_dir_entry {
                 fs::create_dir_all(&outpath).map_err(|e| {
                     log_error!("Failed to create directory: {}", e);
                     Error::new(
                         ErrorCode::InternalError,
-                        format!("Failed to create directory '{}': {}", outpath.display(), e),
+                        format!("Failed to create directory '{}': {e}", outpath.display()),
                     )
                     .to_json()
                 })?;
             } else {
-                // For files, determine the output path based on extraction type
-                let outpath = if is_single_file {
-                    // For single file, extract directly to destination with original filename
-                    let original_filename = Path::new(file.name()).file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new("extracted_file"));
-                    extract_path.join(original_filename)
-                } else {
-                    // For multiple files, use the full path structure
-                    extract_path.join(file.mangled_name())
-                };
+                let unique_outpath = generate_unique_path_buf(&outpath, false).map_err(|err| {
+                    log_error!("{}", err.custom_message);
+                    err.to_json()
+                })?;
 
-                // Generate a unique path if the file already exists
-                let unique_outpath_string = generate_unique_path(&outpath.to_string_lossy());
-                let unique_outpath = Path::new(&unique_outpath_string);
-                
+                ensure_no_symlink_components(&extract_path, &unique_outpath).map_err(|err| {
+                    log_error!("{}", err.custom_message);
+                    err.to_json()
+                })?;
+
                 if let Some(parent) = unique_outpath.parent() {
                     if !parent.exists() {
                         fs::create_dir_all(parent).map_err(|e| {
@@ -1026,40 +1540,52 @@ pub async fn unzip(zip_paths: Vec<String>, destination_path: Option<String>) -> 
                             Error::new(
                                 ErrorCode::InternalError,
                                 format!(
-                                    "Failed to create parent directory '{}': {}",
-                                    parent.display(),
-                                    e
+                                    "Failed to create parent directory '{}': {e}",
+                                    parent.display()
                                 ),
                             )
                             .to_json()
                         })?;
                     }
                 }
+
                 let mut outfile = fs::File::create(&unique_outpath).map_err(|e| {
                     log_error!("Failed to create file: {}", e);
                     Error::new(
                         ErrorCode::InternalError,
-                        format!("Failed to create file {}': {}", unique_outpath.display(), e),
+                        format!("Failed to create file '{}': {e}", unique_outpath.display()),
                     )
                     .to_json()
                 })?;
-                std::io::copy(&mut file, &mut outfile).map_err(|e| {
+
+                let remaining_budget = max_total_bytes.saturating_sub(total_extracted_bytes);
+                let mut limited_reader = (&mut file).take(remaining_budget.saturating_add(1));
+                let written = std::io::copy(&mut limited_reader, &mut outfile).map_err(|e| {
                     log_error!("Failed to write file: {}", e);
                     Error::new(
                         ErrorCode::InternalError,
-                        format!("Failed to write file '{}': {}", unique_outpath.display(), e),
+                        format!("Failed to write file '{}': {e}", unique_outpath.display()),
                     )
                     .to_json()
                 })?;
+                drop(outfile);
+
+                if written > remaining_budget {
+                    let _ = fs::remove_file(&unique_outpath);
+                    log_error!("Zip extraction exceeded maximum allowed uncompressed bytes");
+                    return Err(Error::new(
+                        ErrorCode::InvalidInput,
+                        format!(
+                            "Zip archive exceeds maximum allowed uncompressed size ({max_total_bytes} bytes)"
+                        ),
+                    )
+                    .to_json());
+                }
+
+                total_extracted_bytes = total_extracted_bytes.saturating_add(written);
             }
         }
-
-        // Remove the zip file after successful extraction
-        if let Err(e) = fs::remove_file(zip_path) {
-            log_error!("Failed to remove zip file after extraction: {}", e);
-            // Note: We don't return an error here since extraction was successful
-            // The user can manually delete the zip file if needed
-        }
+        // NOTE: Never delete the user's source zip archive (`zip_path`) after extraction!
     }
 
     Ok(())
@@ -1068,6 +1594,7 @@ pub async fn unzip(zip_paths: Vec<String>, destination_path: Option<String>) -> 
 #[cfg(test)]
 mod tests_file_system_operation_commands {
     use super::*;
+    use crate::models::{count_subdirectories, count_subfiles};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -1259,7 +1786,11 @@ mod tests_file_system_operation_commands {
             "Unexpected error message: {}",
             err
         );
-        assert!(err.contains("InternalError"), "Unexpected error code: {}", err);
+        assert!(
+            err.contains("InternalError"),
+            "Unexpected error code: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -2342,5 +2873,443 @@ mod tests_file_system_operation_commands {
             result.unwrap_err().contains("ResourceNotFound"),
             "Error message does not match expected value"
         );
+    }
+
+    // =========================================================================
+    // TP-SEC-04 (BUG-004): create_file & create_directory path traversal guard
+    // =========================================================================
+
+    #[tokio::test]
+    async fn tp_sec_04_create_file_and_directory_reject_path_traversal_and_separators() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let base_dir = temp_dir.path().join("base_dir");
+        fs::create_dir(&base_dir).unwrap();
+        let outside_abs = temp_dir.path().join("abs_escaped");
+
+        let invalid_names = [
+            "../escaped",
+            "..\\escaped",
+            "a/b",
+            "a\\b",
+            ".",
+            "..",
+            "",
+            "   ",
+            "/etc/pwn_explr_test",
+            outside_abs.to_str().unwrap(),
+        ];
+
+        for bad_name in invalid_names {
+            let file_res = create_file(base_dir.to_str().unwrap(), bad_name).await;
+            assert!(
+                file_res.is_err(),
+                "create_file should reject invalid name '{bad_name}'"
+            );
+            let file_err = file_res.unwrap_err();
+            assert!(
+                file_err.contains("InvalidInput") && file_err.contains("408"),
+                "Expected InvalidInput (408) for create_file('{bad_name}'), got: {file_err}"
+            );
+
+            let dir_res = create_directory(base_dir.to_str().unwrap(), bad_name).await;
+            assert!(
+                dir_res.is_err(),
+                "create_directory should reject invalid name '{bad_name}'"
+            );
+            let dir_err = dir_res.unwrap_err();
+            assert!(
+                dir_err.contains("InvalidInput") && dir_err.contains("408"),
+                "Expected InvalidInput (408) for create_directory('{bad_name}'), got: {dir_err}"
+            );
+        }
+
+        // Verify nothing was created outside base_dir or inside base_dir
+        assert!(!temp_dir.path().join("escaped").exists());
+        assert!(!outside_abs.exists());
+        assert_eq!(fs::read_dir(&base_dir).unwrap().count(), 0);
+    }
+
+    // =========================================================================
+    // TP-SEC-03 (BUG-003): unzip preserves archive, rejects Zip-Slip / symlinks / zip-bomb
+    // =========================================================================
+
+    #[tokio::test]
+    async fn tp_sec_03_unzip_preserves_source_archive_and_rejects_dot_traversal_and_symlinks() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let dest_dir = temp_dir.path().join("dest");
+        fs::create_dir(&dest_dir).unwrap();
+
+        // 1) Valid multi-file archive: source .zip MUST NOT be deleted after extraction
+        let valid_zip_path = temp_dir.path().join("keep_me.zip");
+        {
+            let mut zw = ZipWriter::new(fs::File::create(&valid_zip_path).unwrap());
+            zw.start_file::<_, ()>("folder/a.txt", FileOptions::default())
+                .unwrap();
+            zw.write_all(b"alpha").unwrap();
+            zw.start_file::<_, ()>("folder/b.txt", FileOptions::default())
+                .unwrap();
+            zw.write_all(b"beta").unwrap();
+            zw.finish().unwrap();
+        }
+        let res = unzip(
+            vec![valid_zip_path.to_str().unwrap().to_string()],
+            Some(dest_dir.to_str().unwrap().to_string()),
+        )
+        .await;
+        assert!(res.is_ok(), "Valid unzip should succeed: {res:?}");
+        assert!(
+            valid_zip_path.exists(),
+            "Source .zip archive MUST NOT be deleted after extraction"
+        );
+        assert_eq!(
+            fs::read_to_string(dest_dir.join("keep_me").join("folder").join("a.txt")).unwrap(),
+            "alpha"
+        );
+
+        // 2a) Archive with `.` / `..` / `/..` without trailing `/` (empty mangled_name escape)
+        for bad_entry in [".", "..", "/.."] {
+            let dot_zip = temp_dir.path().join("dot_escape.zip");
+            {
+                let mut zw = ZipWriter::new(fs::File::create(&dot_zip).unwrap());
+                zw.start_file::<_, ()>("legit.txt", FileOptions::default())
+                    .unwrap();
+                zw.write_all(b"ok").unwrap();
+                zw.start_file::<_, ()>(bad_entry, FileOptions::default())
+                    .unwrap();
+                zw.write_all(b"escaped").unwrap();
+                zw.finish().unwrap();
+            }
+            let extract_dest = temp_dir.path().join("dot_dest");
+            fs::create_dir_all(&extract_dest).unwrap();
+            let err_res = unzip(
+                vec![dot_zip.to_str().unwrap().to_string()],
+                Some(extract_dest.to_str().unwrap().to_string()),
+            )
+            .await;
+            assert!(
+                err_res.is_err(),
+                "Archive with entry '{bad_entry}' must be rejected"
+            );
+            assert!(
+                !extract_dest.join("dot_escape (1)").exists(),
+                "Must not write escaped file into dest_path outside extract_path"
+            );
+            assert!(
+                dot_zip.exists(),
+                "Source zip must not be deleted on failure"
+            );
+        }
+
+        // 2b) Archive with `../../escape.txt`
+        let slip_zip = temp_dir.path().join("slip.zip");
+        {
+            let mut zw = ZipWriter::new(fs::File::create(&slip_zip).unwrap());
+            zw.start_file::<_, ()>("../../escape.txt", FileOptions::default())
+                .unwrap();
+            zw.write_all(b"pwned").unwrap();
+            zw.finish().unwrap();
+        }
+        let slip_res = unzip(
+            vec![slip_zip.to_str().unwrap().to_string()],
+            Some(dest_dir.to_str().unwrap().to_string()),
+        )
+        .await;
+        assert!(
+            slip_res.is_err(),
+            "Zip-Slip entry '../../escape.txt' must fail"
+        );
+        assert!(!temp_dir.path().join("escape.txt").exists());
+
+        // 2c) Archive with symlink entry (Unix mode 0o120777)
+        let symlink_zip = temp_dir.path().join("symlink_entry.zip");
+        {
+            let mut zw = ZipWriter::new(fs::File::create(&symlink_zip).unwrap());
+            zw.add_symlink("evil_link", "/etc/passwd", FileOptions::<()>::default())
+                .unwrap();
+            zw.finish().unwrap();
+        }
+        let sym_res = unzip(
+            vec![symlink_zip.to_str().unwrap().to_string()],
+            Some(dest_dir.to_str().unwrap().to_string()),
+        )
+        .await;
+        assert!(
+            sym_res.is_err(),
+            "Symlink entry in zip archive must be rejected"
+        );
+
+        // 2d) Zip-bomb protection (exceeding total bytes cap)
+        let bomb_zip = temp_dir.path().join("bomb.zip");
+        {
+            let mut zw = ZipWriter::new(fs::File::create(&bomb_zip).unwrap());
+            zw.start_file::<_, ()>("big.bin", FileOptions::default())
+                .unwrap();
+            let chunk = vec![0u8; 64 * 1024];
+            for _ in 0..8 {
+                zw.write_all(&chunk).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let bomb_dest = temp_dir.path().join("bomb_dest");
+        fs::create_dir(&bomb_dest).unwrap();
+        let bomb_res = unzip_with_limits_sync(
+            vec![bomb_zip.to_str().unwrap().to_string()],
+            Some(bomb_dest.to_str().unwrap().to_string()),
+            100,
+            128 * 1024, // 128 KiB cap vs 512 KiB archive payload
+        );
+        assert!(
+            bomb_res.is_err(),
+            "Zip archive exceeding max_total_bytes cap must be rejected"
+        );
+        assert!(
+            bomb_res
+                .unwrap_err()
+                .contains("exceeds maximum allowed uncompressed size"),
+            "Expected size limit error message"
+        );
+    }
+
+    // =========================================================================
+    // TP-BE-01 (BUG-008): copy_file_or_dir & generate_unique_path for dot folders and symlink loops
+    // =========================================================================
+
+    #[tokio::test]
+    async fn tp_be_01_copy_dot_directory_preserves_folder_name_and_breaks_symlink_cycles() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+        // 1) Folder `a.b` copied into directory where `a.b` already exists -> `a.b (1)` (not `a (1).b`)
+        let src_dir = temp_dir.path().join("src").join("a.b");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("hello.txt"), "world").unwrap();
+
+        let target_parent = temp_dir.path().join("target");
+        fs::create_dir_all(&target_parent).unwrap();
+        let dest_ab = target_parent.join("a.b");
+
+        // First copy creates `target/a.b`
+        let res1 = copy_file_or_dir(src_dir.to_str().unwrap(), dest_ab.to_str().unwrap()).await;
+        assert!(res1.is_ok(), "First copy of a.b should succeed: {res1:?}");
+        assert!(dest_ab.is_dir());
+
+        // Second copy to `target/a.b` must create `target/a.b (1)`, NOT `target/a (1).b`
+        let res2 = copy_file_or_dir(src_dir.to_str().unwrap(), dest_ab.to_str().unwrap()).await;
+        assert!(res2.is_ok(), "Second copy of a.b should succeed: {res2:?}");
+        assert!(
+            target_parent.join("a.b (1)").is_dir(),
+            "Expected 'a.b (1)' directory to be created"
+        );
+        assert!(
+            !target_parent.join("a (1).b").exists(),
+            "Must not corrupt dot-folder name into 'a (1).b'"
+        );
+
+        // Exhaustion of unique path attempts returns Err instead of overwriting original_path
+        let exhausted = generate_unique_path_with_limit(&dest_ab, true, 1);
+        assert!(
+            exhausted.is_err(),
+            "generate_unique_path_with_limit must return Err when limit is reached"
+        );
+        assert_eq!(
+            exhausted.unwrap_err().message_from_code,
+            ErrorCode::ResourceAlreadyExists
+        );
+
+        // 2) Symlink cycle inside source directory must not cause infinite recursion
+        #[cfg(unix)]
+        {
+            let cycle_src = temp_dir.path().join("cycle_src");
+            fs::create_dir_all(&cycle_src).unwrap();
+            fs::write(cycle_src.join("file.txt"), "data").unwrap();
+            std::os::unix::fs::symlink(&cycle_src, cycle_src.join("loop_back")).unwrap();
+
+            let cycle_dst = temp_dir.path().join("cycle_dst");
+            let cycle_res =
+                copy_file_or_dir(cycle_src.to_str().unwrap(), cycle_dst.to_str().unwrap()).await;
+            assert!(
+                cycle_res.is_ok(),
+                "Copying directory with symlink loop must finish without infinite recursion: {cycle_res:?}"
+            );
+            assert!(cycle_dst.join("file.txt").is_file());
+            assert!(!cycle_dst.join("loop_back").exists());
+        }
+    }
+
+    // =========================================================================
+    // TP-BE-02 (BUG-009): zip does not self-truncate .zip and cleans up on missing source
+    // =========================================================================
+
+    #[tokio::test]
+    async fn tp_be_02_zip_preserves_existing_zip_source_and_leaves_no_partial_archive_on_error() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+        // 1) Create a valid archive.zip and call zip(vec!["archive.zip"], None)
+        let archive_path = temp_dir.path().join("archive.zip");
+        {
+            let mut zw = ZipWriter::new(fs::File::create(&archive_path).unwrap());
+            zw.start_file::<_, ()>("inside.txt", FileOptions::default())
+                .unwrap();
+            zw.write_all(b"important archive payload").unwrap();
+            zw.finish().unwrap();
+        }
+        let original_bytes = fs::read(&archive_path).unwrap();
+        assert!(!original_bytes.is_empty());
+
+        let self_zip_res = zip(vec![archive_path.to_str().unwrap().to_string()], None).await;
+        assert!(
+            self_zip_res.is_ok(),
+            "zip(['archive.zip'], None) should succeed via unique output path: {self_zip_res:?}"
+        );
+        assert_eq!(
+            fs::read(&archive_path).unwrap(),
+            original_bytes,
+            "Original archive.zip MUST NOT be truncated or modified"
+        );
+        assert!(
+            temp_dir.path().join("archive (1).zip").is_file(),
+            "New archive 'archive (1).zip' should be created"
+        );
+
+        // 2) zip(vec!["valid.txt", "missing.txt"], Some("out.zip")) must not leave broken out.zip
+        let valid_txt = temp_dir.path().join("valid.txt");
+        fs::write(&valid_txt, "valid content").unwrap();
+        let missing_txt = temp_dir.path().join("missing.txt");
+        let out_zip = temp_dir.path().join("out.zip");
+
+        let fail_res = zip(
+            vec![
+                valid_txt.to_str().unwrap().to_string(),
+                missing_txt.to_str().unwrap().to_string(),
+            ],
+            Some(out_zip.to_str().unwrap().to_string()),
+        )
+        .await;
+        assert!(fail_res.is_err(), "Zip with missing source must fail");
+        assert!(
+            !out_zip.exists(),
+            "Failed zip operation must not leave a partial or empty out.zip on disk"
+        );
+    }
+
+    // =========================================================================
+    // TP-BE-03 (BUG-010): open_directory returns valid & broken symlinks with is_symlink: true
+    // =========================================================================
+
+    #[tokio::test]
+    async fn tp_be_03_open_directory_includes_valid_and_broken_symlinks_and_counts_single_pass() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let root = temp_dir.path();
+
+        let real_file = root.join("real.txt");
+        fs::write(&real_file, "hello").unwrap();
+
+        let real_sub = root.join("real_sub");
+        fs::create_dir(&real_sub).unwrap();
+        fs::write(real_sub.join("nested.txt"), "1").unwrap();
+        fs::create_dir(real_sub.join("nested_dir")).unwrap();
+
+        // Verify count_subentries_single_pass matches legacy helpers
+        let (f_cnt, d_cnt) = count_subentries_single_pass(&real_sub);
+        assert_eq!(f_cnt, count_subfiles(real_sub.to_str().unwrap()));
+        assert_eq!(d_cnt, count_subdirectories(real_sub.to_str().unwrap()));
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real_file, root.join("link_file.txt")).unwrap();
+            std::os::unix::fs::symlink(&real_sub, root.join("link_dir")).unwrap();
+            std::os::unix::fs::symlink(root.join("nonexistent_target"), root.join("broken_link"))
+                .unwrap();
+
+            let json = open_directory(root.to_str().unwrap().to_string())
+                .await
+                .expect("open_directory should succeed");
+            let entries: Entries = serde_json::from_str(&json).unwrap();
+
+            let link_dir = entries
+                .directories
+                .iter()
+                .find(|d| d.name == "link_dir")
+                .expect("Valid directory symlink must appear in directories");
+            assert!(link_dir.is_symlink, "link_dir must have is_symlink == true");
+            assert_eq!(link_dir.sub_file_count, 1);
+            assert_eq!(link_dir.sub_dir_count, 1);
+
+            let link_file = entries
+                .files
+                .iter()
+                .find(|f| f.name == "link_file.txt")
+                .expect("Valid file symlink must appear in files");
+            assert!(
+                link_file.is_symlink,
+                "link_file.txt must have is_symlink == true"
+            );
+
+            let broken = entries
+                .files
+                .iter()
+                .find(|f| f.name == "broken_link")
+                .expect("Broken symlink must appear in files instead of vanishing");
+            assert!(
+                broken.is_symlink,
+                "broken_link must have is_symlink == true"
+            );
+        }
+    }
+
+    // =========================================================================
+    // TP-BE-09 (BUG-044): rename case-collision protection on Linux & Unicode case rename
+    // =========================================================================
+
+    #[tokio::test]
+    async fn tp_be_09_rename_prevents_case_collision_overwrite_and_supports_unicode_case_rename() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+        // 1) Pure helper supports Cyrillic case-only rename and mixed path separators
+        assert!(names_differ_only_by_case(
+            Path::new("C:/Users/Тест.txt"),
+            Path::new("C:\\Users\\тест.txt")
+        ));
+        assert!(!names_differ_only_by_case(
+            Path::new("/tmp/Тест.txt"),
+            Path::new("/tmp/Тест.txt")
+        ));
+
+        // 2) Renaming Cyrillic casing when only one file exists succeeds
+        let cyr_upper = temp_dir.path().join("Тест.txt");
+        let cyr_lower = temp_dir.path().join("тест.txt");
+        fs::write(&cyr_upper, "cyrillic content").unwrap();
+
+        let cyr_res = rename(cyr_upper.to_str().unwrap(), cyr_lower.to_str().unwrap()).await;
+        assert!(
+            cyr_res.is_ok(),
+            "Cyrillic case rename 'Тест.txt' -> 'тест.txt' should succeed: {cyr_res:?}"
+        );
+        assert_eq!(fs::read_to_string(&cyr_lower).unwrap(), "cyrillic content");
+
+        // 3) On case-sensitive filesystems (Linux), when both `file.txt` and `FILE.txt` exist,
+        //    renaming `file.txt` -> `FILE.txt` must fail with ResourceAlreadyExists (409).
+        #[cfg(target_os = "linux")]
+        {
+            let lower = temp_dir.path().join("file.txt");
+            let upper = temp_dir.path().join("FILE.txt");
+            fs::write(&lower, "lower").unwrap();
+            fs::write(&upper, "upper").unwrap();
+
+            let collision_res = rename(lower.to_str().unwrap(), upper.to_str().unwrap()).await;
+            assert!(
+                collision_res.is_err(),
+                "Renaming file.txt -> FILE.txt when FILE.txt exists as a distinct file on Linux must fail"
+            );
+            let err = collision_res.unwrap_err();
+            assert!(
+                err.contains("ResourceAlreadyExists") && err.contains("409"),
+                "Expected ResourceAlreadyExists (409), got: {err}"
+            );
+            assert_eq!(
+                fs::read_to_string(&upper).unwrap(),
+                "upper",
+                "Existing FILE.txt must not be overwritten"
+            );
+        }
     }
 }

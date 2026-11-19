@@ -10,9 +10,11 @@ mod state;
 
 use crate::commands::{
     command_exec_commands, file_system_operation_commands, hash_commands, meta_data_commands,
-    search_engine_commands, settings_commands, template_commands, volume_operations_commands, sftp_file_system_operation_commands, preview_commands, permission_commands, watcher_commands,
-    system_integration_commands
+    permission_commands, preview_commands, search_engine_commands, settings_commands,
+    sftp_file_system_operation_commands, system_integration_commands, template_commands,
+    volume_operations_commands, watcher_commands,
 };
+use std::path::{Component, Path, PathBuf};
 use tauri::ipc::Invoke;
 use tauri::{Emitter, Manager};
 
@@ -39,6 +41,7 @@ fn all_commands() -> fn(Invoke) -> bool {
         // Volume commands
         volume_operations_commands::get_system_volumes_information_as_json,
         volume_operations_commands::get_system_volumes_information,
+        volume_operations_commands::eject_volume,
         // Settings commands
         settings_commands::get_settings_as_json,
         settings_commands::update_settings_field,
@@ -68,10 +71,8 @@ fn all_commands() -> fn(Invoke) -> bool {
         search_engine_commands::get_indexing_status,
         search_engine_commands::stop_indexing,
         search_engine_commands::get_suggestions,
-
         // Preview commands
         preview_commands::build_preview,
-
         //sftp commands
         sftp_file_system_operation_commands::load_dir,
         sftp_file_system_operation_commands::open_file_sftp,
@@ -88,15 +89,16 @@ fn all_commands() -> fn(Invoke) -> bool {
         sftp_file_system_operation_commands::build_preview_sftp,
         sftp_file_system_operation_commands::download_and_open_sftp_file,
         sftp_file_system_operation_commands::cleanup_sftp_temp_files,
-
+        sftp_file_system_operation_commands::store_sftp_credentials,
+        sftp_file_system_operation_commands::remove_sftp_credentials,
+        sftp_file_system_operation_commands::has_sftp_credentials,
+        sftp_file_system_operation_commands::trust_sftp_host_key,
         // Permission commands
         permission_commands::request_full_disk_access,
         permission_commands::check_directory_access,
-
         // Watcher commands
         watcher_commands::watch_directory,
         watcher_commands::unwatch_directory,
-
         // System integration commands
         system_integration_commands::get_initial_cli_path,
         system_integration_commands::is_default_file_manager,
@@ -106,25 +108,90 @@ fn all_commands() -> fn(Invoke) -> bool {
     ]
 }
 
+fn normalize_cli_path_arg(raw: &str) -> String {
+    if let Some(stripped) = raw.strip_suffix('"') {
+        if stripped.ends_with(':') {
+            return format!("{stripped}\\");
+        }
+        return stripped.to_string();
+    }
+    raw.to_string()
+}
+
+fn clean_absolute_path(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(base) = cwd {
+        base.join(path)
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+
+    let mut cleaned = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(cleaned.components().next_back(), Some(Component::Normal(_))) {
+                    cleaned.pop();
+                }
+            }
+            other => cleaned.push(other),
+        }
+    }
+    Some(cleaned)
+}
+
+fn resolve_existing_cli_candidate(raw: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let direct = clean_absolute_path(Path::new(raw), cwd)?;
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    if raw.ends_with('"') {
+        let normalized = normalize_cli_path_arg(raw);
+        let candidate = clean_absolute_path(Path::new(&normalized), cwd)?;
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn extract_startup_target_path_with_cwd(args: &[String], cwd: Option<&Path>) -> Option<String> {
+    for arg in args.iter().skip(1) {
+        if arg.is_empty() || arg.starts_with('-') {
+            continue;
+        }
+        if let Some(resolved) = resolve_existing_cli_candidate(arg, cwd) {
+            let target = if resolved.is_file() {
+                resolved
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.to_string_lossy().into_owned())
+            } else {
+                Some(resolved.to_string_lossy().into_owned())
+            };
+            if let Some(t) = target.filter(|s| !s.is_empty()) {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+pub fn extract_startup_target_path(args: &[String]) -> Option<String> {
+    let cwd = std::env::current_dir().ok();
+    extract_startup_target_path_with_cwd(args, cwd.as_deref())
+}
+
 #[tokio::main]
 async fn main() {
     // Parse startup CLI arguments (e.g. explr.exe "C:\Path")
     let raw_args: Vec<String> = std::env::args().collect();
-    for arg in raw_args.iter().skip(1) {
-        if !arg.starts_with('-') {
-            let path = std::path::Path::new(arg);
-            if path.exists() {
-                let target = if path.is_file() {
-                    path.parent().map(|p| p.to_string_lossy().into_owned())
-                } else {
-                    Some(path.to_string_lossy().into_owned())
-                };
-                if let Some(t) = target {
-                    let _ = commands::system_integration_commands::INITIAL_CLI_PATH.set(t);
-                    break;
-                }
-            }
-        }
+    if let Some(target) = extract_startup_target_path(&raw_args) {
+        let _ = commands::system_integration_commands::INITIAL_CLI_PATH.set(target);
     }
 
     let app = tauri::Builder::default()
@@ -138,21 +205,8 @@ async fn main() {
                 let _ = window.set_focus();
             }
             // Check if second instance was called with a path to open
-            for arg in args.iter().skip(1) {
-                if !arg.starts_with('-') {
-                    let path = std::path::Path::new(arg);
-                    if path.exists() {
-                        let target = if path.is_file() {
-                            path.parent().map(|p| p.to_string_lossy().into_owned())
-                        } else {
-                            Some(path.to_string_lossy().into_owned())
-                        };
-                        if let Some(t) = target {
-                            let _ = app.emit("open-path-requested", t);
-                            break;
-                        }
-                    }
-                }
+            if let Some(target) = extract_startup_target_path(&args) {
+                let _ = app.emit("open-path-requested", target);
             }
         }))
         .invoke_handler(all_commands())
@@ -162,14 +216,16 @@ async fn main() {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
-            
+
             // Clean up old SFTP temporary files on startup
             tokio::spawn(async {
-                if let Err(e) = commands::sftp_file_system_operation_commands::cleanup_sftp_temp_files() {
-                    eprintln!("Failed to cleanup SFTP temp files: {}", e);
+                if let Err(e) =
+                    commands::sftp_file_system_operation_commands::cleanup_sftp_temp_files()
+                {
+                    eprintln!("Failed to cleanup SFTP temp files: {e}");
                 }
             });
-            
+
             Ok(())
         });
 
@@ -177,9 +233,62 @@ async fn main() {
 
     log_info!("Starting Tauri application...");
 
-    app.run(tauri::generate_context!()).expect({
-        let error_msg = "error while running tauri application";
-        log_critical!(error_msg);
-        &error_msg.to_string()
-    });
+    if let Err(err) = app.run(tauri::generate_context!()) {
+        log_critical!("error while running tauri application: {}", err);
+        panic!("error while running tauri application: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_cli_path_arg_windows_root_quote_tp_be_07() {
+        assert_eq!(normalize_cli_path_arg("C:\""), "C:\\");
+        assert_eq!(normalize_cli_path_arg("D:\""), "D:\\");
+        assert_eq!(
+            normalize_cli_path_arg("C:\\Users\\Test\""),
+            "C:\\Users\\Test"
+        );
+        assert_eq!(normalize_cli_path_arg("C:\\Users\\Test"), "C:\\Users\\Test");
+    }
+
+    #[test]
+    fn test_extract_startup_target_path_directory_and_relative_file_tp_be_07() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let dir_path = tmp.path();
+        let file_path = dir_path.join("rel.txt");
+        std::fs::write(&file_path, b"hello").expect("write test file");
+
+        // 1. Directory argument with trailing escaped quote (simulating Windows `"%1"` on `"dir\"`)
+        let quoted_dir_arg = format!("{}\"", dir_path.display());
+        let args_dir = vec!["explr".to_string(), "--flag".to_string(), quoted_dir_arg];
+        let extracted_dir = extract_startup_target_path_with_cwd(&args_dir, Some(dir_path))
+            .expect("should extract directory");
+        assert_eq!(Path::new(&extracted_dir), dir_path);
+
+        // 2. Relative file argument `"rel.txt"` must resolve to non-empty parent directory, never `""`
+        let args_rel_file = vec!["explr".to_string(), "rel.txt".to_string()];
+        let extracted_parent = extract_startup_target_path_with_cwd(&args_rel_file, Some(dir_path))
+            .expect("should extract parent dir for relative file");
+        assert!(!extracted_parent.is_empty());
+        assert_eq!(Path::new(&extracted_parent), dir_path);
+
+        // 3. Nonexistent path returns None
+        let args_missing = vec![
+            "explr".to_string(),
+            "nonexistent_file_12345.txt".to_string(),
+        ];
+        assert!(extract_startup_target_path_with_cwd(&args_missing, Some(dir_path)).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_extract_startup_target_path_windows_drive_root_quote_tp_be_07() {
+        let args = vec!["explr.exe".to_string(), "C:\"".to_string()];
+        let extracted = extract_startup_target_path(&args)
+            .expect("C:\" should normalize and resolve to C:\\ on Windows");
+        assert_eq!(extracted, "C:\\");
+    }
 }

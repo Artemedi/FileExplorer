@@ -682,17 +682,23 @@ mod tests_autocomplete_commands {
         let subdir = temp_dir.path().join("subdir");
         std::fs::create_dir_all(&subdir).unwrap();
 
-        let _file1 = create_temp_file(&temp_dir, "chunked_test1.txt", "This is chunked test document one");
+        let _file1 = create_temp_file(
+            &temp_dir,
+            "chunked_test1.txt",
+            "This is chunked test document one",
+        );
         let file2_dir = TempDir::new_in(&subdir).unwrap();
-        let _file2 = create_temp_file(&file2_dir, "chunked_test2.txt", "This is chunked test document two");
+        let _file2 = create_temp_file(
+            &file2_dir,
+            "chunked_test2.txt",
+            "This is chunked test document two",
+        );
 
         let (state, _settings_dir) = create_test_search_engine_state();
 
         // The updated add_paths_recursive should use chunked indexing internally
-        let add_result = add_paths_recursive_impl(
-            temp_dir.path().to_string_lossy().to_string(),
-            state.clone(),
-        );
+        let add_result =
+            add_paths_recursive_impl(temp_dir.path().to_string_lossy().to_string(), state.clone());
         assert!(add_result.is_ok());
 
         assert!(
@@ -710,12 +716,16 @@ mod tests_autocomplete_commands {
 
         let results = search_result.unwrap();
         assert!(
-            results.iter().any(|(path, _)| path.contains("chunked_test1.txt")),
+            results
+                .iter()
+                .any(|(path, _)| path.contains("chunked_test1.txt")),
             "Expected chunked_test1.txt in results: {:?}",
             results
         );
         assert!(
-            results.iter().any(|(path, _)| path.contains("chunked_test2.txt")),
+            results
+                .iter()
+                .any(|(path, _)| path.contains("chunked_test2.txt")),
             "Expected chunked_test2.txt in results: {:?}",
             results
         );
