@@ -2150,10 +2150,11 @@ mod tests_searchengine_state {
                 dir_context
             );
 
-            // Count results from context directory
+            // Count results from context directory (normalize separators for Windows)
+            let normalized_context = dir_context.replace('\\', "/");
             let context_matches = results
                 .iter()
-                .filter(|(path, _)| path.starts_with(&dir_context))
+                .filter(|(path, _)| path.replace('\\', "/").starts_with(&normalized_context))
                 .count();
 
             log_info!(
@@ -3113,10 +3114,11 @@ mod tests_searchengine_state {
                 dir_context
             );
 
-            // Count results from context directory
+            // Count results from context directory (normalize separators for Windows)
+            let normalized_context = dir_context.replace('\\', "/");
             let context_matches = results
                 .iter()
-                .filter(|(path, _)| path.starts_with(&dir_context))
+                .filter(|(path, _)| path.replace('\\', "/").starts_with(&normalized_context))
                 .count();
 
             log_info!(

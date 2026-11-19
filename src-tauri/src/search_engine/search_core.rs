@@ -1797,14 +1797,17 @@ mod tests_search_core {
 
     // Helper function to create a temporary directory structure for testing
     fn create_temp_dir_structure() -> std::path::PathBuf {
-        // Create unique temp directory using timestamp and random number
+        // Create unique temp directory using monotonic counter, pid, and nanosecond timestamp
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unique_id = format!(
-            "{}_{}",
+            "{}_{}_{}",
             std::process::id(),
+            seq,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis()
+                .as_nanos()
         );
 
         let temp_dir = std::env::temp_dir().join(format!("search_core_test_{unique_id}"));
