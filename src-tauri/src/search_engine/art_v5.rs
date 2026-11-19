@@ -2535,7 +2535,7 @@ mod tests_art_v5 {
 
             // Use the most common prefixes
             let mut prefix_counts: Vec<(String, usize)> = common_dirs.into_iter().collect();
-            prefix_counts.sort_by(|a, b| b.1.cmp(&a.1));
+            prefix_counts.sort_by_key(|a| std::cmp::Reverse(a.1));
 
             for (prefix, _count) in prefix_counts.into_iter().take(5) {
                 prefixes.push(prefix);

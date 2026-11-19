@@ -355,7 +355,7 @@ where
         let node = self.allocate_node(key.clone(), value);
 
         // Convert Box to raw pointer
-        let node_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(node)) };
+        let node_ptr = NonNull::from(Box::leak(node));
 
         // Insert into map before linking into list so `map` and list stay consistent
         self.map.insert(key, node_ptr);

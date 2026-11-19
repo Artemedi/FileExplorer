@@ -763,6 +763,7 @@ impl SearchEngineState {
                             *discovered_files += 1;
 
                             // Update progress more frequently for better UX
+                            #[allow(unknown_lints, clippy::manual_is_multiple_of)]
                             if *discovered_files % 10 == 0 || *discovered_files == 1 {
                                 self.update_progress_safely(
                                     *discovered_files,

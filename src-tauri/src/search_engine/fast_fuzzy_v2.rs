@@ -474,7 +474,7 @@ impl PathMatcher {
             .collect();
 
         // Sort candidates by hit count descending (most trigrams in common first)
-        candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
 
         // Take only the top N candidates to score (significantly reduces work and speed up search)
         let candidates_to_score = candidates

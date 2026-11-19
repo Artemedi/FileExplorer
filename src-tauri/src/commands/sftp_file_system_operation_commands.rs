@@ -1547,13 +1547,21 @@ mod unit_tests {
             .expect("persist trusted host key");
 
         let stored = fs::read_to_string(&kh_path).expect("read known_hosts");
-        let res_trusted =
-            verify_host_key_against_contents("example.com", 2222, &fp_a, &[stored.clone()]);
+        let res_trusted = verify_host_key_against_contents(
+            "example.com",
+            2222,
+            &fp_a,
+            std::slice::from_ref(&stored),
+        );
         assert_eq!(res_trusted, HostKeyVerification::Trusted);
 
         // 3. Different key on same host:port -> Mismatch
-        let res_mismatch =
-            verify_host_key_against_contents("example.com", 2222, &fp_b, &[stored.clone()]);
+        let res_mismatch = verify_host_key_against_contents(
+            "example.com",
+            2222,
+            &fp_b,
+            std::slice::from_ref(&stored),
+        );
         assert_eq!(
             res_mismatch,
             HostKeyVerification::Mismatch {
