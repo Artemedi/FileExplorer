@@ -71,6 +71,7 @@ fn all_commands() -> fn(Invoke) -> bool {
         search_engine_commands::get_indexing_status,
         search_engine_commands::stop_indexing,
         search_engine_commands::get_suggestions,
+        search_engine_commands::set_search_current_directory,
         // Preview commands
         preview_commands::build_preview,
         //sftp commands

@@ -1,12 +1,16 @@
 use crate::models::ranking_config::RankingConfig;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(any(feature = "search-progress-logging", feature = "index-progress-logging"))]
-use crate::log_info;
 #[cfg(any(feature = "search-error-logging", feature = "index-error-logging"))]
 use crate::log_error;
+#[cfg(any(
+    feature = "search-progress-logging",
+    feature = "index-progress-logging"
+))]
+use crate::log_info;
 use crate::search_engine::art_v5::ART;
 use crate::search_engine::fast_fuzzy_v2::PathMatcher;
 use crate::search_engine::path_cache_wrapper::PathCache;
@@ -46,11 +50,14 @@ pub struct SearchCore {
     /// Track recency of path usage
     recency_map: HashMap<String, Instant>,
 
+    /// Track known directory paths at index time to avoid blocking stat calls during ranking
+    dir_paths: HashSet<String>,
+
     /// Preferred file extensions (ranked higher)
     preferred_extensions: Vec<String>,
 
-    /// Flag to signal that indexing should stop
-    stop_indexing: AtomicBool,
+    /// Flag to signal that indexing should stop (shared with SearchEngineState)
+    stop_indexing: Arc<AtomicBool>,
 
     //Optimizations//
     /// Configuration for ranking results
@@ -61,7 +68,7 @@ pub struct SearchCore {
 
     /// Track if the last search was a cache hit
     last_search_was_cache_hit: bool,
-    
+
     /// String buffer for path normalization
     path_buffer: String,
 }
@@ -79,7 +86,12 @@ impl SearchCore {
     ///
     /// # Performance
     /// Initialization is O(1) as actual data structures are created empty
-    pub fn new(cache_size: usize, max_results: usize, ttl: Duration, ranking_config: RankingConfig) -> Self {
+    pub fn new(
+        cache_size: usize,
+        max_results: usize,
+        ttl: Duration,
+        ranking_config: RankingConfig,
+    ) -> Self {
         let cap = max_results * 2;
         Self {
             cache: PathCache::with_ttl(cache_size, ttl),
@@ -89,6 +101,7 @@ impl SearchCore {
             current_directory: None,
             frequency_map: HashMap::new(),
             recency_map: HashMap::new(),
+            dir_paths: HashSet::new(),
             preferred_extensions: vec![
                 "txt".to_string(),
                 "pdf".to_string(),
@@ -105,7 +118,7 @@ impl SearchCore {
                 "mp4".to_string(),
                 "mp3".to_string(),
             ],
-            stop_indexing: AtomicBool::new(false),
+            stop_indexing: Arc::new(AtomicBool::new(false)),
             ranking_config, // Use the provided ranking_config instead of default
             results_buffer: Vec::with_capacity(cap),
             last_search_was_cache_hit: false,
@@ -130,11 +143,18 @@ impl SearchCore {
     ///
     /// # Performance
     /// O(m) where m is the length of the path
-    fn normalize_path(&mut self, path: &str) -> String {
-        // Reuse buffer to avoid allocation
-        self.path_buffer.clear();
-        self.path_buffer.reserve(path.len());
-        
+    /// Normalizes a path string into a canonical forward-slash representation,
+    /// preserving UNC `//` prefixes.
+    pub fn normalize_path_str(path: &str) -> String {
+        let mut buf = String::with_capacity(path.len());
+        Self::normalize_path_into(path, &mut buf);
+        buf
+    }
+
+    fn normalize_path_into(path: &str, buf: &mut String) {
+        buf.clear();
+        buf.reserve(path.len());
+
         let mut saw_slash = false;
         let mut started = false;
 
@@ -151,10 +171,17 @@ impl SearchCore {
 
         if let Some(&first) = chars.peek() {
             if first == '/' || first == '\\' {
-                self.path_buffer.push('/');
+                buf.push('/');
                 saw_slash = true;
                 started = true;
                 chars.next();
+                // Preserve UNC prefix `//` (e.g. `\\server\share` -> `//server/share`)
+                if let Some(&second) = chars.peek() {
+                    if second == '/' || second == '\\' {
+                        buf.push('/');
+                        chars.next();
+                    }
+                }
             }
         }
 
@@ -162,25 +189,42 @@ impl SearchCore {
             match c {
                 '/' | '\\' => {
                     if !saw_slash && started {
-                        self.path_buffer.push('/');
+                        buf.push('/');
                         saw_slash = true;
                     }
                 }
                 _ => {
-                    self.path_buffer.push(c);
+                    buf.push(c);
                     saw_slash = false;
                     started = true;
                 }
             }
         }
 
-        // Remove trailing slash (unless result is exactly "/")
-        let len = self.path_buffer.len();
-        if len > 1 && self.path_buffer.ends_with('/') {
-            self.path_buffer.truncate(len - 1);
+        // Remove trailing slash (unless result is exactly "/" or "//")
+        let len = buf.len();
+        if len > 1 && buf != "//" && buf.ends_with('/') {
+            buf.truncate(len - 1);
         }
+    }
 
-        // Clone the buffer content to return owned string
+    /// Checks whether a path matches any of the exclusion patterns (normalized, case-insensitive).
+    pub(crate) fn path_matches_excluded_patterns(path: &str, excluded_patterns: &[String]) -> bool {
+        if excluded_patterns.is_empty() {
+            return false;
+        }
+        let normalized_path = Self::normalize_path_str(path).to_lowercase();
+        for pattern in excluded_patterns {
+            let normalized_pattern = pattern.replace('\\', "/").to_lowercase();
+            if !normalized_pattern.is_empty() && normalized_path.contains(&normalized_pattern) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn normalize_path(&mut self, path: &str) -> String {
+        Self::normalize_path_into(path, &mut self.path_buffer);
         self.path_buffer.clone()
     }
 
@@ -192,9 +236,22 @@ impl SearchCore {
     /// * `directory` - Optional directory path to use as context
     ///
     /// # Performance
-    /// O(1) - Simple assignment operation
+    /// O(m) - Normalizes directory path
     pub fn set_current_directory(&mut self, directory: Option<String>) {
-        self.current_directory = directory;
+        self.current_directory = directory
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .map(|d| self.normalize_path(&d));
+    }
+
+    /// Shares an external `AtomicBool` stop flag with `SearchEngineState`.
+    pub fn set_stop_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.stop_indexing = flag;
+    }
+
+    /// Returns a clone of the shared stop flag.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop_indexing)
     }
 
     /// Returns whether the last search operation was a cache hit.
@@ -221,15 +278,31 @@ impl SearchCore {
     /// O(n*m) where n is number of paths and m is average path length
     /// More efficient than multiple single add_path calls due to reduced overhead
     pub fn add_paths_batch(&mut self, paths: Vec<&str>, excluded_patterns: Option<&Vec<String>>) {
+        let with_meta: Vec<(&str, bool)> = paths
+            .into_iter()
+            .map(|p| (p, std::path::Path::new(p).is_dir()))
+            .collect();
+        self.add_paths_batch_with_metadata(with_meta, excluded_patterns);
+    }
+
+    /// Adds multiple paths with precomputed `is_dir` metadata in a batch operation.
+    pub fn add_paths_batch_with_metadata(
+        &mut self,
+        paths: Vec<(&str, bool)>,
+        excluded_patterns: Option<&Vec<String>>,
+    ) {
         #[cfg(feature = "index-progress-logging")]
         let start_time = Instant::now();
-        
+
         #[cfg(feature = "index-progress-logging")]
-        log_info!("Adding batch of {} paths with memory optimization", paths.len());
-        
+        log_info!(
+            "Adding batch of {} paths with memory optimization",
+            paths.len()
+        );
+
         // Process in smaller chunks to prevent memory pressure
         const CHUNK_SIZE: usize = 250;
-        
+
         for chunk in paths.chunks(CHUNK_SIZE) {
             // Check for cancellation before each chunk
             if self.should_stop_indexing() {
@@ -237,29 +310,37 @@ impl SearchCore {
                 log_info!("Batch indexing stopped due to cancellation signal");
                 break;
             }
-            
+
             // Process each path in the chunk
-            for path in chunk {
+            for &(path, is_dir) in chunk {
                 if self.should_stop_indexing() {
                     break;
                 }
-                self.add_path_with_exclusion_check(path, excluded_patterns);
+                if let Some(patterns) = excluded_patterns {
+                    if Self::path_matches_excluded_patterns(path, patterns) {
+                        continue;
+                    }
+                }
+                self.add_path_with_metadata(path, is_dir);
             }
-            
+
             // Purge cache periodically to prevent memory buildup
             if chunk.len() == CHUNK_SIZE {
                 self.cache.purge_expired();
             }
-            
+
             // Yield control briefly to prevent blocking
             std::thread::yield_now();
         }
-        
+
         // Final cache cleanup
         self.cache.purge_expired();
-        
+
         #[cfg(feature = "index-progress-logging")]
-        log_info!("Optimized batch add completed in {:?}", start_time.elapsed());
+        log_info!(
+            "Optimized batch add completed in {:?}",
+            start_time.elapsed()
+        );
     }
 
     /// Adds or updates a path in the search engines.
@@ -274,32 +355,48 @@ impl SearchCore {
     /// - Average case: O(m) where m is the length of the path
     /// - Paths are added with ~300 paths/ms throughput
     pub fn add_path(&mut self, path: &str) {
+        let is_dir = std::path::Path::new(path).is_dir();
+        self.add_path_with_metadata(path, is_dir);
+    }
+
+    /// Adds or updates a path in the search engines with explicit `is_dir` metadata.
+    pub fn add_path_with_metadata(&mut self, path: &str, is_dir: bool) {
         #[cfg(feature = "index-progress-logging")]
         let start_time = Instant::now();
-        
+
         #[cfg(feature = "index-progress-logging")]
         log_info!("Adding path: '{}'", path);
-        
+
         let normalized_path = self.normalize_path(path);
-        
+
         #[cfg(feature = "index-progress-logging")]
         log_info!("Normalized path: '{}'", normalized_path);
-        
+
         let mut score = 1.0;
 
         // check if we have existing frequency data to adjust score and boost score for frequently accessed paths
         if let Some(freq) = self.frequency_map.get(&normalized_path) {
             score += (*freq as f32) * 0.01;
-            
+
             #[cfg(feature = "index-progress-logging")]
-            log_info!("Boosting path score based on frequency ({}): {:.3}", freq, score);
+            log_info!(
+                "Boosting path score based on frequency ({}): {:.3}",
+                freq,
+                score
+            );
+        }
+
+        if is_dir {
+            self.dir_paths.insert(normalized_path.clone());
+        } else {
+            self.dir_paths.remove(&normalized_path);
         }
 
         // Update all modules and clean cache
         self.trie.insert(&normalized_path, score);
         self.fuzzy_matcher.add_path(&normalized_path);
         self.cache.purge_expired();
-        
+
         #[cfg(feature = "index-progress-logging")]
         log_info!("Path added successfully in {:?}", start_time.elapsed());
     }
@@ -315,23 +412,27 @@ impl SearchCore {
     ///
     /// # Performance
     /// O(m + p) where m is path length and p is number of patterns
-    pub fn add_path_with_exclusion_check(&mut self, path: &str, excluded_patterns: Option<&Vec<String>>) {
+    pub fn add_path_with_exclusion_check(
+        &mut self,
+        path: &str,
+        excluded_patterns: Option<&Vec<String>>,
+    ) {
         #[cfg(feature = "index-progress-logging")]
         log_info!("Checking path for exclusion: '{}'", path);
-        
+
         // Check if path should be excluded
         if let Some(patterns) = excluded_patterns {
             if self.should_exclude_path(path, &patterns) {
                 #[cfg(feature = "index-progress-logging")]
                 log_info!("Path excluded by pattern: '{}'", path);
-                
+
                 return;
             }
         }
 
         #[cfg(feature = "index-progress-logging")]
         log_info!("Path passed exclusion check: '{}'", path);
-        
+
         // If not excluded, add normally
         self.add_path(path);
     }
@@ -345,7 +446,7 @@ impl SearchCore {
     pub fn stop_indexing(&mut self) {
         #[cfg(feature = "index-progress-logging")]
         log_info!("Signal received to stop indexing operation");
-        
+
         self.stop_indexing.store(true, Ordering::SeqCst);
     }
 
@@ -358,7 +459,7 @@ impl SearchCore {
     pub fn reset_stop_flag(&mut self) {
         #[cfg(feature = "index-progress-logging")]
         log_info!("Resetting indexing stop flag");
-        
+
         self.stop_indexing.store(false, Ordering::SeqCst);
     }
 
@@ -373,12 +474,12 @@ impl SearchCore {
     /// O(1) - Simple atomic flag read operation
     pub fn should_stop_indexing(&self) -> bool {
         let should_stop = self.stop_indexing.load(Ordering::SeqCst);
-        
+
         #[cfg(feature = "index-progress-logging")]
         if should_stop {
             log_info!("Indexing stop flag is set, will stop indexing");
         }
-        
+
         should_stop
     }
 
@@ -397,30 +498,20 @@ impl SearchCore {
     /// # Performance
     /// O(n) where n is the number of excluded patterns
     pub fn should_exclude_path(&mut self, path: &str, excluded_patterns: &Vec<String>) -> bool {
-        if excluded_patterns.is_empty() {
-            return false;
+        let excluded = Self::path_matches_excluded_patterns(path, excluded_patterns);
+        #[cfg(feature = "index-progress-logging")]
+        if excluded {
+            let normalized_path = self.normalize_path(path);
+            log_info!(
+                "Excluding path '{}' due to excluded pattern",
+                normalized_path
+            );
         }
-
-        // Normalize path for consistent matching
-        let normalized_path = self.normalize_path(path);
-        
-        for pattern in excluded_patterns {
-            // Convert backslashes in pattern to forward slashes for consistency
-            let normalized_pattern = pattern.replace('\\', "/");
-            
-            if normalized_path.contains(&normalized_pattern) {
-                #[cfg(feature = "index-progress-logging")]
-                log_info!("Excluding path '{}' due to pattern '{}'", normalized_path, normalized_pattern);
-                
-                return true;
-            }
-        }
-        
-        false
+        excluded
     }
 
     /// Recursively adds a path and all its subdirectories and files to the index.
-    /// 
+    ///
     /// Optimized version to prevent stack overflow and memory issues on large directories.
     /// Uses iterative processing and conservative memory limits.
     ///
@@ -431,7 +522,11 @@ impl SearchCore {
     /// # Performance
     /// - O(n) where n is the number of files and directories under the path
     /// - Optimized with memory-safe patterns for large directories
-    pub async fn add_paths_recursive(&mut self, root_path: &str, excluded_patterns: Option<&Vec<String>>) {
+    pub async fn add_paths_recursive(
+        &mut self,
+        root_path: &str,
+        excluded_patterns: Option<&Vec<String>>,
+    ) {
         use std::sync::{Arc, Mutex};
         use tokio::task;
         use walkdir::WalkDir;
@@ -439,15 +534,19 @@ impl SearchCore {
         let index_start = Instant::now();
 
         #[cfg(feature = "index-progress-logging")]
-        log_info!("Starting optimized async walkdir-based indexing: '{}'", root_path);
+        log_info!(
+            "Starting optimized async walkdir-based indexing: '{}'",
+            root_path
+        );
 
         self.reset_stop_flag();
 
         let root_path = root_path.to_string();
         let excluded = excluded_patterns.cloned();
-        let collected_paths = Arc::new(Mutex::new(Vec::new()));
+        let collected_paths: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let collected_paths_clone = Arc::clone(&collected_paths);
+        let stop_flag = Arc::clone(&self.stop_indexing);
 
         let result = task::spawn_blocking(move || {
             let patterns_ref = excluded.clone().unwrap_or_default();
@@ -457,6 +556,12 @@ impl SearchCore {
                 .max_depth(15)
                 .into_iter()
                 .filter_entry(|e| {
+                    if stop_flag.load(Ordering::SeqCst) {
+                        return false;
+                    }
+                    if e.file_type().is_symlink() {
+                        return false;
+                    }
                     if let Some(name) = e.file_name().to_str() {
                         let lower = name.to_lowercase();
                         if lower == "appdata"
@@ -475,8 +580,7 @@ impl SearchCore {
                         }
                     }
                     if let Some(path_str) = e.path().to_str() {
-                        let path_lower = path_str.to_lowercase();
-                        if patterns_ref.iter().any(|p| path_lower.contains(&p.to_lowercase())) {
+                        if Self::path_matches_excluded_patterns(path_str, &patterns_ref) {
                             return false;
                         }
                     }
@@ -484,9 +588,14 @@ impl SearchCore {
                 })
                 .filter_map(Result::ok)
             {
+                if stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 // More conservative file limit to prevent memory issues
                 file_count += 1;
-                if file_count > 200000 { // Reduced from 350000
+                if file_count > 200000 {
+                    // Reduced from 350000
                     #[cfg(feature = "index-progress-logging")]
                     log_info!("Stopping walkdir due to file count limit: {}", file_count);
                     break;
@@ -495,23 +604,31 @@ impl SearchCore {
                 let path = entry.path();
 
                 // Explicitly skip symlinks and unreadable entries
-                if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                if entry.file_type().is_symlink()
+                    || path
+                        .symlink_metadata()
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false)
+                {
                     continue; // Skip symlinks
                 }
 
                 if let Some(path_str) = path.to_str() {
-                    if let Some(ref patterns) = excluded {
-                        if patterns.iter().any(|p| path_str.contains(p)) {
-                            #[cfg(feature = "index-progress-logging")]
-                            log_info!("Excluded by pattern: '{}'", path_str);
-                            continue;
-                        }
+                    if Self::path_matches_excluded_patterns(path_str, &patterns_ref) {
+                        #[cfg(feature = "index-progress-logging")]
+                        log_info!("Excluded by pattern: '{}'", path_str);
+                        continue;
                     }
 
-                    if let Ok(metadata) = std::fs::metadata(path) {
+                    let ft = entry.file_type();
+                    if ft.is_file() || ft.is_dir() {
+                        if let Ok(mut paths) = collected_paths_clone.lock() {
+                            paths.push((path_str.to_string(), ft.is_dir()));
+                        }
+                    } else if let Ok(metadata) = std::fs::metadata(path) {
                         if metadata.is_file() || metadata.is_dir() {
                             if let Ok(mut paths) = collected_paths_clone.lock() {
-                                paths.push(path_str.to_string());
+                                paths.push((path_str.to_string(), metadata.is_dir()));
                             }
                         }
                     } else {
@@ -524,7 +641,8 @@ impl SearchCore {
             if let Ok(mut paths) = collected_paths_clone.lock() {
                 paths.shrink_to_fit();
             }
-        }).await;
+        })
+        .await;
 
         if let Err(_err) = result {
             #[cfg(feature = "index-error-logging")]
@@ -533,8 +651,16 @@ impl SearchCore {
         }
 
         let collected = Arc::try_unwrap(collected_paths)
-            .map(|mutex| mutex.into_inner().map_err(|_| "Failed to extract paths from mutex"))
-            .unwrap_or_else(|arc| arc.lock().map(|guard| guard.clone()).map_err(|_| "Failed to lock paths"))
+            .map(|mutex| {
+                mutex
+                    .into_inner()
+                    .map_err(|_| "Failed to extract paths from mutex")
+            })
+            .unwrap_or_else(|arc| {
+                arc.lock()
+                    .map(|guard| guard.clone())
+                    .map_err(|_| "Failed to lock paths")
+            })
             .unwrap_or_else(|_| Vec::new());
 
         // Assert or log error if nothing was indexed
@@ -546,19 +672,26 @@ impl SearchCore {
 
         // Process in smaller batches to prevent memory pressure
         const BATCH_SIZE: usize = 100;
-        
+
         #[cfg(feature = "index-progress-logging")]
-        log_info!("Processing {} collected paths in batches of {}", collected.len(), BATCH_SIZE);
+        log_info!(
+            "Processing {} collected paths in batches of {}",
+            collected.len(),
+            BATCH_SIZE
+        );
 
         for chunk in collected.chunks(BATCH_SIZE) {
             if self.should_stop_indexing() {
                 break;
             }
-            
+
             // Process batch
-            let batch_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-            self.add_paths_batch(batch_refs, None);
-            
+            let batch_refs: Vec<(&str, bool)> = chunk
+                .iter()
+                .map(|(s, is_dir)| (s.as_str(), *is_dir))
+                .collect();
+            self.add_paths_batch_with_metadata(batch_refs, None);
+
             // Yield control between batches
             tokio::task::yield_now().await;
         }
@@ -593,29 +726,30 @@ impl SearchCore {
     pub fn remove_path(&mut self, path: &str) {
         #[cfg(feature = "index-progress-logging")]
         let start_time = Instant::now();
-        
+
         #[cfg(feature = "index-progress-logging")]
         log_info!("Removing path: '{}'", path);
-        
+
         let normalized_path = self.normalize_path(path);
-        
+
         #[cfg(feature = "index-progress-logging")]
         log_info!("Normalized path for removal: '{}'", normalized_path);
-        
+
         // Remove from modules
         self.trie.remove(&normalized_path);
         self.fuzzy_matcher.remove_path(&normalized_path);
+        self.dir_paths.remove(&normalized_path);
 
         // Clear the entire cache (this is a simplification, because of previous bugs)
         self.cache.clear();
-        
+
         #[cfg(feature = "index-progress-logging")]
         log_info!("Cache cleared after path removal");
 
         // remove from frequency and recency maps
         let _had_frequency = self.frequency_map.remove(&normalized_path).is_some();
         let _had_recency = self.recency_map.remove(&normalized_path).is_some();
-        
+
         #[cfg(feature = "index-progress-logging")]
         {
             if _had_frequency {
@@ -624,7 +758,7 @@ impl SearchCore {
             if _had_recency {
                 log_info!("Removed recency data for path");
             }
-            
+
             log_info!("Path removal completed in {:?}", start_time.elapsed());
         }
     }
@@ -642,75 +776,88 @@ impl SearchCore {
     pub fn remove_paths_recursive(&mut self, path: &str) {
         #[cfg(feature = "index-progress-logging")]
         let start_time = Instant::now();
-        
+
         #[cfg(feature = "index-progress-logging")]
         log_info!("Starting recursive removal of path: '{}'", path);
-        
-        // Remove the path itself first
-        self.remove_path(path);
 
-        // Check if dir
-        let path_obj = std::path::Path::new(path);
-        if !path_obj.exists() || !path_obj.is_dir() {
-            #[cfg(feature = "index-progress-logging")]
-            {
-                if !path_obj.exists() {
-                    log_info!("Path doesn't exist, skipping recursion: '{}'", path);
-                } else {
-                    log_info!("Path is not a directory, skipping recursion: '{}'", path);
-                }
-            }
-            
-            return;
-        }
-
-        #[cfg(feature = "index-progress-logging")]
-        log_info!(
-            "Recursively removing directory from index: {}",
-            path
-        );
-        
-        #[allow(unused_variables)]
-        let mut removed_count = 1;
-
-        let mut paths_to_remove = Vec::new();
-
-        // Walk dir
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.filter_map(Result::ok) {
-                let entry_path = entry.path();
-                if let Some(entry_str) = entry_path.to_str() {
-                    paths_to_remove.push(entry_str.to_string());
-                }
-            }
+        let normalized_root = self.normalize_path(path);
+        let child_prefix = if normalized_root == "/" {
+            "/".to_string()
         } else {
-            #[cfg(feature = "index-error-logging")]
-            log_error!("Failed to read directory '{}' for removal", path);
+            format!("{normalized_root}/")
+        };
+
+        // Remove the path itself first
+        self.remove_path(&normalized_root);
+
+        #[allow(unused_variables)]
+        let mut removed_count = 1usize;
+
+        // 1. Remove all matching indexed paths by normalized prefix from the in-memory index,
+        //    so even if the directory was already deleted from disk, stale entries are purged.
+        loop {
+            let matches: Vec<String> = self
+                .trie
+                .find_completions(&normalized_root)
+                .into_iter()
+                .map(|(p, _)| p)
+                .filter(|p| p == &normalized_root || p.starts_with(&child_prefix))
+                .collect();
+            if matches.is_empty() {
+                break;
+            }
+            for p in matches {
+                self.remove_path(&p);
+                removed_count += 1;
+            }
         }
 
-        #[cfg(feature = "index-progress-logging")]
-        log_info!("Found {} child paths to remove under '{}'", paths_to_remove.len(), path);
+        // Also purge any remaining metadata entries under the prefix
+        self.dir_paths
+            .retain(|p| p != &normalized_root && !p.starts_with(&child_prefix));
+        self.frequency_map
+            .retain(|p, _| p != &normalized_root && !p.starts_with(&child_prefix));
+        self.recency_map
+            .retain(|p, _| p != &normalized_root && !p.starts_with(&child_prefix));
 
-        // Now remove each path
-        for path_to_remove in paths_to_remove {
-            if std::path::Path::new(&path_to_remove).is_dir() {
-                #[cfg(feature = "index-progress-logging")]
-                log_info!("Recursing into directory for removal: '{}'", path_to_remove);
-                
-                self.remove_paths_recursive(&path_to_remove);
-                
-                removed_count += 1;
-            } else {
-                self.remove_path(&path_to_remove);
-                
-                removed_count += 1;
+        // 2. If the directory still exists on disk and is NOT a symlink/junction,
+        //    walk it iteratively (skipping symlinks/junctions) to catch any entries
+        //    beyond `find_completions`'s per-call result cap.
+        let path_obj = std::path::Path::new(path);
+        let is_real_dir = path_obj
+            .symlink_metadata()
+            .map(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+            .unwrap_or(false);
+
+        if is_real_dir {
+            let mut dir_stack = vec![path_obj.to_path_buf()];
+            while let Some(dir) = dir_stack.pop() {
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.filter_map(Result::ok) {
+                        let ft = match entry.file_type() {
+                            Ok(ft) => ft,
+                            Err(_) => continue,
+                        };
+                        if ft.is_symlink() {
+                            continue;
+                        }
+                        let entry_path = entry.path();
+                        if let Some(entry_str) = entry_path.to_str() {
+                            self.remove_path(entry_str);
+                            removed_count += 1;
+                        }
+                        if ft.is_dir() {
+                            dir_stack.push(entry_path);
+                        }
+                    }
+                }
             }
         }
 
         // Ensure the cache is purged of any entries that might contain references to removed paths
         let _ = removed_count;
         self.cache.purge_expired();
-        
+
         #[cfg(feature = "index-progress-logging")]
         {
             let elapsed = start_time.elapsed();
@@ -719,9 +866,14 @@ impl SearchCore {
             } else {
                 removed_count as f64 // Avoid division by zero
             };
-            
-            log_info!("Completed recursive removal of '{}': {} paths in {:?} ({:.2} paths/ms)",
-                     path, removed_count, elapsed, paths_per_ms);
+
+            log_info!(
+                "Completed recursive removal of '{}': {} paths in {:?} ({:.2} paths/ms)",
+                path,
+                removed_count,
+                elapsed,
+                paths_per_ms
+            );
         }
     }
 
@@ -738,18 +890,19 @@ impl SearchCore {
             let cache_size = self.cache.len();
             let frequency_size = self.frequency_map.len();
             let recency_size = self.recency_map.len();
-            
+
             log_info!("Clearing all engine data - trie: {} items, cache: {} items, frequency map: {} items, recency map: {} items",
                      trie_size, cache_size, frequency_size, recency_size);
         }
-        
+
         self.trie.clear();
         self.cache.clear();
         self.frequency_map.clear();
         self.recency_map.clear();
+        self.dir_paths.clear();
 
         self.fuzzy_matcher = PathMatcher::new();
-        
+
         #[cfg(feature = "index-progress-logging")]
         log_info!("Engine data cleared successfully");
     }
@@ -823,43 +976,53 @@ impl SearchCore {
     pub fn search(&mut self, query: &str) -> Vec<(String, f32)> {
         #[cfg(feature = "search-progress-logging")]
         let search_start = Instant::now();
-        
+
         #[cfg(feature = "search-progress-logging")]
         log_info!("Search started for query: '{}'", query);
-        
+
         if query.is_empty() {
             #[cfg(feature = "search-progress-logging")]
             log_info!("Empty query provided, returning empty results");
-            
+
             return Vec::new();
         }
 
         // Use trimmed query directly, avoid unnecessary allocation for now
         let normalized_query = query.trim();
-        let normalized_query_owned = normalized_query.to_string(); // Only allocate when needed
+        let cache_key = format!(
+            "{}|dir={}",
+            normalized_query,
+            self.current_directory.as_deref().unwrap_or("")
+        );
 
         #[cfg(feature = "search-progress-logging")]
         log_info!("Normalized query: '{}'", normalized_query);
 
         // 1. Check cache first
-        if let Some(cached_data) = self.cache.get(&normalized_query_owned) {
+        if let Some(cached_data) = self.cache.get(&cache_key) {
             #[cfg(feature = "search-progress-logging")]
-            log_info!("Cache hit for query: '{}', found {} cached results", 
-                     normalized_query, cached_data.results.len());
-            
+            log_info!(
+                "Cache hit for query: '{}', found {} cached results",
+                normalized_query,
+                cached_data.results.len()
+            );
+
             // If we have cached results, return them (they represent the complete search result for this query)
             // We cached up to max_results, so if we find cached data, it's the complete result
             #[cfg(feature = "search-progress-logging")]
             log_info!("Returning {} cached results", cached_data.results.len());
-            
+
             self.last_search_was_cache_hit = true;
             return cached_data.results;
         }
-        
+
         // This will be a cache miss - either no cache entry or insufficient cached results
         self.last_search_was_cache_hit = false;
         #[cfg(feature = "search-progress-logging")]
-        log_info!("Cache miss for query: '{}', performing full search", normalized_query);
+        log_info!(
+            "Cache miss for query: '{}', performing full search",
+            normalized_query
+        );
 
         #[cfg(feature = "search-progress-logging")]
         let prefix_start = Instant::now();
@@ -874,7 +1037,7 @@ impl SearchCore {
             None, // should add current_dif_ref, but rn not very performant
             false,
         );
-        
+
         #[cfg(feature = "search-progress-logging")]
         {
             let prefix_duration = prefix_start.elapsed();
@@ -894,15 +1057,16 @@ impl SearchCore {
 
             #[cfg(feature = "search-progress-logging")]
             log_info!(
-                "Insufficient prefix results ({}), performing fuzzy search for up to {} more results", 
-                self.results_buffer.len(), 
+                "Insufficient prefix results ({}), performing fuzzy search for up to {} more results",
+                self.results_buffer.len(),
                 self.max_results - self.results_buffer.len()
             );
 
-            let fuzzy_results = self
-                .fuzzy_matcher
-                .search(&normalized_query, self.max_results - self.results_buffer.len());
-            
+            let fuzzy_results = self.fuzzy_matcher.search(
+                &normalized_query,
+                self.max_results - self.results_buffer.len(),
+            );
+
             #[cfg(feature = "search-progress-logging")]
             {
                 let fuzzy_duration = fuzzy_start.elapsed();
@@ -913,10 +1077,11 @@ impl SearchCore {
                 );
             }
 
-            let mut seen: HashSet<String> = self.results_buffer.iter().map(|(p, _)| p.clone()).collect();
+            let mut seen: HashSet<String> =
+                self.results_buffer.iter().map(|(p, _)| p.clone()).collect();
             #[allow(unused_variables)]
             let mut added_fuzzy = 0;
-            
+
             for (p, s) in fuzzy_results {
                 if !seen.contains(&p) {
                     seen.insert(p.clone());
@@ -924,33 +1089,39 @@ impl SearchCore {
                     added_fuzzy += 1;
                 }
             }
-            
+
             #[cfg(feature = "search-progress-logging")]
-            log_info!("Added {} unique fuzzy results after deduplication", added_fuzzy);
+            log_info!(
+                "Added {} unique fuzzy results after deduplication",
+                added_fuzzy
+            );
         }
-        
+
         if self.results_buffer.is_empty() {
             #[cfg(feature = "search-error-logging")]
             log_error!("No results found for query: '{}'", normalized_query);
-            
+
             #[cfg(feature = "search-progress-logging")]
-            log_info!("Search completed with no results in {:?}", search_start.elapsed());
-            
+            log_info!(
+                "Search completed with no results in {:?}",
+                search_start.elapsed()
+            );
+
             return Vec::new();
         }
 
         // 4. Rank combined results
         #[cfg(feature = "search-progress-logging")]
         let ranking_start = Instant::now();
-        
+
         #[cfg(feature = "search-progress-logging")]
         log_info!("Ranking {} combined results", self.results_buffer.len());
-        
+
         // Clone buffer temporarily to avoid borrowing conflicts
         let mut temp_results = self.results_buffer.clone();
         self.rank_results(&mut temp_results, &normalized_query);
         self.results_buffer = temp_results;
-        
+
         #[cfg(feature = "search-progress-logging")]
         log_info!("Ranking completed in {:?}", ranking_start.elapsed());
 
@@ -958,45 +1129,51 @@ impl SearchCore {
         let _original_len = self.results_buffer.len();
         if self.results_buffer.len() > self.max_results {
             self.results_buffer.truncate(self.max_results);
-            
+
             #[cfg(feature = "search-progress-logging")]
-            log_info!("Truncated {} results to max_results: {}", _original_len, self.max_results);
+            log_info!(
+                "Truncated {} results to max_results: {}",
+                _original_len,
+                self.max_results
+            );
         }
 
-        // Reserve capacity for cache - store up to max_results for better cache hits
-        let cache_size = self.results_buffer.len().min(self.max_results);
-        let mut cached_results = Vec::with_capacity(cache_size);
-        for (p, s) in self.results_buffer.iter().take(cache_size) {
-            cached_results.push((p.clone(), *s));
-        }
-        
-        #[cfg(feature = "search-progress-logging")]
-        log_info!("Caching {} results for query: '{}'", cached_results.len(), normalized_query);
-        
-        self.cache.insert(normalized_query.to_string().clone(), cached_results);
-        
         if !self.results_buffer.is_empty() {
             #[cfg(feature = "search-progress-logging")]
-            log_info!("Recording usage for top result: '{}'", self.results_buffer[0].0);
-            
+            log_info!(
+                "Recording usage for top result: '{}'",
+                self.results_buffer[0].0
+            );
+
             let first_result = self.results_buffer[0].0.clone();
             self.record_path_usage(&first_result);
         }
-        
+
         // Create final results vector to return
         let final_results = self.results_buffer.clone();
-        
+
         // Cache the results for future identical queries
+        #[cfg(feature = "search-progress-logging")]
+        log_info!(
+            "Caching {} results for query: '{}'",
+            final_results.len(),
+            normalized_query
+        );
+
         let cached_results = crate::search_engine::path_cache_wrapper::CachedSearchResults {
             results: final_results.clone(),
         };
-        self.cache.put(normalized_query_owned, cached_results);
-        
+        self.cache.put(cache_key, cached_results);
+
         #[cfg(feature = "search-progress-logging")]
         {
             let total_duration = search_start.elapsed();
-            log_info!("Search completed in {:?} with {} results", total_duration, final_results.len());
-            
+            log_info!(
+                "Search completed in {:?} with {} results",
+                total_duration,
+                final_results.len()
+            );
+
             if !final_results.is_empty() {
                 log_info!("Top 3 results:");
                 for (i, (path, score)) in final_results.iter().take(3).enumerate() {
@@ -1004,7 +1181,7 @@ impl SearchCore {
                 }
             }
         }
-        
+
         final_results
     }
 
@@ -1025,25 +1202,62 @@ impl SearchCore {
     ///
     /// # Performance
     /// O(k log k) where k is the number of results to rank
+    fn is_path_in_dir(path_lc: &str, dir_lc: &str) -> bool {
+        if dir_lc == "/" {
+            return path_lc.starts_with('/');
+        }
+        if let Some(rest) = path_lc.strip_prefix(dir_lc) {
+            rest.is_empty() || rest.starts_with('/')
+        } else {
+            false
+        }
+    }
+
+    fn normalized_parent_dir(dir: &str) -> Option<String> {
+        let trimmed = dir.trim_end_matches('/');
+        let pos = trimmed.rfind('/')?;
+        if pos == 0 {
+            Some("/".to_string())
+        } else {
+            Some(trimmed[..pos].to_string())
+        }
+    }
+
     fn rank_results(&self, results: &mut Vec<(String, f32)>, query: &str) {
         #[cfg(feature = "search-progress-logging")]
         let ranking_detailed_start = Instant::now();
-        
-        // Precompute lowercase query once  
+
+        // Precompute lowercase query once
         let q_lc = query.to_lowercase();
-        
+
         #[cfg(feature = "search-progress-logging")]
-        log_info!("Starting ranking for {} results with query: '{}'", results.len(), query);
-        
+        log_info!(
+            "Starting ranking for {} results with query: '{}'",
+            results.len(),
+            query
+        );
+
         // Precompute lowercase preferred extensions
         let pref_exts_lc: Vec<String> = self
             .preferred_extensions
             .iter()
             .map(|e| e.to_lowercase())
             .collect();
-            
+
+        // Precompute normalized lowercase current_directory and its parent
+        let current_dir_lc = self
+            .current_directory
+            .as_deref()
+            .map(|d| Self::normalize_path_str(d).to_lowercase());
+        let parent_dir_lc = current_dir_lc
+            .as_deref()
+            .and_then(Self::normalized_parent_dir);
+
         #[cfg(feature = "search-progress-logging")]
-        log_info!("Using {} preferred extensions for ranking", pref_exts_lc.len());
+        log_info!(
+            "Using {} preferred extensions for ranking",
+            pref_exts_lc.len()
+        );
 
         // Track how many results get each type of boost for logging
         #[cfg(feature = "search-progress-logging")]
@@ -1060,7 +1274,7 @@ impl SearchCore {
                 // More frequently used paths get a boost
                 let final_boost = boost.min(self.ranking_config.max_frequency_boost);
                 new_score += final_boost;
-                
+
                 #[cfg(feature = "search-progress-logging")]
                 {
                     *boost_counts.entry("frequency").or_insert(0) += 1;
@@ -1073,7 +1287,7 @@ impl SearchCore {
                 let rec_boost_approx = self.ranking_config.recency_weight
                     / (1.0 + age * self.ranking_config.recency_lambda);
                 new_score += rec_boost_approx;
-                
+
                 #[cfg(feature = "search-progress-logging")]
                 {
                     *boost_counts.entry("recency").or_insert(0) += 1;
@@ -1081,25 +1295,24 @@ impl SearchCore {
             }
 
             // 3. Boost for current directory context
-            if let Some(current_dir) = &self.current_directory {
-                if path.starts_with(current_dir) {
+            if let Some(current_dir) = &current_dir_lc {
+                let path_lc = path.to_lowercase();
+                if Self::is_path_in_dir(&path_lc, current_dir) {
                     // Paths in the current directory get a significant boost
                     new_score += self.ranking_config.context_same_dir_boost;
-                    
+
                     #[cfg(feature = "search-progress-logging")]
                     {
                         *boost_counts.entry("same_dir").or_insert(0) += 1;
                     }
-                } else if let Some(parent_dir) = std::path::Path::new(current_dir).parent() {
-                    if let Some(parent_str) = parent_dir.to_str() {
-                        if path.starts_with(parent_str) {
-                            // Paths in the parent directory get a smaller boost
-                            new_score += self.ranking_config.context_parent_dir_boost;
-                            
-                            #[cfg(feature = "search-progress-logging")]
-                            {
-                                *boost_counts.entry("parent_dir").or_insert(0) += 1;
-                            }
+                } else if let Some(parent_str) = &parent_dir_lc {
+                    if Self::is_path_in_dir(&path_lc, parent_str) {
+                        // Paths in the parent directory get a smaller boost
+                        new_score += self.ranking_config.context_parent_dir_boost;
+
+                        #[cfg(feature = "search-progress-logging")]
+                        {
+                            *boost_counts.entry("parent_dir").or_insert(0) += 1;
                         }
                     }
                 }
@@ -1114,7 +1327,7 @@ impl SearchCore {
                 if let Some(pos) = pref_exts_lc.iter().position(|e| e == &ext_lc) {
                     let position_factor = 1.0 - (pos as f32 / pref_exts_lc.len() as f32);
                     new_score += self.ranking_config.extension_boost * position_factor;
-                    
+
                     #[cfg(feature = "search-progress-logging")]
                     {
                         *boost_counts.entry("extension").or_insert(0) += 1;
@@ -1122,7 +1335,7 @@ impl SearchCore {
                 }
                 if q_lc.contains(&ext_lc) {
                     new_score += self.ranking_config.extension_query_boost;
-                    
+
                     #[cfg(feature = "search-progress-logging")]
                     {
                         *boost_counts.entry("extension_query").or_insert(0) += 1;
@@ -1138,21 +1351,21 @@ impl SearchCore {
                 let f_lc = name.to_lowercase();
                 if f_lc == q_lc {
                     new_score += self.ranking_config.exact_match_boost;
-                    
+
                     #[cfg(feature = "search-progress-logging")]
                     {
                         *boost_counts.entry("exact_match").or_insert(0) += 1;
                     }
                 } else if f_lc.starts_with(&q_lc) {
                     new_score += self.ranking_config.prefix_match_boost;
-                    
+
                     #[cfg(feature = "search-progress-logging")]
                     {
                         *boost_counts.entry("prefix_match").or_insert(0) += 1;
                     }
                 } else if f_lc.contains(&q_lc) {
                     new_score += self.ranking_config.contains_match_boost;
-                    
+
                     #[cfg(feature = "search-progress-logging")]
                     {
                         *boost_counts.entry("contains_match").or_insert(0) += 1;
@@ -1160,11 +1373,10 @@ impl SearchCore {
                 }
             }
 
-            // 6. Boost for directories if prefer_directories is enabled
-            let path_obj = std::path::Path::new(path);
-            if path_obj.is_dir() {
+            // 6. Boost for directories if prefer_directories is enabled (using index-time metadata)
+            if self.dir_paths.contains(path.as_str()) {
                 new_score += self.ranking_config.directory_ranking_boost;
-                
+
                 #[cfg(feature = "search-progress-logging")]
                 {
                     *boost_counts.entry("directory").or_insert(0) += 1;
@@ -1173,48 +1385,57 @@ impl SearchCore {
 
             // Normalize score to be between 0 and 1 with sigmoid function
             new_score = 1.0 / (1.0 + (-new_score).exp());
-            
+
             #[cfg(feature = "search-progress-logging")]
             if new_score > _original_score + 0.1 {
                 // Only log significant score changes
-                log_info!("Path score boost: '{}' - {:.3} → {:.3}", path, _original_score, new_score);
+                log_info!(
+                    "Path score boost: '{}' - {:.3} → {:.3}",
+                    path,
+                    _original_score,
+                    new_score
+                );
             }
 
             *score = new_score;
         }
-        
+
         #[cfg(feature = "search-progress-logging")]
         {
             // Log boost statistics
             log_info!("Boost statistics for {} results:", results.len());
             for (boost_type, count) in boost_counts.iter() {
-                log_info!("  {}: {} paths ({:.1}%)", 
-                         boost_type, 
-                         count, 
-                         (*count as f32 / results.len() as f32) * 100.0);
+                log_info!(
+                    "  {}: {} paths ({:.1}%)",
+                    boost_type,
+                    count,
+                    (*count as f32 / results.len() as f32) * 100.0
+                );
             }
         }
 
         // Sort by score (descending)
         #[cfg(feature = "search-progress-logging")]
         let sort_start = Instant::now();
-        
+
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         #[cfg(feature = "search-progress-logging")]
         {
             let sort_duration = sort_start.elapsed();
             log_info!("Sorted {} results in {:?}", results.len(), sort_duration);
-            
+
             let total_ranking_duration = ranking_detailed_start.elapsed();
             log_info!("Total ranking time: {:?}", total_ranking_duration);
-            
+
             // Log score distribution
             if !results.is_empty() {
-                log_info!("Score distribution - Top: {:.4}, Median: {:.4}, Bottom: {:.4}",
-                         results.first().unwrap().1,
-                         results[results.len()/2].1,
-                         results.last().unwrap().1);
+                log_info!(
+                    "Score distribution - Top: {:.4}, Median: {:.4}, Bottom: {:.4}",
+                    results.first().unwrap().1,
+                    results[results.len() / 2].1,
+                    results.last().unwrap().1
+                );
             }
         }
     }
@@ -1235,16 +1456,27 @@ impl SearchCore {
     /// # Performance
     /// O(k log k) where k is the number of results to rank
     #[allow(dead_code)]
-    fn rank_results_with_context(&self, results: &[(String, f32)], query: &str, current_directory: Option<&str>) -> Vec<(String, f32)> {
+    fn rank_results_with_context(
+        &self,
+        results: &[(String, f32)],
+        query: &str,
+        current_directory: Option<&str>,
+    ) -> Vec<(String, f32)> {
         // Precompute lowercase query once
         let q_lc = query.to_lowercase();
-        
+
         // Precompute lowercase preferred extensions
         let pref_exts_lc: Vec<String> = self
             .preferred_extensions
             .iter()
             .map(|e| e.to_lowercase())
             .collect();
+
+        // Precompute normalized lowercase current_directory and its parent
+        let current_dir_lc = current_directory.map(|d| Self::normalize_path_str(d).to_lowercase());
+        let parent_dir_lc = current_dir_lc
+            .as_deref()
+            .and_then(Self::normalized_parent_dir);
 
         // Create a new vector to avoid mutation
         let mut ranked_results = Vec::with_capacity(results.len());
@@ -1261,20 +1493,20 @@ impl SearchCore {
             }
 
             if let Some(last_used) = self.recency_map.get(path) {
-                let recency_factor = self.ranking_config.recency_weight 
-                    * (-last_used.elapsed().as_secs_f32() * self.ranking_config.recency_lambda).exp();
+                let recency_factor = self.ranking_config.recency_weight
+                    * (-last_used.elapsed().as_secs_f32() * self.ranking_config.recency_lambda)
+                        .exp();
                 new_score += recency_factor;
             }
 
             // 2. Current directory boost (using parameter instead of self.current_directory)
-            if let Some(current_dir) = current_directory {
-                if path.starts_with(current_dir) {
+            if let Some(current_dir) = &current_dir_lc {
+                let path_lc = path.to_lowercase();
+                if Self::is_path_in_dir(&path_lc, current_dir) {
                     new_score += self.ranking_config.context_same_dir_boost;
-                } else if let Some(parent) = std::path::Path::new(current_dir).parent() {
-                    if let Some(parent_str) = parent.to_str() {
-                        if path.starts_with(parent_str) {
-                            new_score += self.ranking_config.context_parent_dir_boost;
-                        }
+                } else if let Some(parent_str) = &parent_dir_lc {
+                    if Self::is_path_in_dir(&path_lc, parent_str) {
+                        new_score += self.ranking_config.context_parent_dir_boost;
                     }
                 }
             }
@@ -1286,7 +1518,7 @@ impl SearchCore {
             {
                 let ext_lc = ext.to_lowercase();
                 if let Some(pos) = pref_exts_lc.iter().position(|e| *e == ext_lc) {
-                    let boost = self.ranking_config.extension_boost 
+                    let boost = self.ranking_config.extension_boost
                         * (1.0 - (pos as f32 / pref_exts_lc.len() as f32) * 0.5);
                     new_score += boost;
                 }
@@ -1312,22 +1544,21 @@ impl SearchCore {
                 }
             }
 
-            // 5. Directory boost
-            let path_obj = std::path::Path::new(path);
-            if path_obj.is_dir() {
+            // 5. Directory boost (using index-time metadata)
+            if self.dir_paths.contains(path.as_str()) {
                 new_score += self.ranking_config.directory_ranking_boost;
             }
 
             // Normalize score
             new_score = 1.0 / (1.0 + (-new_score).exp());
-            
+
             // Add to ranked results
             ranked_results.push((path.clone(), new_score));
         }
 
         // Sort by score (descending)
         ranked_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         ranked_results
     }
 
@@ -2877,5 +3108,84 @@ mod tests_search_core {
                 log_info!("Cache size after tests: {}", cache_stats.cache_size);
             }
         }
+    }
+
+    #[test]
+    fn tp_search_07_unc_preservation_and_current_dir_boost() {
+        assert_eq!(
+            SearchCore::normalize_path_str(r"\\server\share\doc.pdf"),
+            "//server/share/doc.pdf"
+        );
+        assert_eq!(
+            SearchCore::normalize_path_str("//server/share/doc.pdf/"),
+            "//server/share/doc.pdf"
+        );
+
+        let mut engine = SearchCore::new(16, 20, Duration::from_secs(60), RankingConfig::default());
+        engine.add_path_with_metadata(r"C:\Папка\Отчёт.TXT", false);
+        engine.add_path_with_metadata(r"C:\Другая\Отчёт.TXT", false);
+
+        // Set current directory with Windows backslashes; must normalize & boost C:/Папка/Отчёт.TXT
+        engine.set_current_directory(Some(r"C:\Папка".to_string()));
+        let results_in_dir = engine.search("Отчёт");
+        assert!(!results_in_dir.is_empty());
+        assert_eq!(results_in_dir[0].0, "C:/Папка/Отчёт.TXT");
+
+        // Switching current_directory must not return stale cached scores for the previous directory
+        engine.set_current_directory(Some(r"C:\Другая".to_string()));
+        let _results_in_other = engine.search("Отчёт");
+        assert!(!engine.was_last_search_cache_hit());
+
+        // On a fresh engine (without frequency/recency bias from prior search),
+        // C:\Другая boosts C:/Другая/Отчёт.TXT to #1.
+        let mut engine2 =
+            SearchCore::new(16, 20, Duration::from_secs(60), RankingConfig::default());
+        engine2.add_path_with_metadata(r"C:\Папка\Отчёт.TXT", false);
+        engine2.add_path_with_metadata(r"C:\Другая\Отчёт.TXT", false);
+        engine2.set_current_directory(Some(r"C:\Другая".to_string()));
+        let results_in_other = engine2.search("Отчёт");
+        assert_eq!(results_in_other[0].0, "C:/Другая/Отчёт.TXT");
+    }
+
+    #[test]
+    fn tp_search_08_remove_paths_recursive_deleted_and_symlink() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root = temp_dir.path().join("root");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).expect("create sub");
+        let file_a = sub.join("a.txt");
+        std::fs::write(&file_a, b"hello").expect("write a.txt");
+
+        let mut engine = SearchCore::new(16, 20, Duration::from_secs(60), RankingConfig::default());
+        engine.add_path_with_metadata(&sub.to_string_lossy(), true);
+        engine.add_path_with_metadata(&file_a.to_string_lossy(), false);
+
+        assert!(!engine.search("a.txt").is_empty());
+
+        // Delete root/sub from disk BEFORE calling remove_paths_recursive
+        std::fs::remove_dir_all(&sub).expect("remove sub from disk");
+        engine.remove_paths_recursive(&sub.to_string_lossy());
+
+        assert!(
+            engine.search("a.txt").is_empty(),
+            "Deleted directory's indexed files must be removed from index"
+        );
+    }
+
+    #[test]
+    fn tp_search_08_excluded_patterns_unified() {
+        let patterns = vec![r"node_modules\cache".to_string(), "SECRET".to_string()];
+        assert!(SearchCore::path_matches_excluded_patterns(
+            r"C:\Project\Node_Modules\Cache\foo.js",
+            &patterns
+        ));
+        assert!(SearchCore::path_matches_excluded_patterns(
+            "/home/user/secret/key.pem",
+            &patterns
+        ));
+        assert!(!SearchCore::path_matches_excluded_patterns(
+            "/home/user/src/main.rs",
+            &patterns
+        ));
     }
 }

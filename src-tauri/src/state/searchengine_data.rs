@@ -6,6 +6,7 @@ use crate::{log_error, log_info, log_warn};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio;
@@ -167,6 +168,46 @@ pub struct SearchEngineState {
     pub data: Arc<Mutex<SearchEngine>>,
     pub engine: Arc<RwLock<SearchCore>>,
     settings_state: Arc<Mutex<SettingsState>>,
+    pub stop_flag: Arc<AtomicBool>,
+    indexing_mutex: Arc<Mutex<()>>,
+}
+
+/// RAII guard that ensures `data.status` is reset out of `Indexing`/`Searching`
+/// if an operation exits early due to an error or panic.
+struct StatusResetGuard {
+    data: Arc<Mutex<SearchEngine>>,
+    active: bool,
+    target_status: SearchEngineStatus,
+}
+
+impl StatusResetGuard {
+    fn new(data: Arc<Mutex<SearchEngine>>, target_status: SearchEngineStatus) -> Self {
+        Self {
+            data,
+            active: true,
+            target_status,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for StatusResetGuard {
+    fn drop(&mut self) {
+        if self.active {
+            if let Ok(mut data) = self.data.lock() {
+                if matches!(
+                    data.status,
+                    SearchEngineStatus::Indexing | SearchEngineStatus::Searching
+                ) {
+                    data.status = self.target_status.clone();
+                    data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                }
+            }
+        }
+    }
 }
 
 impl SearchEngineState {
@@ -211,13 +252,14 @@ impl SearchEngineState {
 
         // Pass the ranking_config from settings to the autocomplete engine
         let engine = SearchCore::new(
-            config.cache_size,
-            config.max_results,
+            config.cache_size.max(1),
+            config.max_results.max(1),
             config
                 .cache_ttl
                 .unwrap_or_else(|| std::time::Duration::from_secs(3600)), // Default 1 hour TTL
             ranking_config,
         );
+        let stop_flag = engine.stop_flag();
 
         Self {
             data: Arc::new(Mutex::new(Self::save_default_search_engine_in_state(
@@ -225,6 +267,8 @@ impl SearchEngineState {
             ))),
             engine: Arc::new(RwLock::new(engine)),
             settings_state,
+            stop_flag,
+            indexing_mutex: Arc::new(Mutex::new(())),
         }
     }
 
@@ -280,9 +324,87 @@ impl SearchEngineState {
     /// let search_engine = SearchEngineState::new();
     /// let result = search_engine.start_indexing(PathBuf::from("/path/to/index"));
     /// ```
+    /// Synchronizes search engine configuration from `SettingsState` without
+    /// altering `current_directory`.
+    pub fn sync_config_from_settings(&self) -> Result<(), String> {
+        let config = {
+            let settings = self
+                .settings_state
+                .lock()
+                .map_err(|_| "Failed to lock settings state for config sync")?;
+            let inner_settings = settings
+                .0
+                .lock()
+                .map_err(|_| "Failed to lock inner settings for config sync")?;
+            inner_settings.backend_settings.search_engine_config.clone()
+        };
+
+        let prefs_changed = {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| "Failed to lock search engine data for config sync")?;
+            let changed = data.config.preferred_extensions != config.preferred_extensions;
+            data.config = config.clone();
+            changed
+        };
+
+        if prefs_changed {
+            let mut engine = self
+                .engine
+                .write()
+                .map_err(|_| "Failed to acquire write lock on search engine for config sync")?;
+            engine.set_preferred_extensions(config.preferred_extensions);
+        }
+
+        Ok(())
+    }
+
+    /// Updates the current directory context for search ranking.
+    pub fn set_current_directory(&self, path: Option<String>) -> Result<(), String> {
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| "Failed to lock search engine data for current directory update")?;
+            data.current_directory = path.clone();
+            data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        }
+
+        let mut engine = self
+            .engine
+            .write()
+            .map_err(|_| "Failed to acquire write lock on search engine for current directory")?;
+        engine.set_current_directory(path);
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn start_indexing(&self, folder: PathBuf) -> Result<(), String> {
-        // Get locks on both data and engine
+        self.sync_config_from_settings()?;
+
+        // If already indexing, signal stop before waiting on indexing_mutex
+        {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| "Failed to lock search engine data")?;
+            if matches!(data.status, SearchEngineStatus::Indexing) {
+                #[cfg(test)]
+                log_info!(
+                    "Stopping previous indexing of '{}' before starting new indexing",
+                    data.index_folder.display()
+                );
+                self.stop_flag.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let _indexing_guard = self
+            .indexing_mutex
+            .lock()
+            .map_err(|_| "Failed to acquire indexing lock")?;
+
+        // Get locks on both data and engine in strict order: data -> engine
         let mut data = self
             .data
             .lock()
@@ -298,26 +420,17 @@ impl SearchEngineState {
             return Err("Search engine is disabled in configuration".to_string());
         }
 
-        // Check if we're already indexing - if so, stop it first
-        if matches!(data.status, SearchEngineStatus::Indexing) {
-            // Signal the engine to stop the current indexing process
-            #[cfg(test)]
-            log_info!(
-                "Stopping previous indexing of '{}' before starting new indexing",
-                data.index_folder.display()
-            );
-
-            engine.stop_indexing();
-        }
-
         // Update state to show we're indexing a new folder
         data.status = SearchEngineStatus::Indexing;
+        let mut status_guard =
+            StatusResetGuard::new(Arc::clone(&self.data), SearchEngineStatus::Failed);
         data.index_folder = folder.clone();
         data.progress = IndexingProgress::default();
-        data.progress.start_time = Some(chrono::Utc::now().timestamp_millis() as u64);
-        data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+        data.progress.start_time = Some(chrono::Utc::now().timestamp_millis().max(0) as u64);
+        data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
         // Reset the stop flag before starting new indexing
+        self.stop_flag.store(false, Ordering::SeqCst);
         engine.reset_stop_flag();
 
         // Start indexing in the engine
@@ -337,15 +450,31 @@ impl SearchEngineState {
 
             // Get the engine again for the recursive operation
             {
-                let mut engine = self
-                    .engine
-                    .write()
-                    .map_err(|_| "Failed to acquire write lock on search engine")?;
-                // Since add_paths_recursive is async, we need to use a runtime
-                let rt =
-                    tokio::runtime::Runtime::new().map_err(|_| "Failed to create tokio runtime")?;
                 let patterns = excluded_patterns.as_ref();
-                rt.block_on(engine.add_paths_recursive(folder_str, patterns));
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    std::thread::scope(|s| {
+                        s.spawn(|| -> Result<(), String> {
+                            let mut engine = self
+                                .engine
+                                .write()
+                                .map_err(|_| "Failed to acquire write lock on search engine")?;
+                            let rt = tokio::runtime::Runtime::new()
+                                .map_err(|_| "Failed to create tokio runtime".to_string())?;
+                            rt.block_on(engine.add_paths_recursive(folder_str, patterns));
+                            Ok(())
+                        })
+                        .join()
+                        .map_err(|_| "Indexing runtime thread panicked".to_string())?
+                    })?;
+                } else {
+                    let mut engine = self
+                        .engine
+                        .write()
+                        .map_err(|_| "Failed to acquire write lock on search engine")?;
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|_| "Failed to create tokio runtime")?;
+                    rt.block_on(engine.add_paths_recursive(folder_str, patterns));
+                }
             }
 
             // Update status and metrics after indexing completes or stops
@@ -357,11 +486,7 @@ impl SearchEngineState {
             data.metrics.last_indexing_duration_ms = Some(elapsed.as_millis() as u64);
 
             // Check if it was cancelled
-            let engine = self
-                .engine
-                .read()
-                .map_err(|_| "Failed to acquire read lock on search engine")?;
-            if engine.should_stop_indexing() {
+            if self.stop_flag.load(Ordering::SeqCst) {
                 data.status = SearchEngineStatus::Cancelled;
                 #[cfg(test)]
                 log_info!(
@@ -378,8 +503,10 @@ impl SearchEngineState {
                     elapsed
                 );
             }
+            status_guard.disarm();
         } else {
             data.status = SearchEngineStatus::Failed;
+            status_guard.disarm();
             return Err("Invalid folder path".to_string());
         }
 
@@ -402,7 +529,31 @@ impl SearchEngineState {
     /// * `Ok(())` - Indexing completed successfully
     /// * `Err(String)` - An error occurred during indexing
     pub fn start_chunked_indexing(&self, folder: PathBuf, chunk_size: usize) -> Result<(), String> {
-        // Get locks on both data and engine
+        self.sync_config_from_settings()?;
+
+        // If already indexing, signal stop and drop data lock before waiting for prior indexing to finish
+        {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| "Failed to lock search engine data")?;
+            if matches!(data.status, SearchEngineStatus::Indexing) {
+                #[cfg(test)]
+                log_info!(
+                    "Stopping previous indexing of '{}' before starting new chunked indexing",
+                    data.index_folder.display()
+                );
+                self.stop_flag.store(true, Ordering::SeqCst);
+            }
+        }
+
+        // Wait for any prior indexing task/thread to finish before resetting stop_flag
+        let _indexing_guard = self
+            .indexing_mutex
+            .lock()
+            .map_err(|_| "Failed to acquire indexing lock")?;
+
+        // Get locks on both data and engine in strict order: data -> engine
         let mut data = self
             .data
             .lock()
@@ -418,29 +569,18 @@ impl SearchEngineState {
             return Err("Search engine is disabled in configuration".to_string());
         }
 
-        // Check if we're already indexing - if so, stop it first
-        if matches!(data.status, SearchEngineStatus::Indexing) {
-            #[cfg(test)]
-            log_info!(
-                "Stopping previous indexing of '{}' before starting new chunked indexing",
-                data.index_folder.display()
-            );
-
-            engine.stop_indexing();
-        }
-
         // Update state to show we're indexing a new folder
         data.status = SearchEngineStatus::Indexing;
+        let mut status_guard =
+            StatusResetGuard::new(Arc::clone(&self.data), SearchEngineStatus::Failed);
         data.index_folder = folder.clone();
         data.progress = IndexingProgress::default();
-        data.progress.start_time = Some(chrono::Utc::now().timestamp_millis() as u64);
-        data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+        data.progress.start_time = Some(chrono::Utc::now().timestamp_millis().max(0) as u64);
+        data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
         // Reset the stop flag before starting new indexing
+        self.stop_flag.store(false, Ordering::SeqCst);
         engine.reset_stop_flag();
-
-        // Start indexing in the engine
-        let _start_time = Instant::now();
 
         // Clear previous index if switching folders
         engine.clear();
@@ -464,7 +604,7 @@ impl SearchEngineState {
                 data.progress.files_indexed = 0;
                 data.progress.percentage_complete = 0.0;
                 data.progress.current_path = Some(folder.to_string_lossy().to_string());
-                data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+                data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
                 #[cfg(feature = "index-progress-logging")]
                 log_info!("Starting streaming indexing for: {}", folder.display());
@@ -473,8 +613,10 @@ impl SearchEngineState {
             // Use streaming indexing instead of collecting all paths first
             let patterns = excluded_patterns.unwrap_or_default();
             self.index_directory_streaming(&folder, &patterns, chunk_size)?;
+            status_guard.disarm();
         } else {
             data.status = SearchEngineStatus::Failed;
+            status_guard.disarm();
             return Err("Invalid folder path".to_string());
         }
 
@@ -491,7 +633,7 @@ impl SearchEngineState {
     ) -> Result<(), String> {
         let mut discovered_files = 0;
         let mut indexed_files = 0;
-        let mut current_batch = Vec::with_capacity(chunk_size);
+        let mut current_batch: Vec<(String, bool)> = Vec::with_capacity(chunk_size);
         let start_time = Instant::now();
 
         #[cfg(feature = "index-progress-logging")]
@@ -508,11 +650,17 @@ impl SearchEngineState {
             &mut indexed_files,
             &mut current_batch,
             chunk_size,
+            start_time,
         )?;
 
         // Process any remaining files in the batch
         if !current_batch.is_empty() {
-            self.process_batch(&current_batch, &mut indexed_files, discovered_files)?;
+            self.process_batch(
+                &current_batch,
+                &mut indexed_files,
+                discovered_files,
+                start_time,
+            )?;
         }
 
         // Update final status
@@ -524,11 +672,7 @@ impl SearchEngineState {
         data.metrics.last_indexing_duration_ms = Some(elapsed.as_millis() as u64);
 
         // Check if it was cancelled
-        let engine = self
-            .engine
-            .read()
-            .map_err(|_| "Failed to acquire read lock on search engine for status check")?;
-        if engine.should_stop_indexing() {
+        if self.stop_flag.load(Ordering::SeqCst) {
             data.status = SearchEngineStatus::Cancelled;
             log_info!("Optimized streaming indexing was cancelled");
         } else {
@@ -537,7 +681,7 @@ impl SearchEngineState {
             data.progress.files_discovered = discovered_files;
             data.progress.percentage_complete = 100.0;
             data.progress.current_path = None;
-            data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+            data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
             log_info!(
                 "Optimized streaming indexing completed: {} files indexed in {:?}",
@@ -557,8 +701,9 @@ impl SearchEngineState {
         excluded_patterns: &[String],
         discovered_files: &mut usize,
         indexed_files: &mut usize,
-        current_batch: &mut Vec<String>,
+        current_batch: &mut Vec<(String, bool)>,
         chunk_size: usize,
+        start_time: Instant,
     ) -> Result<(), String> {
         use std::collections::VecDeque;
 
@@ -580,26 +725,28 @@ impl SearchEngineState {
                 break;
             }
 
-            // Check for cancellation more frequently
-            {
-                let engine = self.engine.read().map_err(|_| {
-                    "Failed to acquire read lock on search engine for cancellation check"
-                })?;
-                if engine.should_stop_indexing() {
-                    return Ok(());
-                }
+            // Check for cancellation without locking engine
+            if self.stop_flag.load(Ordering::SeqCst) {
+                return Ok(());
             }
 
             // Process current directory
             if let Ok(entries) = fs::read_dir(&current_dir) {
                 for entry in entries.filter_map(Result::ok) {
                     // Check for cancellation on each entry to be more responsive
-                    {
-                        let engine = self.engine.read().map_err(|_| "Failed to acquire read lock on search engine for entry cancellation check")?;
-                        if engine.should_stop_indexing() {
-                            return Ok(());
-                        }
+                    if self.stop_flag.load(Ordering::SeqCst) {
+                        return Ok(());
                     }
+
+                    // Skip symlinks and junctions via file_type()
+                    let file_type = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(_) => continue,
+                    };
+                    if file_type.is_symlink() {
+                        continue;
+                    }
+                    let is_dir = file_type.is_dir();
 
                     let path = entry.path();
 
@@ -624,16 +771,13 @@ impl SearchEngineState {
                     }
 
                     if let Some(path_str) = path.to_str() {
-                        let lower_path = path_str.to_lowercase();
-                        // Check if path should be excluded (case-insensitive)
-                        let should_exclude = excluded_patterns.iter().any(|pattern| {
-                            let p_lower = pattern.to_lowercase();
-                            lower_path.contains(&p_lower)
-                        });
+                        // Unified normalized, case-insensitive exclusion check
+                        let should_exclude =
+                            SearchCore::path_matches_excluded_patterns(path_str, excluded_patterns);
 
                         if !should_exclude {
-                            // Add to current batch
-                            current_batch.push(path_str.to_string());
+                            // Add to current batch with is_dir metadata
+                            current_batch.push((path_str.to_string(), is_dir));
                             *discovered_files += 1;
 
                             // Update progress more frequently for better UX
@@ -651,13 +795,14 @@ impl SearchEngineState {
                                     current_batch,
                                     indexed_files,
                                     *discovered_files,
+                                    start_time,
                                 )?;
                                 current_batch.clear();
                                 current_batch.reserve(chunk_size); // Pre-allocate for next batch
                             }
 
                             // Add subdirectories to queue for later processing (breadth-first)
-                            if path.is_dir() {
+                            if is_dir {
                                 dir_queue.push_back((path, depth + 1));
                             }
                         }
@@ -709,22 +854,18 @@ impl SearchEngineState {
     /// Process a batch of files for indexing with optimized memory management
     fn process_batch(
         &self,
-        batch: &[String],
+        batch: &[(String, bool)],
         indexed_files: &mut usize,
         total_discovered: usize,
+        start_time: Instant,
     ) -> Result<(), String> {
         if batch.is_empty() {
             return Ok(());
         }
 
         // Check for cancellation before processing
-        {
-            let engine = self.engine.read().map_err(|_| {
-                "Failed to acquire read lock on search engine for batch cancellation check"
-            })?;
-            if engine.should_stop_indexing() {
-                return Ok(());
-            }
+        if self.stop_flag.load(Ordering::SeqCst) {
+            return Ok(());
         }
 
         // Process smaller sub-batches to reduce memory pressure
@@ -732,13 +873,8 @@ impl SearchEngineState {
 
         for chunk in batch.chunks(SUB_BATCH_SIZE) {
             // Check for cancellation before each sub-batch
-            {
-                let engine = self.engine.read().map_err(|_| {
-                    "Failed to acquire read lock on search engine for sub-batch cancellation check"
-                })?;
-                if engine.should_stop_indexing() {
-                    return Ok(());
-                }
+            if self.stop_flag.load(Ordering::SeqCst) {
+                return Ok(());
             }
 
             // Process the sub-batch
@@ -746,8 +882,11 @@ impl SearchEngineState {
                 let mut engine = self.engine.write().map_err(|_| {
                     "Failed to acquire write lock on search engine for sub-batch processing"
                 })?;
-                let batch_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-                engine.add_paths_batch(batch_refs, None);
+                let batch_refs: Vec<(&str, bool)> = chunk
+                    .iter()
+                    .map(|(s, is_dir)| (s.as_str(), *is_dir))
+                    .collect();
+                engine.add_paths_batch_with_metadata(batch_refs, None);
             } // Release write lock immediately
 
             *indexed_files += chunk.len();
@@ -764,18 +903,16 @@ impl SearchEngineState {
                     0.0
                 };
 
-                // Calculate estimated time remaining
-                if let Some(start_time_ms) = data.progress.start_time {
-                    let elapsed_ms = chrono::Utc::now().timestamp_millis() as u64 - start_time_ms;
-                    if *indexed_files > 0 {
-                        let avg_time_per_file = elapsed_ms as f32 / *indexed_files as f32;
-                        let remaining_files = total_discovered.saturating_sub(*indexed_files);
-                        let estimated_ms = (avg_time_per_file * remaining_files as f32) as u64;
-                        data.progress.estimated_time_remaining = Some(estimated_ms);
-                    }
+                // Calculate estimated time remaining using monotonic Instant
+                let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                if *indexed_files > 0 {
+                    let avg_time_per_file = elapsed_ms as f32 / *indexed_files as f32;
+                    let remaining_files = total_discovered.saturating_sub(*indexed_files);
+                    let estimated_ms = (avg_time_per_file * remaining_files as f32) as u64;
+                    data.progress.estimated_time_remaining = Some(estimated_ms);
                 }
 
-                data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+                data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
                 // Log batch progress for debugging
                 #[cfg(feature = "index-progress-logging")]
@@ -820,6 +957,8 @@ impl SearchEngineState {
     /// }
     /// ```
     pub fn search(&self, query: &str) -> Result<Vec<(String, f32)>, String> {
+        self.sync_config_from_settings()?;
+
         let mut data = self
             .data
             .lock()
@@ -841,7 +980,9 @@ impl SearchEngineState {
 
         // Update state for search operation
         data.status = SearchEngineStatus::Searching;
-        data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+        data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let mut status_guard =
+            StatusResetGuard::new(Arc::clone(&self.data), SearchEngineStatus::Idle);
 
         // Release data lock before acquiring engine lock
         drop(data);
@@ -921,6 +1062,7 @@ impl SearchEngineState {
 
         // Reset status back to Idle
         data.status = SearchEngineStatus::Idle;
+        status_guard.disarm();
 
         Ok(search_results)
     }
@@ -958,6 +1100,8 @@ impl SearchEngineState {
         query: &str,
         extensions: Vec<String>,
     ) -> Result<Vec<(String, f32)>, String> {
+        self.sync_config_from_settings()?;
+
         let mut data = self
             .data
             .lock()
@@ -976,7 +1120,9 @@ impl SearchEngineState {
 
         // Update state
         data.status = SearchEngineStatus::Searching;
-        data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+        data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let mut status_guard =
+            StatusResetGuard::new(Arc::clone(&self.data), SearchEngineStatus::Idle);
 
         // Get current directory context
         let current_dir = data.current_directory.clone();
@@ -984,7 +1130,13 @@ impl SearchEngineState {
         // Release data lock before acquiring engine lock
         drop(data);
 
-        // Use write lock for modifying extension preferences
+        let normalized_exts: Vec<String> = extensions
+            .iter()
+            .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+            .filter(|e| !e.is_empty())
+            .collect();
+
+        // Use write lock for search + cache update without clearing preferred_extensions cache
         let mut engine = self
             .engine
             .write()
@@ -993,42 +1145,51 @@ impl SearchEngineState {
         // Set current directory context if available
         if let Some(current_dir) = &current_dir {
             engine.set_current_directory(Some(current_dir.clone()));
+        } else {
+            engine.set_current_directory(None);
         }
 
-        // Store original preferred extensions and override
-        let original_extensions = engine.get_preferred_extensions().clone();
-        engine.set_preferred_extensions(extensions.clone());
         #[cfg(test)]
-        log_info!("Searching with preferred extensions: {:?}", extensions);
+        log_info!("Searching with extension filter: {:?}", normalized_exts);
 
-        // Perform search
+        // Perform search without double-clearing preferred_extensions cache
         let start_time = Instant::now();
-        let results = engine.search(query);
+        let raw_results = engine.search(query);
         let search_time = start_time.elapsed();
         let was_cache_hit = engine.was_last_search_cache_hit();
 
-        #[cfg(test)]
-        {
-            // Verify that results meet our extension preferences
-            if !results.is_empty() && !extensions.is_empty() {
-                log_info!("Top search result: {}", results[0].0);
+        // Release engine lock before filtering and updating metrics
+        drop(engine);
 
-                // Check if top result has one of our preferred extensions
-                if let Some(extension) = std::path::Path::new(&results[0].0)
+        let results: Vec<(String, f32)> = if normalized_exts.is_empty() {
+            raw_results
+        } else {
+            let mut filtered: Vec<(String, f32)> = raw_results
+                .into_iter()
+                .filter(|(path, _)| {
+                    std::path::Path::new(path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| normalized_exts.contains(&e.to_lowercase()))
+                })
+                .collect();
+            filtered.sort_by(|(p_a, s_a), (p_b, s_b)| {
+                let pos_a = std::path::Path::new(p_a)
                     .extension()
                     .and_then(|e| e.to_str())
-                {
-                    let ext = extension.to_lowercase();
-                    log_info!("Top result extension: {}, preferred: {:?}", ext, extensions);
-                }
-            }
-        }
-
-        // Reset the original preferred extensions
-        engine.set_preferred_extensions(original_extensions);
-
-        // Release engine lock before updating metrics
-        drop(engine);
+                    .and_then(|e| normalized_exts.iter().position(|x| x == &e.to_lowercase()))
+                    .unwrap_or(usize::MAX);
+                let pos_b = std::path::Path::new(p_b)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(|e| normalized_exts.iter().position(|x| x == &e.to_lowercase()))
+                    .unwrap_or(usize::MAX);
+                pos_a
+                    .cmp(&pos_b)
+                    .then_with(|| s_b.partial_cmp(s_a).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            filtered
+        };
 
         // Update metrics
         let mut data = self
@@ -1086,6 +1247,7 @@ impl SearchEngineState {
 
         // Update state
         data.status = SearchEngineStatus::Idle;
+        status_guard.disarm();
 
         Ok(results)
     }
@@ -1126,9 +1288,10 @@ impl SearchEngineState {
             data.progress.percentage_complete = (indexed as f32 / total as f32) * 100.0;
         }
 
-        // Calculate estimated time remaining
+        // Calculate estimated time remaining (use saturating_sub to avoid u64 underflow on clock skew)
         if let Some(start_time) = data.progress.start_time {
-            let elapsed_ms = chrono::Utc::now().timestamp_millis() as u64 - start_time;
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let elapsed_ms = now_ms.saturating_sub(start_time);
             if indexed > 0 {
                 let avg_time_per_file = elapsed_ms as f32 / indexed as f32;
                 let remaining_files = total.saturating_sub(indexed);
@@ -1137,7 +1300,7 @@ impl SearchEngineState {
             }
         }
 
-        data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+        data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
     }
 
     /// Returns statistics about the search engine's index and cache.
@@ -1174,8 +1337,14 @@ impl SearchEngineState {
     ///
     /// O(1) - Simple field aggregation operations
     pub fn get_search_engine_info(&self) -> SearchEngineInfo {
-        let data = match self.data.lock() {
-            Ok(data) => data,
+        let (status, progress, metrics, recent_activity, last_updated) = match self.data.lock() {
+            Ok(data) => (
+                data.status.clone(),
+                data.progress.clone(),
+                data.metrics.clone(),
+                data.recent_activity.clone(),
+                data.last_updated,
+            ),
             Err(_) => {
                 log_error!(
                     "Failed to lock search engine data for info retrieval, returning minimal info"
@@ -1194,15 +1363,15 @@ impl SearchEngineState {
             }
         };
 
-        // Get stats from engine
+        // Get stats from engine after releasing data lock
         let stats = self.get_stats();
         SearchEngineInfo {
-            status: data.status.clone(),
-            progress: data.progress.clone(),
-            metrics: data.metrics.clone(),
-            recent_activity: data.recent_activity.clone(),
+            status,
+            progress,
+            metrics,
+            recent_activity,
             stats,
-            last_updated: data.last_updated,
+            last_updated,
         }
     }
 
@@ -1223,7 +1392,6 @@ impl SearchEngineState {
     /// # Performance
     ///
     /// O(1) plus cache invalidation cost for changed preferences
-    #[cfg(test)]
     pub fn update_config(&self, path: Option<String>) -> Result<(), String> {
         let mut data = self
             .data
@@ -1244,7 +1412,7 @@ impl SearchEngineState {
         };
 
         data.config = config.clone();
-        data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+        data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
         // Update the current directory in the data structure
         data.current_directory = path.clone();
@@ -1257,6 +1425,7 @@ impl SearchEngineState {
             .write()
             .map_err(|_| "Failed to acquire write lock on search engine for config update")?;
         engine.set_preferred_extensions(config.preferred_extensions);
+        engine.set_current_directory(path);
 
         Ok(())
     }
@@ -1275,6 +1444,8 @@ impl SearchEngineState {
     /// * `Ok(())` - Path was successfully added
     /// * `Err(String)` - An error occurred while adding the path
     pub fn add_path(&self, path: &str) -> Result<(), String> {
+        self.sync_config_from_settings()?;
+
         let data = self
             .data
             .lock()
@@ -1294,11 +1465,7 @@ impl SearchEngineState {
             .engine
             .write()
             .map_err(|_| "Failed to acquire write lock on search engine for path addition")?;
-        // Use the new method to check exclusions before adding
-        engine.add_path_with_exclusion_check(
-            path,
-            Some(&excluded_patterns.ok_or("No excluded patterns configuration available")?),
-        );
+        engine.add_path_with_exclusion_check(path, excluded_patterns.as_ref());
         Ok(())
     }
 
@@ -1384,7 +1551,6 @@ impl SearchEngineState {
     /// # Performance
     ///
     /// O(1) - Simple flag operation
-    #[cfg(test)] // maybe use in a later release
     pub fn stop_indexing(&self) -> Result<(), String> {
         let mut data = self
             .data
@@ -1392,24 +1558,15 @@ impl SearchEngineState {
             .map_err(|_| "Failed to lock search engine data for stop indexing")?;
 
         if matches!(data.status, SearchEngineStatus::Indexing) {
-            // Update state first
+            // Update state and set atomic stop flag WITHOUT acquiring engine.write()
             data.status = SearchEngineStatus::Cancelled;
-            data.last_updated = chrono::Utc::now().timestamp_millis() as u64;
-
-            let index_folder = data.index_folder.clone();
-            drop(data);
-
-            // Signal the engine to stop indexing (works for both traditional and chunked)
-            let mut engine = self
-                .engine
-                .write()
-                .map_err(|_| "Failed to acquire write lock on search engine for stop indexing")?;
-            engine.stop_indexing();
+            data.last_updated = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            self.stop_flag.store(true, Ordering::SeqCst);
 
             #[cfg(test)]
             log_info!(
                 "Indexing of '{}' stopped (works for both traditional and chunked)",
-                index_folder.display()
+                data.index_folder.display()
             );
 
             return Ok(());
@@ -1455,12 +1612,14 @@ impl Clone for SearchEngineState {
             data: Arc::clone(&self.data),
             engine: Arc::clone(&self.engine),
             settings_state: Arc::clone(&self.settings_state),
+            stop_flag: Arc::clone(&self.stop_flag),
+            indexing_mutex: Arc::clone(&self.indexing_mutex),
         }
     }
 }
 
 #[cfg(test)]
-fn create_isolated_test_settings() -> (Arc<Mutex<SettingsState>>, tempfile::TempDir) {
+pub(crate) fn create_isolated_test_settings() -> (Arc<Mutex<SettingsState>>, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory for settings");
     let settings_path = temp_dir.path().join("settings.json");
     let settings_state = Arc::new(Mutex::new(SettingsState::new_with_path(settings_path)));
@@ -2568,22 +2727,28 @@ mod tests_searchengine_state {
             }
         }
 
-        // Verify that all documents are still found with different rankings
-        assert_eq!(regular_results.len(), txt_results.len());
-        assert_eq!(regular_results.len(), pdf_results.len());
-        assert_eq!(regular_results.len(), txt_pdf_results.len());
+        // Verify strict extension filtering
+        assert!(!txt_results.is_empty());
+        assert!(txt_results.iter().all(|(p, _)| p.ends_with(".txt")));
+        assert!(!pdf_results.is_empty());
+        assert!(pdf_results.iter().all(|(p, _)| p.ends_with(".pdf")));
+        assert!(txt_pdf_results
+            .iter()
+            .all(|(p, _)| p.ends_with(".txt") || p.ends_with(".pdf")));
+        assert!(pdf_txt_results
+            .iter()
+            .all(|(p, _)| p.ends_with(".txt") || p.ends_with(".pdf")));
 
-        // Test search for a non-existent extension
+        // Test search for a non-existent extension (strictly filtered -> empty)
         let nonexistent_results = state
             .search_by_extension("document", vec!["nonexistent".to_string()])
             .unwrap();
-        assert_eq!(
-            regular_results.len(),
-            nonexistent_results.len(),
-            "Should still find all documents with non-existent extension"
+        assert!(
+            nonexistent_results.is_empty(),
+            "Strict extension filtering should return empty for non-existent extension"
         );
 
-        // Test with empty extensions list (should use default preferences)
+        // Test with empty extensions list (should return all matching documents)
         let empty_ext_results = state.search_by_extension("document", vec![]).unwrap();
         assert_eq!(
             regular_results.len(),
@@ -3369,17 +3534,13 @@ mod tests_searchengine_state {
             );
         }
 
-        // Verify all documents are still found
-        assert_eq!(
-            regular_results.len(),
-            txt_results.len(),
-            "Same number of results with extension preferences after chunked indexing"
-        );
-        assert_eq!(
-            regular_results.len(),
-            pdf_results.len(),
-            "Same number of results with different extension preferences after chunked indexing"
-        );
+        // Verify strict extension filtering after chunked indexing
+        assert!(!txt_results.is_empty());
+        assert!(txt_results.iter().all(|(p, _)| p.ends_with(".txt")));
+        assert!(txt_results.len() <= regular_results.len());
+        assert!(!pdf_results.is_empty());
+        assert!(pdf_results.iter().all(|(p, _)| p.ends_with(".pdf")));
+        assert!(pdf_results.len() <= regular_results.len());
     }
 
     #[test]
@@ -4020,5 +4181,133 @@ mod bench_indexing_methods {
                 result.err()
             );
         }
+    }
+
+    #[test]
+    fn tp_search_05_concurrent_progress_search_stop_while_indexing() {
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
+        let state = Arc::new(SearchEngineState::new(settings_state));
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        for i in 0..300 {
+            let p = temp_dir.path().join(format!("file_{i:04}.txt"));
+            std::fs::write(&p, b"x").expect("write test file");
+        }
+
+        let state_bg = Arc::clone(&state);
+        let dir_path = temp_dir.path().to_path_buf();
+        let handle = thread::spawn(move || state_bg.start_chunked_indexing(dir_path, 25));
+
+        // Wait briefly for indexing to start
+        let start = Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(2) {
+            let info = state.get_search_engine_info();
+            if matches!(info.status, SearchEngineStatus::Indexing) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Concurrent progress read + search + stop_indexing must not hang
+        let _info = state.get_search_engine_info();
+        let _ = state.search("file");
+        let _ = state.stop_indexing();
+
+        let res = handle.join().expect("indexing thread should not panic");
+        assert!(res.is_ok());
+
+        // Subsequent search must not hang or fail with "Engine is currently indexing"
+        let final_status = state.get_search_engine_info().status;
+        assert!(matches!(
+            final_status,
+            SearchEngineStatus::Cancelled | SearchEngineStatus::Idle
+        ));
+        assert!(state.search("file").is_ok());
+    }
+
+    #[test]
+    fn tp_search_06_stop_in_idle_error_reset_and_concurrent_clear() {
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
+        let state = SearchEngineState::new(settings_state);
+
+        // 1) stop_indexing in Idle must NOT transition to Cancelled
+        assert!(state.stop_indexing().is_err());
+        assert_eq!(
+            state.get_search_engine_info().status,
+            SearchEngineStatus::Idle
+        );
+
+        // 2) RAII guard resets Indexing status on early drop
+        {
+            let mut data = state.data.lock().unwrap();
+            data.status = SearchEngineStatus::Indexing;
+        }
+        {
+            let _guard = StatusResetGuard::new(Arc::clone(&state.data), SearchEngineStatus::Failed);
+        }
+        assert_eq!(
+            state.get_search_engine_info().status,
+            SearchEngineStatus::Failed
+        );
+        assert!(state.search("x").is_ok());
+    }
+
+    #[test]
+    fn tp_search_07_extension_filtering_and_cache_size_zero() {
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
+        {
+            let s = settings_state.lock().unwrap();
+            let mut inner = s.0.lock().unwrap();
+            inner.backend_settings.search_engine_config.cache_size = 0;
+            inner
+                .backend_settings
+                .search_engine_config
+                .excluded_patterns = None;
+        }
+
+        // Must not panic when cache_size == 0
+        let state = SearchEngineState::new(settings_state);
+
+        // Must succeed when excluded_patterns == None
+        assert!(state.add_path("C:/docs/report.TXT").is_ok());
+        assert!(state.add_path("C:/docs/report.pdf").is_ok());
+        assert!(state.add_path("C:/docs/report.md").is_ok());
+
+        let txt_only = state
+            .search_by_extension("report", vec!["txt".to_string()])
+            .expect("search_by_extension");
+        assert!(!txt_only.is_empty());
+        assert!(txt_only
+            .iter()
+            .all(|(p, _)| p.to_lowercase().ends_with(".txt")));
+    }
+
+    #[test]
+    fn tp_ipc_07_update_config_and_settings_sync() {
+        let (settings_state, _settings_dir) = create_isolated_test_settings();
+        let state = SearchEngineState::new(Arc::clone(&settings_state));
+
+        // Disable search engine in SettingsState and verify live search picks it up
+        {
+            let s = settings_state.lock().unwrap();
+            let mut inner = s.0.lock().unwrap();
+            inner
+                .backend_settings
+                .search_engine_config
+                .search_engine_enabled = false;
+        }
+        assert!(state.search("test").is_err());
+
+        // Re-enable and call update_config with a directory path
+        {
+            let s = settings_state.lock().unwrap();
+            let mut inner = s.0.lock().unwrap();
+            inner
+                .backend_settings
+                .search_engine_config
+                .search_engine_enabled = true;
+        }
+        assert!(state.update_config(Some(r"C:\Work".to_string())).is_ok());
+        assert!(state.search("test").is_ok());
     }
 }

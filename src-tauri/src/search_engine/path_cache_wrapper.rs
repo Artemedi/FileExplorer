@@ -38,8 +38,8 @@ impl PathCache {
     }
 
     #[inline]
-    pub fn get(&mut self, path: &str) -> Option<PathData> {
-        self.inner.write().get(&path.to_string())
+    pub fn get(&self, path: &str) -> Option<PathData> {
+        self.inner.write().get(path)
     }
 
     #[inline]
@@ -47,13 +47,19 @@ impl PathCache {
         let data = PathData { results };
         self.put_data(query, data);
     }
-    
-    #[inline]  
-    pub fn put(&mut self, query: String, data: crate::search_engine::path_cache_wrapper::CachedSearchResults) {
-        let path_data = PathData { results: data.results };
+
+    #[inline]
+    pub fn put(
+        &mut self,
+        query: String,
+        data: crate::search_engine::path_cache_wrapper::CachedSearchResults,
+    ) {
+        let path_data = PathData {
+            results: data.results,
+        };
         self.put_data(query, path_data);
     }
-    
+
     #[inline]
     fn put_data(&mut self, query: String, data: PathData) {
         self.inner.write().put(query, data);

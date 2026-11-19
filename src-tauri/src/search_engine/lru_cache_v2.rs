@@ -28,6 +28,7 @@
 //!
 //! This confirms the near O(1) performance with only a slight increase due to memory effects.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::ptr::NonNull;
@@ -76,15 +77,11 @@ where
     ///
     /// # Arguments
     ///
-    /// * `capacity` - The maximum number of entries the cache can hold. Must be greater than zero.
+    /// * `capacity` - The maximum number of entries the cache can hold. Values of `0` are clamped to `1`.
     ///
     /// # Returns
     ///
-    /// A new `LruPathCache` instance with the specified capacity.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the capacity is zero.
+    /// A new `LruPathCache` instance with at least capacity `1`.
     ///
     /// # Example
     ///
@@ -92,8 +89,8 @@ where
     /// let cache: LruPathCache<String, String> = LruPathCache::new(100);
     /// ```
     pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "Capacity must be greater than zero");
-        
+        let capacity = capacity.max(1);
+
         Self {
             capacity,
             map: HashMap::with_capacity(capacity),
@@ -162,7 +159,11 @@ where
     /// ```
     #[inline]
     #[allow(dead_code)]
-    pub fn check_ttl(&self, key: &K) -> bool {
+    pub fn check_ttl<Q: ?Sized>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash,
+    {
         if let Some(&node_ptr) = self.map.get(key) {
             // SAFETY: The pointer is valid as it's managed by the cache
             let node = unsafe { &*node_ptr.as_ptr() };
@@ -209,33 +210,39 @@ where
     /// }
     /// ```
     #[inline]
-    pub fn get(&mut self, key: &K) -> Option<V> {
-        if let Some(&node_ptr) = self.map.get(key) {
-            // SAFETY: The pointer is valid as it's managed by the cache
+    pub fn get<Q: ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash,
+    {
+        let node_ptr = *self.map.get(key)?;
+
+        // Scope `&mut Node` strictly so it ends before `remove`/`detach_node`/`prepend_node`.
+        let (expired, value) = {
+            // SAFETY: The pointer is valid as it's managed by the cache.
             let node = unsafe { &mut *node_ptr.as_ptr() };
-
-            // expired?
-            if let Some(ttl) = self.ttl {
-                if node.last_accessed.elapsed() > ttl {
-                    self.remove(key);
-                    return None;
-                }
+            let expired = self
+                .ttl
+                .map_or(false, |ttl| node.last_accessed.elapsed() > ttl);
+            if expired {
+                (true, None)
+            } else {
+                node.last_accessed = Instant::now();
+                (false, Some(node.value.clone()))
             }
+        };
 
-            // Update last accessed time
-            node.last_accessed = Instant::now();
-
-            // skip if head
-            if self.head != Some(node_ptr) {
-                // move to front
-                self.detach_node(node_ptr);
-                self.prepend_node(node_ptr);
-            }
-
-            Some(node.value.clone())
-        } else {
-            None
+        if expired {
+            self.remove(key);
+            return None;
         }
+
+        if self.head != Some(node_ptr) {
+            self.detach_node(node_ptr);
+            self.prepend_node(node_ptr);
+        }
+
+        value
     }
 
     /// Removes an entry with the specified key from the cache.
@@ -266,7 +273,11 @@ where
     /// }
     /// ```
     #[inline]
-    pub fn remove(&mut self, key: &K) -> bool {
+    pub fn remove<Q: ?Sized>(&mut self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash,
+    {
         if let Some(node_ptr) = self.map.remove(key) {
             self.detach_node(node_ptr);
 
@@ -312,10 +323,13 @@ where
     pub fn insert(&mut self, key: K, value: V) {
         // Check if the key already exists
         if let Some(&node_ptr) = self.map.get(&key) {
-            // SAFETY: The pointer is valid as it's managed by the cache
-            let node = unsafe { &mut *node_ptr.as_ptr() };
-            node.value = value;
-            node.last_accessed = Instant::now();
+            {
+                // SAFETY: The pointer is valid as it's managed by the cache.
+                // Scoped so `&mut Node` ends before `detach_node`/`prepend_node`.
+                let node = unsafe { &mut *node_ptr.as_ptr() };
+                node.value = value;
+                node.last_accessed = Instant::now();
+            }
 
             // skip if head
             if self.head != Some(node_ptr) {
@@ -325,12 +339,16 @@ where
             return;
         }
 
-        // if capacity full, remove the least recently used item
+        // If capacity full, remove the least recently used item
         if self.map.len() >= self.capacity {
             if let Some(tail) = self.tail {
-                // SAFETY: The pointer is valid as it's managed by the cache
-                let tail_node = unsafe { &*tail.as_ptr() };
-                self.remove(&tail_node.key);
+                let tail_key = {
+                    // SAFETY: The pointer is valid as it's managed by the cache.
+                    // Clone the key in a tight scope so no reference into `tail` survives into `remove`.
+                    let tail_node = unsafe { &*tail.as_ptr() };
+                    tail_node.key.clone()
+                };
+                self.remove(&tail_key);
             }
         }
 
@@ -339,11 +357,11 @@ where
         // Convert Box to raw pointer
         let node_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(node)) };
 
+        // Insert into map before linking into list so `map` and list stay consistent
+        self.map.insert(key, node_ptr);
+
         // Add to front of list
         self.prepend_node(node_ptr);
-
-        // Add to map
-        self.map.insert(key, node_ptr);
     }
 
     /// Removes all entries from the cache.
@@ -365,16 +383,18 @@ where
     /// assert_eq!(cache.len(), 0);
     /// ```
     pub fn clear(&mut self) {
-        // Free all nodes
-        while let Some(head) = self.head {
-            // SAFETY: The pointer is valid as it's managed by the cache
-            let head_node = unsafe { &*head.as_ptr() };
-            let head_key = head_node.key.clone();
-            self.remove(&head_key);
-        }
-
-        // Clear the map
+        let mut current = self.head;
+        self.head = None;
+        self.tail = None;
         self.map.clear();
+
+        while let Some(node_ptr) = current {
+            // SAFETY: All pointers in the list are valid and uniquely owned by the cache.
+            unsafe {
+                current = (*node_ptr.as_ptr()).next;
+                self.deallocate_node(node_ptr);
+            }
+        }
     }
 
     /// Returns the number of entries currently in the cache.
@@ -444,7 +464,11 @@ where
     /// * `None` - If the key does not exist or the entry has expired.
     #[inline]
     #[allow(dead_code)]
-    pub fn get_immutable(&self, key: &K) -> Option<V> {
+    pub fn get_immutable<Q: ?Sized>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash,
+    {
         if let Some(&node_ptr) = self.map.get(key) {
             // SAFETY: The pointer is valid as it's managed by the cache
             let node = unsafe { &*node_ptr.as_ptr() };
@@ -530,10 +554,13 @@ where
     // Helper method to detach a node from the linked list
     #[inline(always)]
     fn detach_node(&mut self, node_ptr: NonNull<Node<K, V>>) {
-        // SAFETY: The pointer is valid as it's managed by the cache
-        let node = unsafe { &mut *node_ptr.as_ptr() };
+        // SAFETY: The pointer is valid as it's managed by the cache.
+        let (prev, next) = unsafe {
+            let node = &*node_ptr.as_ptr();
+            (node.prev, node.next)
+        };
 
-        match (node.prev, node.next) {
+        match (prev, next) {
             (Some(prev), Some(next)) => {
                 // Node is in the middle of the list
                 unsafe {
@@ -563,34 +590,32 @@ where
         }
 
         // Clear node's pointers
-        node.prev = None;
-        node.next = None;
+        unsafe {
+            let node = &mut *node_ptr.as_ptr();
+            node.prev = None;
+            node.next = None;
+        }
     }
 
     // Helper method to add a node to the front of the linked list
     #[inline(always)]
     fn prepend_node(&mut self, node_ptr: NonNull<Node<K, V>>) {
-        // SAFETY: The pointer is valid as it's managed by the cache
-        let node = unsafe { &mut *node_ptr.as_ptr() };
+        let old_head = self.head;
+        // SAFETY: The pointer is valid as it's managed by the cache.
+        unsafe {
+            let node = &mut *node_ptr.as_ptr();
+            node.next = old_head;
+            node.prev = None;
+        }
 
-        match self.head {
+        match old_head {
             Some(head) => {
-                // List is not empty
-                node.next = Some(head);
-                node.prev = None;
-
-                // Update head's prev pointer
                 unsafe {
                     (*head.as_ptr()).prev = Some(node_ptr);
                 }
-
-                // Update head
                 self.head = Some(node_ptr);
             }
             None => {
-                // List is empty
-                node.next = None;
-                node.prev = None;
                 self.head = Some(node_ptr);
                 self.tail = Some(node_ptr);
             }
@@ -855,5 +880,35 @@ mod tests_lru_cache_v2 {
         }
 
         log_info!("Evicted {} items from the middle range", evicted_count);
+    }
+
+    #[test]
+    fn test_tp_search_01_capacity_two_eviction_get_clear_and_zero_capacity() {
+        // Capacity 0 must clamp to 1 without panicking
+        let mut zero_cap: LruPathCache<String, String> = LruPathCache::new(0);
+        zero_cap.insert("only".to_string(), "val".to_string());
+        assert_eq!(zero_cap.len(), 1);
+        zero_cap.insert("next".to_string(), "val2".to_string());
+        assert_eq!(zero_cap.len(), 1);
+        assert_eq!(zero_cap.get("only"), None);
+        assert_eq!(zero_cap.get("next"), Some("val2".to_string()));
+
+        // TP-SEARCH-01: capacity = 2, insert A, B; get(&A) moves A to head; insert C evicts B; clear & drop
+        let mut cache: LruPathCache<String, String> =
+            LruPathCache::with_ttl(2, Duration::from_millis(50));
+        cache.insert("A".to_string(), "1".to_string());
+        cache.insert("B".to_string(), "2".to_string());
+        // B is head, A is tail -> get("A") moves A to head
+        assert_eq!(cache.get("A"), Some("1".to_string()));
+        // Insert C -> evicts B (tail)
+        cache.insert("C".to_string(), "3".to_string());
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get("B"), None);
+        assert_eq!(cache.get("A"), Some("1".to_string()));
+        assert_eq!(cache.get("C"), Some("3".to_string()));
+
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
     }
 }

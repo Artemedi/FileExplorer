@@ -75,7 +75,9 @@ const CHAR_MAPPING: [u8; 256] = {
 /// significantly outperforming traditional algorithms like Levenshtein (O(N*M²)) or
 /// simple substring matching (O(N*Q)).
 pub struct PathMatcher {
-    paths: Vec<String>,
+    paths: Vec<Option<String>>,
+    path_to_idx: FxHashMap<String, u32>,
+    free_indices: Vec<u32>,
     trigram_index: TrigramMap,
     /// Reusable buffer for trigram extraction to avoid repeated allocations
     extraction_buffer: Vec<u8>,
@@ -99,6 +101,8 @@ impl PathMatcher {
     pub fn new() -> Self {
         PathMatcher {
             paths: Vec::new(),
+            path_to_idx: FxHashMap::default(),
+            free_indices: Vec::new(),
             // Better capacity estimation: ~20 trigrams per path on average
             trigram_index: FxHashMap::with_capacity_and_hasher(8192, Default::default()),
             extraction_buffer: Vec::with_capacity(1024), // Pre-allocate reasonable buffer
@@ -144,14 +148,23 @@ impl PathMatcher {
     /// * O(L) where L is the length of the path
     /// * Overall index construction is O(N*L) for N paths with average length L
     pub fn add_path(&mut self, path: &str) {
-        let path_index = self.paths.len() as u32;
-        self.paths.push(path.to_string());
+        if self.path_to_idx.contains_key(path) {
+            return;
+        }
+        let path_index = if let Some(free_idx) = self.free_indices.pop() {
+            self.paths[free_idx as usize] = Some(path.to_string());
+            free_idx
+        } else {
+            let idx = self.paths.len() as u32;
+            self.paths.push(Some(path.to_string()));
+            idx
+        };
+        self.path_to_idx.insert(path.to_string(), path_index);
         self.extract_and_index_trigrams(path, path_index);
     }
 
     /// Removes a path from the matcher and updates all indices accordingly.
-    /// This maintains the integrity of the trigram index by adjusting the indices
-    /// of paths that come after the removed path.
+    /// Uses tombstones and a free-list to avoid O(N * T) reindexing.
     ///
     /// # Arguments
     /// * `path` - The path string to remove from the matcher.
@@ -172,27 +185,25 @@ impl PathMatcher {
     /// ```
     ///
     /// # Time Complexity
-    /// * O(T) where T is the number of trigrams in the index
-    /// * Worst case O(N) where N is the total number of paths
+    /// * O(L) where L is the length of the removed path
     pub fn remove_path(&mut self, path: &str) -> bool {
-        if let Some(path_idx) = self.paths.iter().position(|p| p == path) {
-            let path_idx = path_idx as u32;
-            self.paths.remove(path_idx as usize);
+        let Some(path_idx) = self.path_to_idx.remove(path) else {
+            return false;
+        };
+        self.paths[path_idx as usize] = None;
+        self.free_indices.push(path_idx);
 
-            for values in self.trigram_index.values_mut() {
+        let trigrams = self.collect_text_trigrams(path);
+        for trigram in trigrams {
+            if let Some(values) = self.trigram_index.get_mut(&trigram) {
                 values.retain(|idx| *idx != path_idx);
-                for idx in values.iter_mut() {
-                    if *idx > path_idx {
-                        *idx -= 1;
-                    }
+                if values.is_empty() {
+                    self.trigram_index.remove(&trigram);
                 }
             }
-
-            self.trigram_index.retain(|_, values| !values.is_empty());
-            true
-        } else {
-            false
         }
+
+        true
     }
 
     /// Extracts trigrams from a text string and indexes them for the given path.
@@ -211,7 +222,14 @@ impl PathMatcher {
     /// * O(L) where L is the length of the text
     #[inline]
     fn extract_and_index_trigrams(&mut self, text: &str, path_idx: u32) {
-        let bytes = text.as_bytes();
+        let lower_owned;
+        let bytes = if text.is_ascii() {
+            text.as_bytes()
+        } else {
+            lower_owned = text.to_lowercase();
+            lower_owned.as_bytes()
+        };
+
         if bytes.len() < 3 {
             return;
         }
@@ -219,17 +237,21 @@ impl PathMatcher {
         // Use stack allocation for small paths, heap for larger ones
         const MAX_STACK_PATH: usize = 512;
         let mut trigram_bytes = [0u8; 3];
-        
+
         if bytes.len() <= MAX_STACK_PATH {
             // Use stack-allocated buffer for small paths
             let mut stack_buffer = [b' '; MAX_STACK_PATH + 4];
             stack_buffer[0] = b' ';
             stack_buffer[1] = b' ';
-            stack_buffer[2..2+bytes.len()].copy_from_slice(bytes);
-            stack_buffer[2+bytes.len()] = b' ';
-            stack_buffer[3+bytes.len()] = b' ';
-            
-            self.process_trigrams(&stack_buffer[..bytes.len() + 4], path_idx, &mut trigram_bytes);
+            stack_buffer[2..2 + bytes.len()].copy_from_slice(bytes);
+            stack_buffer[2 + bytes.len()] = b' ';
+            stack_buffer[3 + bytes.len()] = b' ';
+
+            self.process_trigrams(
+                &stack_buffer[..bytes.len() + 4],
+                path_idx,
+                &mut trigram_bytes,
+            );
         } else {
             // Use reusable buffer for larger paths
             self.extraction_buffer.clear();
@@ -239,16 +261,52 @@ impl PathMatcher {
             self.extraction_buffer.extend_from_slice(bytes);
             self.extraction_buffer.push(b' ');
             self.extraction_buffer.push(b' ');
-            
+
             // Clone buffer to avoid borrowing issues
             let buffer_copy = self.extraction_buffer.clone();
             self.process_trigrams(&buffer_copy, path_idx, &mut trigram_bytes);
         }
     }
 
+    /// Collects the unique trigrams for a given text (used for fast O(L) removal).
+    fn collect_text_trigrams(&self, text: &str) -> Vec<u32> {
+        let lower_owned;
+        let bytes = if text.is_ascii() {
+            text.as_bytes()
+        } else {
+            lower_owned = text.to_lowercase();
+            lower_owned.as_bytes()
+        };
+
+        if bytes.len() < 3 {
+            return Vec::new();
+        }
+
+        let mut padded = Vec::with_capacity(bytes.len() + 4);
+        padded.push(b' ');
+        padded.push(b' ');
+        padded.extend_from_slice(bytes);
+        padded.push(b' ');
+        padded.push(b' ');
+
+        let mut seen = FxHashSet::with_capacity_and_hasher(padded.len(), Default::default());
+        let mut trigrams = Vec::with_capacity(padded.len());
+        for i in 0..padded.len() - 2 {
+            let a = Self::fast_lowercase(padded[i]);
+            let b = Self::fast_lowercase(padded[i + 1]);
+            let c = Self::fast_lowercase(padded[i + 2]);
+            let trigram = Self::pack_trigram(a, b, c);
+            if seen.insert(trigram) {
+                trigrams.push(trigram);
+            }
+        }
+        trigrams
+    }
+
     /// Helper function to process trigrams from a padded byte array
     fn process_trigrams(&mut self, padded: &[u8], path_idx: u32, trigram_bytes: &mut [u8; 3]) {
-        let mut seen_trigrams = FxHashSet::with_capacity_and_hasher(padded.len(), Default::default());
+        let mut seen_trigrams =
+            FxHashSet::with_capacity_and_hasher(padded.len(), Default::default());
 
         for i in 0..padded.len() - 2 {
             trigram_bytes[0] = Self::fast_lowercase(padded[i]);
@@ -364,54 +422,56 @@ impl PathMatcher {
     /// * Significantly faster than Levenshtein (O(N*M²)) or substring matching (O(N*Q))
     pub fn search(&self, query: &str, max_results: usize) -> Vec<(String, f32)> {
         const MAX_SCORING_CANDIDATES: usize = 2000;
+        const MAX_QUERY_CHARS: usize = 512;
 
         if query.is_empty() {
             return Vec::new();
         }
 
-        let query_lower = query.to_lowercase();
+        let (query_capped, query_char_len) = {
+            let mut count = 0usize;
+            let mut end_byte = query.len();
+            for (idx, _) in query.char_indices() {
+                if count == MAX_QUERY_CHARS {
+                    end_byte = idx;
+                    break;
+                }
+                count += 1;
+            }
+            (&query[..end_byte], count)
+        };
+
+        let query_lower = query_capped.to_lowercase();
         let query_trigrams = self.extract_query_trigrams(&query_lower);
-        if query_trigrams.is_empty() && query.len() >= 3 {
+        if query_trigrams.is_empty() && query_char_len >= 3 {
             return Vec::new();
         }
 
-        // 32-bit words can track 32 paths each
-        let bitmap_size = (self.paths.len() + 31) / 32;
-        let mut path_bitmap = vec![0u32; bitmap_size];
         let mut hit_counts = vec![0u16; self.paths.len()];
-        let mut total_hits = 0;
+        let mut total_hits = 0usize;
 
-        // For each trigram, mark matching paths in bitmap
         for &trigram in &query_trigrams {
             if let Some(path_indices) = self.trigram_index.get(&trigram) {
                 for &path_idx in path_indices {
                     let idx = path_idx as usize;
                     if idx < hit_counts.len() {
-                        // Increment hit count
-                        hit_counts[idx] += 1;
-
-                        // Set bitmap bit if first hit
-                        if hit_counts[idx] == 1 {
+                        if hit_counts[idx] == 0 {
                             total_hits += 1;
                         }
-
-                        // Mark in bitmap using fast bit ops
-                        let word_idx = idx / 32;
-                        let bit_pos = idx % 32;
-                        path_bitmap[word_idx] |= 1 << bit_pos;
+                        hit_counts[idx] = hit_counts[idx].saturating_add(1);
                     }
                 }
             }
         }
 
         if total_hits == 0 {
-            return self.fallback_search(query, max_results);
+            return self.fallback_search(query_capped, max_results);
         }
 
         let mut candidates: Vec<(usize, u16)> = hit_counts
             .iter()
             .enumerate()
-            .filter(|&(_idx, &count)| count > 0)
+            .filter(|&(idx, &count)| count > 0 && self.paths[idx].is_some())
             .map(|(idx, &count)| (idx, count))
             .collect();
 
@@ -429,12 +489,13 @@ impl PathMatcher {
         let query_trigram_count = query_trigrams.len() as f32;
 
         for (path_idx, hits) in candidates_to_score {
-            let path = &self.paths[path_idx];
+            let Some(path) = self.paths[path_idx].as_ref() else {
+                continue;
+            };
             let hits = hits as f32;
             let path_lower = path.to_lowercase();
 
-            let path_components: Vec<&str> = path.split('/').collect();
-            let filename = path_components.last().unwrap_or(&"");
+            let filename = path.split(&['/', '\\'][..]).last().unwrap_or("");
             let filename_lower = filename.to_lowercase();
             let mut score = hits / query_trigram_count;
 
@@ -482,8 +543,8 @@ impl PathMatcher {
         });
         results.truncate(max_results);
 
-        if results.is_empty() && query.len() >= 3 {
-            return self.fallback_search(query, max_results);
+        if results.is_empty() && query_char_len >= 3 {
+            return self.fallback_search(query_capped, max_results);
         }
 
         results
@@ -510,6 +571,7 @@ impl PathMatcher {
         }
 
         let mut trigrams = Vec::with_capacity(bytes.len() + 2);
+        let mut seen = FxHashSet::with_capacity_and_hasher(bytes.len() + 2, Default::default());
         let mut padded = Vec::with_capacity(bytes.len() + 4);
         padded.push(b' ');
         padded.push(b' ');
@@ -522,7 +584,10 @@ impl PathMatcher {
             let b = Self::fast_lowercase(padded[i + 1]);
             let c = Self::fast_lowercase(padded[i + 2]);
 
-            trigrams.push(Self::pack_trigram(a, b, c));
+            let trigram = Self::pack_trigram(a, b, c);
+            if seen.insert(trigram) {
+                trigrams.push(trigram);
+            }
         }
 
         trigrams
@@ -559,62 +624,44 @@ impl PathMatcher {
     fn fallback_search(&self, query: &str, max_results: usize) -> Vec<(String, f32)> {
         let query_lower = query.to_lowercase();
         let variations = self.generate_efficient_variations(&query_lower);
+        if variations.is_empty() {
+            return Vec::new();
+        }
 
-        // === Step 1: Fast Variation-based Fallback ===
-        let mut path_bitmap = vec![0u32; (self.paths.len() + 31) / 32];
-        let mut variation_hits =
-            FxHashMap::with_capacity_and_hasher(variations.len(), Default::default());
         let mut seen_paths =
             FxHashSet::with_capacity_and_hasher(max_results * 2, Default::default());
         let mut results = Vec::with_capacity(max_results * 2);
+        let query_first = query_lower.chars().next();
 
         for (variation_idx, variation) in variations.iter().enumerate() {
             let trigrams = self.extract_query_trigrams(variation);
             if trigrams.is_empty() {
                 continue;
             }
-            for word in &mut path_bitmap {
-                *word = 0;
-            }
             for &trigram in &trigrams {
                 if let Some(path_indices) = self.trigram_index.get(&trigram) {
                     for &path_idx in path_indices {
                         let idx = path_idx as usize;
-                        let word_idx = idx / 32;
-                        let bit_pos = idx % 32;
-                        path_bitmap[word_idx] |= 1 << bit_pos;
-                        variation_hits
-                            .entry(path_idx)
-                            .or_insert_with(|| SmallVec::<[usize; 2]>::with_capacity(2))
-                            .push(variation_idx);
-                    }
-                }
-            }
-            for word_idx in 0..path_bitmap.len() {
-                let mut word = path_bitmap[word_idx];
-                while word != 0 {
-                    let bit_pos = word.trailing_zeros() as usize;
-                    let path_idx = word_idx * 32 + bit_pos;
-                    if path_idx < self.paths.len() && !seen_paths.contains(&path_idx) {
-                        seen_paths.insert(path_idx);
-                        let path = &self.paths[path_idx];
-                        let filename = path.split('/').last().unwrap_or(path);
-                        let filename_lower = filename.to_lowercase();
-                        let variation_index = variation_idx as f32 / variations.len() as f32;
-                        let mut score = 0.9 - (variation_index * 0.2);
-                        // Bonus for matching first char
-                        if let (Some(query_first), Some(filename_first)) = 
-                            (query_lower.chars().next(), filename_lower.chars().next()) {
-                            if query_first == filename_first {
-                                score += 0.3;
+                        if idx < self.paths.len() && seen_paths.insert(idx) {
+                            let Some(path) = self.paths[idx].as_deref() else {
+                                continue;
+                            };
+                            let filename = path.split(&['/', '\\'][..]).last().unwrap_or(path);
+                            let filename_lower = filename.to_lowercase();
+                            let variation_index = variation_idx as f32 / variations.len() as f32;
+                            let mut score = 0.9 - (variation_index * 0.2);
+                            if let (Some(qf), Some(ff)) =
+                                (query_first, filename_lower.chars().next())
+                            {
+                                if qf == ff {
+                                    score += 0.3;
+                                }
                             }
+                            let length_factor = self.calculate_length_normalization(path.len());
+                            score *= length_factor;
+                            results.push((path.to_string(), score));
                         }
-                        // Length normalization
-                        let length_factor = self.calculate_length_normalization(path.len());
-                        score *= length_factor;
-                        results.push((path.clone(), score));
                     }
-                    word &= !(1 << bit_pos);
                 }
             }
             if results.len() >= max_results {
@@ -645,21 +692,21 @@ impl PathMatcher {
     /// - Substitutions: Replace characters with common alternatives (only for short queries)
     #[inline]
     fn generate_efficient_variations(&self, query: &str) -> Vec<String> {
-        let len = query.len();
         let chars: Vec<char> = query.chars().collect();
+        let char_len = chars.len();
 
         // Capacity calculation based on likely number of variations
-        let mut variations = Vec::with_capacity(len * 2);
+        let mut variations = Vec::with_capacity(char_len * 2);
 
         // Only add the most effective variations
 
         // 1. Deletions (critical for catching extra characters)
-        if len > 1 {
-            for i in 0..len {
-                let mut new_query = String::with_capacity(len - 1);
-                for j in 0..len {
+        if char_len > 1 {
+            for i in 0..char_len {
+                let mut new_query = String::with_capacity(query.len());
+                for (j, &ch) in chars.iter().enumerate() {
                     if j != i {
-                        new_query.push(chars[j]);
+                        new_query.push(ch);
                     }
                 }
                 variations.push(new_query);
@@ -667,15 +714,15 @@ impl PathMatcher {
         }
 
         // 2. Adjacent transpositions (critical for catching swapped characters)
-        if len > 2 {
-            for i in 0..len - 1 {
+        if char_len > 2 {
+            for i in 0..char_len - 1 {
                 let mut new_chars = chars.clone();
                 new_chars.swap(i, i + 1);
                 variations.push(new_chars.iter().collect());
             }
         }
         // 3. Only do substitutions for short queries (expensive)
-        if len > 1 && len <= 5 {
+        if char_len > 1 && char_len <= 5 {
             static SUBS: &[(char, char)] = &[
                 ('a', 'e'),
                 ('e', 'a'),
@@ -685,7 +732,7 @@ impl PathMatcher {
                 ('c', 'k'),
             ];
 
-            for i in 0..len {
+            for i in 0..char_len {
                 let c = chars[i].to_lowercase().next().unwrap_or(chars[i]);
                 for &(from, to) in SUBS {
                     if c == from {
@@ -817,11 +864,11 @@ mod tests_fast_fuzzy_v2 {
     #[test]
     fn test_add_path() {
         let mut matcher = PathMatcher::new();
-        assert_eq!(matcher.paths.len(), 0);
+        assert_eq!(matcher.path_to_idx.len(), 0);
 
         matcher.add_path("/test/path.txt");
-        assert_eq!(matcher.paths.len(), 1);
-        assert_eq!(matcher.paths[0], "/test/path.txt");
+        assert_eq!(matcher.path_to_idx.len(), 1);
+        assert_eq!(matcher.paths[0].as_deref(), Some("/test/path.txt"));
         assert!(!matcher.trigram_index.is_empty());
     }
 
@@ -833,16 +880,17 @@ mod tests_fast_fuzzy_v2 {
         matcher.add_path("/test/path2.txt");
         matcher.add_path("/test/path3.txt");
 
-        assert_eq!(matcher.paths.len(), 3);
+        assert_eq!(matcher.path_to_idx.len(), 3);
 
         // Remove a path
         let removed = matcher.remove_path("/test/path2.txt");
         assert!(removed);
 
         // Check that the path was removed
-        assert_eq!(matcher.paths.len(), 2);
-        assert_eq!(matcher.paths[0], "/test/path1.txt");
-        assert_eq!(matcher.paths[1], "/test/path3.txt");
+        assert_eq!(matcher.path_to_idx.len(), 2);
+        assert!(matcher.path_to_idx.contains_key("/test/path1.txt"));
+        assert!(!matcher.path_to_idx.contains_key("/test/path2.txt"));
+        assert!(matcher.path_to_idx.contains_key("/test/path3.txt"));
 
         // Verify search still works
         let results = matcher.search("path", 10);
@@ -851,7 +899,7 @@ mod tests_fast_fuzzy_v2 {
         // Verify removing a non-existent path returns false
         let removed = matcher.remove_path("/test/nonexistent.txt");
         assert!(!removed);
-        assert_eq!(matcher.paths.len(), 2);
+        assert_eq!(matcher.path_to_idx.len(), 2);
     }
 
     #[test]
@@ -1997,5 +2045,60 @@ mod tests_fast_fuzzy_v2 {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_tp_search_02_non_ascii_fallback_and_unicode_case_folding() {
+        let mut matcher = PathMatcher::new();
+        matcher.add_path("C:\\Папка\\Отчёт.TXT");
+        matcher.add_path("C:/docs/привет.txt");
+        matcher.add_path("C:/docs/文件.md");
+        matcher.add_path("C:/docs/🚀.txt");
+
+        // Case-insensitive Cyrillic match
+        let cyr = matcher.search("отчёт", 10);
+        assert!(
+            !cyr.is_empty(),
+            "Cyrillic case-insensitive search should match"
+        );
+        assert_eq!(cyr[0].0, "C:\\Папка\\Отчёт.TXT");
+
+        // Misspelled Cyrillic / CJK / emoji queries triggering fallback_search must not panic
+        let _ = matcher.search("превет", 10);
+        let _ = matcher.search("приветт", 10);
+        let _ = matcher.search("文件", 10);
+        let _ = matcher.search("文件x", 10);
+        let _ = matcher.search("🚀", 10);
+        let _ = matcher.search("🚀x", 10);
+    }
+
+    #[test]
+    fn test_tp_search_09_long_80k_query_no_overflow() {
+        let mut matcher = PathMatcher::new();
+        matcher.add_path("/aaa/aaaa/test.txt");
+        let long_query = "a".repeat(80_000);
+        let results = matcher.search(&long_query, 10);
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_tp_search_10_dedup_and_fast_remove() {
+        let mut matcher = PathMatcher::new();
+        matcher.add_path("/dup/file.txt");
+        matcher.add_path("/dup/file.txt");
+        assert_eq!(matcher.path_to_idx.len(), 1);
+
+        for i in 0..500 {
+            matcher.add_path(&format!("/bulk/dir/item_{}.txt", i));
+        }
+        assert_eq!(matcher.path_to_idx.len(), 501);
+
+        for i in 0..500 {
+            assert!(matcher.remove_path(&format!("/bulk/dir/item_{}.txt", i)));
+        }
+        assert_eq!(matcher.path_to_idx.len(), 1);
+        assert!(matcher.remove_path("/dup/file.txt"));
+        assert_eq!(matcher.path_to_idx.len(), 0);
+        assert!(matcher.search("item", 10).is_empty());
     }
 }

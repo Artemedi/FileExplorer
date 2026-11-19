@@ -682,7 +682,12 @@ impl Node256 {
     }
 
     fn find_child_mut(&mut self, key: KeyType) -> Option<&mut Option<Box<ARTNode>>> {
-        Some(&mut self.children[key as usize])
+        let slot = &mut self.children[key as usize];
+        if slot.is_some() {
+            Some(slot)
+        } else {
+            None
+        }
     }
 
     fn remove_child(&mut self, key: KeyType) -> Option<Box<ARTNode>> {
@@ -817,9 +822,16 @@ impl ART {
         if let Some(&first) = chars.peek() {
             if first == '/' || first == '\\' {
                 result.push('/');
+                chars.next();
+                // Preserve UNC prefix `//` (e.g., `\\server\share` -> `//server/share`)
+                if let Some(&second) = chars.peek() {
+                    if second == '/' || second == '\\' {
+                        result.push('/');
+                        chars.next();
+                    }
+                }
                 saw_slash = true;
                 started = true;
-                chars.next();
             }
         }
 
@@ -918,15 +930,133 @@ impl ART {
     /// ```
     pub fn insert(&mut self, path: &str, score: f32) -> bool {
         let normalized = self.normalize_path(path);
-        let path_bytes = normalized.as_bytes();
+        let key = normalized.as_bytes();
 
         if self.root.is_none() {
             self.root = Some(Box::new(ARTNode::new_node4()));
         }
 
-        let root = self.root.take();
-        let (changed, new_path, new_root) = Self::insert_recursive(root, path_bytes, 0, score);
-        self.root = new_root;
+        struct InsertFrame {
+            parent: Box<ARTNode>,
+            edge: u8,
+        }
+
+        let mut stack: Vec<InsertFrame> = Vec::new();
+        let mut current = self.root.take();
+        let mut depth = 0usize;
+
+        let (changed, new_path, mut result_node) = loop {
+            let Some(mut node_ref) = current else {
+                let mut new_node = Box::new(ARTNode::new_node4());
+                *new_node.get_prefix_mut() = key[depth..].iter().copied().collect();
+                new_node.set_terminal(true);
+                new_node.set_score(Some(score));
+                break (true, true, Some(new_node));
+            };
+
+            if depth == key.len() {
+                let mut changed = false;
+                let mut new_path = false;
+                if !node_ref.is_terminal() {
+                    node_ref.set_terminal(true);
+                    new_path = true;
+                    changed = true;
+                }
+                if node_ref.get_score() != Some(score) {
+                    node_ref.set_score(Some(score));
+                    changed = true;
+                }
+                break (changed, new_path, Some(node_ref));
+            }
+
+            let existing = node_ref.get_prefix().to_vec();
+            let remaining = &key[depth..];
+            let compare_len = existing.len().min(remaining.len());
+            let mut split = 0;
+            while split < compare_len && existing[split] == remaining[split] {
+                split += 1;
+            }
+
+            // Case A: split point is inside existing prefix
+            if split < existing.len() {
+                if split == remaining.len() {
+                    // Subcase A.1: split at exact end of remaining key
+                    let suffix = existing[split + 1..].to_vec();
+                    let existing_child = Self::extract_children_into_node(&mut node_ref, suffix);
+                    node_ref.get_prefix_mut().truncate(split);
+                    node_ref.set_terminal(true);
+                    node_ref.set_score(Some(score));
+                    let edge = existing[split];
+                    node_ref.add_child(edge, Some(existing_child));
+                    break (true, true, Some(node_ref));
+                }
+
+                // Subcase A.2: full divergence
+                let old_edge = existing[split];
+                let old_suffix = existing[split + 1..].to_vec();
+                let existing_child = Self::extract_children_into_node(&mut node_ref, old_suffix);
+
+                let new_edge = remaining[split];
+                let new_suffix = remaining[split + 1..].to_vec();
+                let mut new_child = Box::new(ARTNode::new_node4());
+                *new_child.get_prefix_mut() = new_suffix.into();
+                new_child.set_terminal(true);
+                new_child.set_score(Some(score));
+
+                node_ref.get_prefix_mut().truncate(split);
+                node_ref.set_terminal(false);
+                node_ref.set_score(None);
+                node_ref.add_child(old_edge, Some(existing_child));
+                node_ref.add_child(new_edge, Some(new_child));
+                break (true, true, Some(node_ref));
+            }
+
+            let next_depth = depth + split;
+
+            // Case B: matched full node prefix and next_depth == key.len()
+            if next_depth == key.len() {
+                let mut changed = false;
+                let mut new_path = false;
+                if !node_ref.is_terminal() {
+                    node_ref.set_terminal(true);
+                    new_path = true;
+                    changed = true;
+                }
+                if node_ref.get_score() != Some(score) {
+                    node_ref.set_score(Some(score));
+                    changed = true;
+                }
+                break (changed, new_path, Some(node_ref));
+            }
+
+            // Case C: matched full node prefix and need to descend one byte
+            let c = key[next_depth];
+            if node_ref.find_child_mut(c).is_none() {
+                let mut new_child = Box::new(ARTNode::new_node4());
+                *new_child.get_prefix_mut() = key[(next_depth + 1)..].iter().copied().collect();
+                new_child.set_terminal(true);
+                new_child.set_score(Some(score));
+                node_ref.add_child(c, Some(new_child));
+                break (true, true, Some(node_ref));
+            }
+
+            let taken_child = node_ref.remove_child(c);
+            stack.push(InsertFrame {
+                parent: node_ref,
+                edge: c,
+            });
+            current = taken_child;
+            depth = next_depth + 1;
+        };
+
+        while let Some(InsertFrame { mut parent, edge }) = stack.pop() {
+            if let Some(child) = result_node {
+                parent.add_child(edge, Some(child));
+            }
+            result_node = Some(parent);
+        }
+
+        self.root = result_node;
 
         if new_path {
             self.path_count += 1;
@@ -935,568 +1065,76 @@ impl ART {
         changed
     }
 
-    /// Recursively inserts a path into the trie, navigating and modifying nodes as needed.
-    /// This internal helper method is used by the public insert method.
-    ///
-    /// # Arguments
-    /// * `node` - The current node in the traversal.
-    /// * `key` - The byte representation of the path being inserted.
-    /// * `depth` - The current depth in the key.
-    /// * `score` - The score to associate with the path.
-    ///
-    /// # Returns
-    /// * A tuple containing:
-    ///   - Whether the insertion changed the trie
-    ///   - Whether this is a new path
-    ///   - The new node after insertion
-    fn insert_recursive(
-        node: Option<Box<ARTNode>>,
-        key: &[u8],
-        depth: usize,
-        score: f32,
-    ) -> (bool, bool, Option<Box<ARTNode>>) {
-        // If node is None, create a new Node4 with the full remaining key as its prefix
-        if node.is_none() {
-            // Create new node and set its prefix to key[depth..]
-            let mut new_node = Box::new(ARTNode::new_node4());
-            *new_node.get_prefix_mut() = key[depth..].iter().copied().collect();
-            new_node.set_terminal(true);
-            new_node.set_score(Some(score));
-            return (true, true, Some(new_node));
-        }
+    /// Moves all children and terminal metadata from `node_ref` into a newly sized node with `suffix`,
+    /// clearing `node_ref`'s children. Counts actual non-empty children so splits never lose subtrees.
+    fn extract_children_into_node(node_ref: &mut ARTNode, suffix: Vec<u8>) -> Box<ARTNode> {
+        let is_terminal = node_ref.is_terminal();
+        let score = node_ref.get_score();
+        let mut extracted: Vec<(KeyType, Box<ARTNode>)> = Vec::new();
 
-        let mut node_ref = node.unwrap();
-
-        // If we've consumed all bytes in the key, update terminal state and score
-        if depth == key.len() {
-            let mut changed = false;
-            let mut new_path = false;
-
-            if !node_ref.is_terminal() {
-                node_ref.set_terminal(true);
-                new_path = true;
-                changed = true;
+        match node_ref {
+            ARTNode::Node4(n) => {
+                for i in 0..n.keys.len() {
+                    if i < n.children.len() {
+                        if let Some(child) = n.children[i].take() {
+                            extracted.push((n.keys[i], child));
+                        }
+                    }
+                }
+                n.keys.clear();
+                n.children.clear();
             }
-            if node_ref.get_score() != Some(score) {
-                node_ref.set_score(Some(score));
-                changed = true;
+            ARTNode::Node16(n) => {
+                for i in 0..n.keys.len() {
+                    if i < n.children.len() {
+                        if let Some(child) = n.children[i].take() {
+                            extracted.push((n.keys[i], child));
+                        }
+                    }
+                }
+                n.keys.clear();
+                n.children.clear();
             }
-            return (changed, new_path, Some(node_ref));
-        }
-
-        let existing = node_ref.get_prefix().to_vec();
-        let remaining = &key[depth..];
-        // Determine the longest common prefix length
-        let compare_len = existing.len().min(remaining.len());
-        let mut split = 0;
-        while split < compare_len && existing[split] == remaining[split] {
-            split += 1;
-        }
-
-        // Case A: split point is inside existing prefix
-        if split < existing.len() {
-            // Subcase A.1: split at exact end of remaining key (remaining.len() == split)
-            if split == remaining.len() {
-                let child_count = node_ref.num_children();
-                let existing_child = match node_ref.as_mut() {
-                    ARTNode::Node4(n) => {
-                        let suffix = existing[split + 1..].to_vec();
-                        if child_count <= NODE4_MAX {
-                            Box::new(ARTNode::Node4(Node4 {
-                                prefix: suffix.clone().into(),
-                                is_terminal: n.is_terminal,
-                                score: n.score,
-                                keys: mem::take(&mut n.keys),
-                                children: mem::take(&mut n.children),
-                            }))
-                        } else if child_count <= NODE16_MAX {
-                            let mut new_node16 = Node16::new();
-                            new_node16.prefix = suffix.clone().into();
-                            new_node16.is_terminal = n.is_terminal;
-                            new_node16.score = n.score;
-                            for (i, key) in n.keys.iter().enumerate() {
-                                if i < n.children.len() {
-                                    if let Some(child) = n.children[i].take() {
-                                        new_node16.add_child(*key, Some(child));
-                                    }
-                                }
-                            }
-                            Box::new(ARTNode::Node16(new_node16))
-                        } else {
-                            // This shouldn't happen with Node4
-                            Box::new(ARTNode::Node4(Node4 {
-                                prefix: suffix.clone().into(),
-                                is_terminal: n.is_terminal,
-                                score: n.score,
-                                keys: SmallVec::new(),
-                                children: SmallVec::new(),
-                            }))
+            ARTNode::Node48(n) => {
+                for byte in 0..256 {
+                    if let Some(idx) = n.child_index[byte] {
+                        if let Some(child) = n.children[idx as usize].take() {
+                            extracted.push((byte as u8, child));
                         }
                     }
-                    ARTNode::Node16(n) => {
-                        let suffix = existing[split + 1..].to_vec();
-                        if child_count <= NODE4_MAX {
-                            let mut new_node4 = Node4::new();
-                            new_node4.prefix = suffix.clone().into();
-                            new_node4.is_terminal = n.is_terminal;
-                            new_node4.score = n.score;
-                            for i in 0..n.keys.len().min(NODE4_MAX) {
-                                if let Some(child_box) = n.children[i].take() {
-                                    new_node4.add_child(n.keys[i], Some(child_box));
-                                }
-                            }
-                            Box::new(ARTNode::Node4(new_node4))
-                        } else if child_count <= NODE16_MAX {
-                            let mut new_node16 = Node16::new();
-                            new_node16.prefix = suffix.clone().into();
-                            new_node16.is_terminal = n.is_terminal;
-                            new_node16.score = n.score;
-                            for i in 0..n.keys.len() {
-                                if let Some(child_box) = n.children[i].take() {
-                                    new_node16.add_child(n.keys[i], Some(child_box));
-                                }
-                            }
-                            Box::new(ARTNode::Node16(new_node16))
-                        } else if child_count <= NODE48_MAX {
-                            let mut new_node48 = Node48::new();
-                            new_node48.prefix = suffix.clone().into();
-                            new_node48.is_terminal = n.is_terminal;
-                            new_node48.score = n.score;
-                            for i in 0..n.keys.len() {
-                                if let Some(child_box) = n.children[i].take() {
-                                    new_node48.add_child(n.keys[i], Some(child_box));
-                                }
-                            }
-                            Box::new(ARTNode::Node48(new_node48))
-                        } else {
-                            // Shouldn't happen with Node16
-                            Box::new(ARTNode::Node16(Node16 {
-                                prefix: suffix.clone().into(),
-                                is_terminal: n.is_terminal,
-                                score: n.score,
-                                keys: SmallVec::new(),
-                                children: SmallVec::new(),
-                            }))
-                        }
-                    }
-                    ARTNode::Node48(n) => {
-                        let suffix = existing[split + 1..].to_vec();
-                        if child_count <= NODE4_MAX {
-                            let mut new_node4 = Node4::new();
-                            new_node4.prefix = suffix.clone().into();
-                            new_node4.is_terminal = n.is_terminal;
-                            new_node4.score = n.score;
-                            for byte in 0..256 {
-                                if let Some(idx) = n.child_index[byte] {
-                                    if let Some(child_box) = n.children[idx as usize].take() {
-                                        new_node4.add_child(byte as u8, Some(child_box));
-                                        if new_node4.keys.len() >= NODE4_MAX {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Box::new(ARTNode::Node4(new_node4))
-                        } else if child_count <= NODE16_MAX {
-                            let mut new_node16 = Node16::new();
-                            new_node16.prefix = suffix.clone().into();
-                            new_node16.is_terminal = n.is_terminal;
-                            new_node16.score = n.score;
-                            for byte in 0..256 {
-                                if let Some(idx) = n.child_index[byte] {
-                                    if let Some(child_box) = n.children[idx as usize].take() {
-                                        new_node16.add_child(byte as u8, Some(child_box));
-                                    }
-                                }
-                            }
-                            Box::new(ARTNode::Node16(new_node16))
-                        } else if child_count <= NODE48_MAX {
-                            let mut new_node48 = Node48::new();
-                            new_node48.prefix = suffix.clone().into();
-                            new_node48.is_terminal = n.is_terminal;
-                            new_node48.score = n.score;
-                            for byte in 0..256 {
-                                if let Some(idx) = n.child_index[byte] {
-                                    if let Some(child_box) = n.children[idx as usize].take() {
-                                        new_node48.add_child(byte as u8, Some(child_box));
-                                    }
-                                }
-                            }
-                            Box::new(ARTNode::Node48(new_node48))
-                        } else {
-                            let mut new_node256 = Node256::new();
-                            new_node256.prefix = suffix.clone().into();
-                            new_node256.is_terminal = n.is_terminal;
-                            new_node256.score = n.score;
-                            for byte in 0..256 {
-                                if let Some(idx) = n.child_index[byte] {
-                                    if let Some(child_box) = n.children[idx as usize].take() {
-                                        new_node256.add_child(byte as u8, Some(child_box));
-                                    }
-                                }
-                            }
-                            Box::new(ARTNode::Node256(new_node256))
-                        }
-                    }
-                    ARTNode::Node256(n) => {
-                        let suffix = existing[split + 1..].to_vec();
-                        if child_count <= NODE4_MAX {
-                            let mut new_node4 = Node4::new();
-                            new_node4.prefix = suffix.clone().into();
-                            new_node4.is_terminal = n.is_terminal;
-                            new_node4.score = n.score;
-                            let mut count = 0;
-                            for byte in 0..256 {
-                                if let Some(child_box) = n.children[byte].take() {
-                                    new_node4.add_child(byte as u8, Some(child_box));
-                                    count += 1;
-                                    if count >= NODE4_MAX {
-                                        break;
-                                    }
-                                }
-                            }
-                            Box::new(ARTNode::Node4(new_node4))
-                        } else if child_count <= NODE16_MAX {
-                            let mut new_node16 = Node16::new();
-                            new_node16.prefix = suffix.clone().into();
-                            new_node16.is_terminal = n.is_terminal;
-                            new_node16.score = n.score;
-                            let mut count = 0;
-                            for byte in 0..256 {
-                                if let Some(child_box) = n.children[byte].take() {
-                                    new_node16.add_child(byte as u8, Some(child_box));
-                                    count += 1;
-                                    if count >= NODE16_MAX {
-                                        break;
-                                    }
-                                }
-                            }
-                            Box::new(ARTNode::Node16(new_node16))
-                        } else if child_count <= NODE48_MAX {
-                            let mut new_node48 = Node48::new();
-                            new_node48.prefix = suffix.clone().into();
-                            new_node48.is_terminal = n.is_terminal;
-                            new_node48.score = n.score;
-                            let mut count = 0;
-                            for byte in 0..256 {
-                                if let Some(child_box) = n.children[byte].take() {
-                                    new_node48.add_child(byte as u8, Some(child_box));
-                                    count += 1;
-                                    if count >= NODE48_MAX {
-                                        break;
-                                    }
-                                }
-                            }
-                            Box::new(ARTNode::Node48(new_node48))
-                        } else {
-                            let mut new_node256 = Node256::new();
-                            new_node256.prefix = suffix.clone().into();
-                            new_node256.is_terminal = n.is_terminal;
-                            new_node256.score = n.score;
-                            for byte in 0..256 {
-                                if let Some(child_box) = n.children[byte].take() {
-                                    new_node256.add_child(byte as u8, Some(child_box));
-                                }
-                            }
-                            Box::new(ARTNode::Node256(new_node256))
-                        }
-                    }
-                };
-
-                // Truncate this node's prefix to the common part, mark terminal, clear children
-                node_ref.get_prefix_mut().truncate(split);
-                node_ref.set_terminal(true);
-                node_ref.set_score(Some(score));
-                match node_ref.as_mut() {
-                    ARTNode::Node4(n) => {
-                        n.keys.clear();
-                        n.children.clear();
-                    }
-                    ARTNode::Node16(n) => {
-                        n.keys.clear();
-                        n.children.clear();
-                    }
-                    ARTNode::Node48(n) => {
-                        n.child_index = [None; 256];
-                        n.children.iter_mut().for_each(|c| *c = None);
-                        n.size = 0;
-                    }
-                    ARTNode::Node256(n) => {
-                        n.children.iter_mut().for_each(|c| *c = None);
-                        n.size = 0;
-                    }
+                    n.child_index[byte] = None;
                 }
-
-                let edge = existing[split];
-                node_ref.add_child(edge, Some(existing_child));
-                // After adding a new child, potentially promote the node type
-                return (true, true, Some(node_ref));
+                n.children.iter_mut().for_each(|c| *c = None);
+                n.size = 0;
             }
-
-            // Subcase A.2: full divergence at split < existing.len() and split < remaining.len()
-            let old_edge = existing[split];
-            let old_suffix = existing[split + 1..].to_vec();
-
-            let child_count = node_ref.num_children();
-
-            // Build existing_child carrying over terminal, score, children
-            let existing_child = match node_ref.as_mut() {
-                ARTNode::Node4(n) => {
-                    if child_count <= NODE4_MAX {
-                        Box::new(ARTNode::Node4(Node4 {
-                            prefix: old_suffix.clone().into(),
-                            is_terminal: n.is_terminal,
-                            score: n.score,
-                            keys: mem::take(&mut n.keys),
-                            children: mem::take(&mut n.children),
-                        }))
-                    } else {
-                        // This should never happen for Node4 as it can only have 4 children
-                        Box::new(ARTNode::Node4(Node4 {
-                            prefix: old_suffix.clone().into(),
-                            is_terminal: n.is_terminal,
-                            score: n.score,
-                            keys: mem::take(&mut n.keys),
-                            children: mem::take(&mut n.children),
-                        }))
+            ARTNode::Node256(n) => {
+                for byte in 0..256 {
+                    if let Some(child) = n.children[byte].take() {
+                        extracted.push((byte as u8, child));
                     }
                 }
-                ARTNode::Node16(n) => {
-                    if child_count <= NODE4_MAX {
-                        let mut new_node4 = Node4::new();
-                        new_node4.prefix = old_suffix.clone().into();
-                        new_node4.is_terminal = n.is_terminal;
-                        new_node4.score = n.score;
-                        for i in 0..n.keys.len().min(NODE4_MAX) {
-                            if let Some(child_box) = n.children[i].take() {
-                                new_node4.add_child(n.keys[i], Some(child_box));
-                            }
-                        }
-                        Box::new(ARTNode::Node4(new_node4))
-                    } else if child_count <= NODE16_MAX {
-                        let mut new_node16 = Node16::new();
-                        new_node16.prefix = old_suffix.clone().into();
-                        new_node16.is_terminal = n.is_terminal;
-                        new_node16.score = n.score;
-                        for i in 0..n.keys.len() {
-                            if let Some(child_box) = n.children[i].take() {
-                                new_node16.add_child(n.keys[i], Some(child_box));
-                            }
-                        }
-                        Box::new(ARTNode::Node16(new_node16))
-                    } else {
-                        // Should not happen with Node16
-                        Box::new(ARTNode::Node16(Node16 {
-                            prefix: old_suffix.clone().into(),
-                            is_terminal: n.is_terminal,
-                            score: n.score,
-                            keys: SmallVec::new(),
-                            children: SmallVec::new(),
-                        }))
-                    }
-                }
-                ARTNode::Node48(n) => {
-                    if child_count <= NODE4_MAX {
-                        let mut new_node4 = Node4::new();
-                        new_node4.prefix = old_suffix.clone().into();
-                        new_node4.is_terminal = n.is_terminal;
-                        new_node4.score = n.score;
-                        let mut count = 0;
-                        for byte in 0..256 {
-                            if let Some(idx) = n.child_index[byte] {
-                                if let Some(child_box) = n.children[idx as usize].take() {
-                                    new_node4.add_child(byte as u8, Some(child_box));
-                                    count += 1;
-                                    if count >= NODE4_MAX {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Box::new(ARTNode::Node4(new_node4))
-                    } else if child_count <= NODE16_MAX {
-                        let mut new_node16 = Node16::new();
-                        new_node16.prefix = old_suffix.clone().into();
-                        new_node16.is_terminal = n.is_terminal;
-                        new_node16.score = n.score;
-                        for byte in 0..256 {
-                            if let Some(idx) = n.child_index[byte] {
-                                if let Some(child_box) = n.children[idx as usize].take() {
-                                    new_node16.add_child(byte as u8, Some(child_box));
-                                }
-                            }
-                        }
-                        Box::new(ARTNode::Node16(new_node16))
-                    } else if child_count <= NODE48_MAX {
-                        let mut new_node48 = Node48::new();
-                        new_node48.prefix = old_suffix.clone().into();
-                        new_node48.is_terminal = n.is_terminal;
-                        new_node48.score = n.score;
-                        for byte in 0..256 {
-                            if let Some(idx) = n.child_index[byte] {
-                                if let Some(child_box) = n.children[idx as usize].take() {
-                                    new_node48.add_child(byte as u8, Some(child_box));
-                                }
-                            }
-                        }
-                        Box::new(ARTNode::Node48(new_node48))
-                    } else {
-                        // Should not happen with Node48
-                        let mut new_node48 = Node48::new();
-                        new_node48.prefix = old_suffix.clone().into();
-                        new_node48.is_terminal = n.is_terminal;
-                        new_node48.score = n.score;
-                        Box::new(ARTNode::Node48(new_node48))
-                    }
-                }
-                ARTNode::Node256(n) => {
-                    if child_count <= NODE4_MAX {
-                        let mut new_node4 = Node4::new();
-                        new_node4.prefix = old_suffix.clone().into();
-                        new_node4.is_terminal = n.is_terminal;
-                        new_node4.score = n.score;
-                        let mut count = 0;
-                        for byte in 0..256 {
-                            if let Some(child_box) = n.children[byte].take() {
-                                new_node4.add_child(byte as u8, Some(child_box));
-                                count += 1;
-                                if count >= NODE4_MAX {
-                                    break;
-                                }
-                            }
-                        }
-                        Box::new(ARTNode::Node4(new_node4))
-                    } else if child_count <= NODE16_MAX {
-                        let mut new_node16 = Node16::new();
-                        new_node16.prefix = old_suffix.clone().into();
-                        new_node16.is_terminal = n.is_terminal;
-                        new_node16.score = n.score;
-                        let mut count = 0;
-                        for byte in 0..256 {
-                            if let Some(child_box) = n.children[byte].take() {
-                                new_node16.add_child(byte as u8, Some(child_box));
-                                count += 1;
-                                if count >= NODE16_MAX {
-                                    break;
-                                }
-                            }
-                        }
-                        Box::new(ARTNode::Node16(new_node16))
-                    } else if child_count <= NODE48_MAX {
-                        let mut new_node48 = Node48::new();
-                        new_node48.prefix = old_suffix.clone().into();
-                        new_node48.is_terminal = n.is_terminal;
-                        new_node48.score = n.score;
-                        let mut count = 0;
-                        for byte in 0..256 {
-                            if let Some(child_box) = n.children[byte].take() {
-                                new_node48.add_child(byte as u8, Some(child_box));
-                                count += 1;
-                                if count >= NODE48_MAX {
-                                    break;
-                                }
-                            }
-                        }
-                        Box::new(ARTNode::Node48(new_node48))
-                    } else {
-                        let mut new_node256 = Node256::new();
-                        new_node256.prefix = old_suffix.clone().into();
-                        new_node256.is_terminal = n.is_terminal;
-                        new_node256.score = n.score;
-                        for byte in 0..256 {
-                            if let Some(child_box) = n.children[byte].take() {
-                                new_node256.add_child(byte as u8, Some(child_box));
-                            }
-                        }
-                        Box::new(ARTNode::Node256(new_node256))
-                    }
-                }
-            };
-
-            let new_edge = remaining[split];
-            let new_suffix = remaining[split + 1..].to_vec();
-            let new_child = Box::new(ARTNode::Node4(Node4 {
-                prefix: new_suffix.clone().into(),
-                is_terminal: true,
-                score: Some(score),
-                keys: SmallVec::new(),
-                children: SmallVec::new(),
-            }));
-
-            // Turn current node into interior: update prefix, clear terminal, children
-            node_ref.get_prefix_mut().truncate(split);
-            node_ref.set_terminal(false);
-            node_ref.set_score(None);
-            match node_ref.as_mut() {
-                ARTNode::Node4(n) => {
-                    n.keys.clear();
-                    n.children.clear();
-                }
-                ARTNode::Node16(n) => {
-                    n.keys.clear();
-                    n.children.clear();
-                }
-                ARTNode::Node48(n) => {
-                    n.child_index = [None; 256];
-                    n.children.iter_mut().for_each(|c| *c = None);
-                    n.size = 0;
-                }
-                ARTNode::Node256(n) => {
-                    n.children.iter_mut().for_each(|c| *c = None);
-                    n.size = 0;
-                }
+                n.size = 0;
             }
-
-            node_ref.add_child(old_edge, Some(existing_child));
-            node_ref.add_child(new_edge, Some(new_child));
-            // After adding new children, potentially promote the node type
-            return (true, true, Some(node_ref));
         }
 
-        let next_depth = depth + split;
+        let actual_count = extracted.len();
+        let mut target: Box<ARTNode> = if actual_count <= NODE4_MAX {
+            Box::new(ARTNode::Node4(Node4::new()))
+        } else if actual_count <= NODE16_MAX {
+            Box::new(ARTNode::Node16(Node16::new()))
+        } else if actual_count <= NODE48_MAX {
+            Box::new(ARTNode::Node48(Node48::new()))
+        } else {
+            Box::new(ARTNode::Node256(Node256::new()))
+        };
 
-        // Case B: We matched full node prefix and next_depth == key.len()
-        if next_depth == key.len() {
-            let mut changed = false;
-            let mut new_path = false;
-
-            if !node_ref.is_terminal() {
-                node_ref.set_terminal(true);
-                new_path = true;
-                changed = true;
-            }
-            if node_ref.get_score() != Some(score) {
-                node_ref.set_score(Some(score));
-                changed = true;
-            }
-            return (changed, new_path, Some(node_ref));
+        *target.get_prefix_mut() = suffix.into();
+        target.set_terminal(is_terminal);
+        target.set_score(score);
+        for (edge, child) in extracted {
+            target.add_child(edge, Some(child));
         }
-
-        // Case C: matched full node prefix and need to descend one byte
-        let c = key[next_depth];
-        if node_ref.find_child_mut(c).is_none() {
-            // No child for this byte: create new child with remaining suffix
-            let mut new_child = Box::new(ARTNode::new_node4());
-            *new_child.get_prefix_mut() = key[(next_depth + 1)..].iter().copied().collect();
-            new_child.set_terminal(true);
-            new_child.set_score(Some(score));
-
-            node_ref.add_child(c, Some(new_child));
-            // After adding a new child, potentially promote the node type
-            return (true, true, Some(node_ref));
-        }
-
-        // Otherwise, descend into existing child
-        if let Some(child) = node_ref.find_child_mut(c) {
-            let taken_child = child.take();
-            let (changed, new_path_in_child, new_child) =
-                Self::insert_recursive(taken_child, key, next_depth + 1, score);
-            *child = new_child;
-            return (changed, new_path_in_child, Some(node_ref));
-        }
-
-        // Should not reach here
-        (false, false, Some(node_ref))
+        target
     }
 
     /// Collects all paths stored below a given node in the trie.
@@ -1506,36 +1144,31 @@ impl ART {
     /// * `node` - The node from which to start collection.
     /// * `results` - A mutable reference to a vector where results will be stored.
     fn collect_all_paths(&self, node: &ARTNode, results: &mut Vec<(String, f32)>) {
-        // Define the stack item with accumulated path
         struct StackItem<'a> {
             node: &'a ARTNode,
-            path: String,
+            path: Vec<u8>,
         }
 
         let mut stack = Vec::new();
         stack.push(StackItem {
             node,
-            path: String::new(),
+            path: Vec::new(),
         });
 
         while let Some(StackItem { node, path }) = stack.pop() {
-            // Build complete path for this node
             let mut full_path = path;
-
-            if !node.get_prefix().is_empty() {
-                full_path.push_str(&String::from_utf8_lossy(node.get_prefix()));
-            }
+            full_path.extend_from_slice(node.get_prefix());
 
             if node.is_terminal() {
                 if let Some(score) = node.get_score() {
-                    results.push((full_path.clone(), score));
+                    results.push((String::from_utf8_lossy(&full_path).into_owned(), score));
                 }
             }
 
             // Add all children to the stack (in reverse order for proper traversal)
             for (key, child) in node.iter_children().into_iter().rev() {
                 let mut child_path = full_path.clone();
-                child_path.push(key as char);
+                child_path.push(key);
                 stack.push(StackItem {
                     node: child,
                     path: child_path,
@@ -1558,13 +1191,9 @@ impl ART {
         let normalized_bytes = normalized.as_bytes();
 
         if let Some(root) = &self.root {
-            // Descend until we either:
-            // 1) run out of search bytes in the middle of a node prefix, or
-            // 2) match a full node prefix exactly, or
-            // 3) fail to match
             let mut node = root.as_ref();
             let mut depth = 0;
-            let mut path_acc = String::new();
+            let mut path_acc: Vec<u8> = Vec::new();
 
             loop {
                 let node_prefix = node.get_prefix();
@@ -1578,10 +1207,8 @@ impl ART {
                     if &node_prefix[..rem] != &normalized_bytes[depth..] {
                         return Vec::new();
                     }
-                    // Build base string so far: path_acc + full node_prefix
-                    path_acc.push_str(&String::from_utf8_lossy(node_prefix));
-                    let base = path_acc.clone();
-                    self.collect_results_with_limit(node, &base, &mut results);
+                    path_acc.extend_from_slice(node_prefix);
+                    self.collect_results_with_limit(node, &path_acc, &mut results);
                     self.sort_and_deduplicate_results(&mut results, true);
                     if results.len() > self.max_results {
                         results.truncate(self.max_results);
@@ -1592,12 +1219,10 @@ impl ART {
                 if &node_prefix[..] != &normalized_bytes[depth..depth + prefix_len] {
                     return Vec::new();
                 }
-                // Full match: append node_prefix to path_acc and advance depth
-                path_acc.push_str(&String::from_utf8_lossy(node_prefix));
+                path_acc.extend_from_slice(node_prefix);
                 depth += prefix_len;
                 if depth == normalized_bytes.len() {
-                    let base = path_acc.clone();
-                    self.collect_results_with_limit(node, &base, &mut results);
+                    self.collect_results_with_limit(node, &path_acc, &mut results);
                     self.sort_and_deduplicate_results(&mut results, true);
                     if results.len() > self.max_results {
                         results.truncate(self.max_results);
@@ -1607,7 +1232,7 @@ impl ART {
                 // Otherwise, descend into the next child by one byte
                 let next_byte = normalized_bytes[depth];
                 if let Some(child) = node.find_child(next_byte) {
-                    path_acc.push(next_byte as char);
+                    path_acc.push(next_byte);
                     node = child;
                     depth += 1;
                     continue;
@@ -1619,8 +1244,7 @@ impl ART {
 
             // Case C: if we broke out of the loop because prefix is empty or fully consumed initially
             if depth == normalized_bytes.len() {
-                let base = path_acc.clone();
-                self.collect_results_with_limit(node, &base, &mut results);
+                self.collect_results_with_limit(node, &path_acc, &mut results);
                 self.sort_and_deduplicate_results(&mut results, true);
                 if results.len() > self.max_results {
                     results.truncate(self.max_results);
@@ -1649,176 +1273,136 @@ impl ART {
         let normalized = self.normalize_path(path);
         let path_bytes = normalized.as_bytes();
 
-        // Track if we removed the path
-        let (removed, should_remove_root, new_root) =
-            Self::remove_recursive(self.root.take(), path_bytes, 0);
-
-        // Update the root based on the removal result
-        if should_remove_root {
-            self.root = None;
-        } else {
-            self.root = new_root;
+        struct RemoveFrame {
+            parent: Box<ARTNode>,
+            edge: u8,
         }
 
-        // Update path count if we removed a path
+        let mut stack: Vec<RemoveFrame> = Vec::new();
+        let mut current = self.root.take();
+        let mut depth = 0usize;
+
+        let (removed, mut result_node) = loop {
+            let Some(mut node_box) = current else {
+                break (false, None);
+            };
+
+            let (match_len, exact_match) = node_box.check_prefix(path_bytes, depth);
+            let next_depth = depth + match_len;
+
+            if !exact_match {
+                break (false, Some(node_box));
+            }
+
+            if next_depth == path_bytes.len() {
+                if !node_box.is_terminal() {
+                    break (false, Some(node_box));
+                }
+
+                node_box.set_terminal(false);
+                node_box.set_score(None);
+
+                let should_remove = node_box.num_children() == 0;
+                break (true, if should_remove { None } else { Some(node_box) });
+            }
+
+            let c = path_bytes[next_depth];
+            if let Some(child) = node_box.remove_child(c) {
+                stack.push(RemoveFrame {
+                    parent: node_box,
+                    edge: c,
+                });
+                current = Some(child);
+                depth = next_depth + 1;
+            } else {
+                break (false, Some(node_box));
+            }
+        };
+
+        while let Some(RemoveFrame { mut parent, edge }) = stack.pop() {
+            if let Some(child) = result_node {
+                parent.add_child(edge, Some(child));
+            }
+
+            if removed {
+                if !parent.is_terminal() && parent.num_children() == 1 {
+                    let children = parent.iter_children();
+                    if children.len() == 1 {
+                        let (key, child) = &children[0];
+                        if child.get_prefix().is_empty() {
+                            let mut merged_child = (**child).clone();
+                            let mut new_prefix = parent.get_prefix().to_vec();
+                            new_prefix.push(*key);
+                            new_prefix.extend_from_slice(merged_child.get_prefix());
+                            *merged_child.get_prefix_mut() = new_prefix.into();
+                            result_node = Some(merged_child);
+                            continue;
+                        }
+                    }
+                }
+
+                if !(!parent.is_terminal() && parent.num_children() == 0) {
+                    let prefix = parent.get_prefix().to_vec();
+                    let is_term = parent.is_terminal();
+                    let score = parent.get_score();
+
+                    match parent.as_mut() {
+                        ARTNode::Node16(n) if n.keys.len() <= 4 => {
+                            let mut new_node4 = Node4::new();
+                            new_node4.prefix = prefix.into();
+                            new_node4.is_terminal = is_term;
+                            new_node4.score = score;
+                            for i in 0..n.keys.len() {
+                                if let Some(child_box) = n.children[i].take() {
+                                    new_node4.add_child(n.keys[i], Some(child_box));
+                                }
+                            }
+                            parent = Box::new(ARTNode::Node4(new_node4));
+                        }
+                        ARTNode::Node48(n) if n.size <= 16 => {
+                            let mut new_node16 = Node16::new();
+                            new_node16.prefix = prefix.into();
+                            new_node16.is_terminal = is_term;
+                            new_node16.score = score;
+                            for byte in 0..256 {
+                                if let Some(idx) = n.child_index[byte] {
+                                    if let Some(child_box) = n.children[idx as usize].take() {
+                                        new_node16.add_child(byte as u8, Some(child_box));
+                                    }
+                                }
+                            }
+                            parent = Box::new(ARTNode::Node16(new_node16));
+                        }
+                        ARTNode::Node256(n) if n.size <= 48 => {
+                            let mut new_node48 = Node48::new();
+                            new_node48.prefix = prefix.into();
+                            new_node48.is_terminal = is_term;
+                            new_node48.score = score;
+                            for byte in 0..256 {
+                                if let Some(child_box) = n.children[byte].take() {
+                                    new_node48.add_child(byte as u8, Some(child_box));
+                                }
+                            }
+                            parent = Box::new(ARTNode::Node48(new_node48));
+                        }
+                        _ => {}
+                    }
+                }
+
+                let should_remove = !parent.is_terminal() && parent.num_children() == 0;
+                result_node = if should_remove { None } else { Some(parent) };
+            } else {
+                result_node = Some(parent);
+            }
+        }
+
+        self.root = result_node;
+
         if removed {
             self.path_count -= 1;
         }
 
         removed
-    }
-
-    /// Recursively removes a path from the trie.
-    /// Internal helper method for the public remove method.
-    ///
-    /// # Arguments
-    /// * `node` - The current node in the traversal.
-    /// * `path` - The path bytes to remove.
-    /// * `depth` - Current depth in the path.
-    ///
-    /// # Returns
-    /// * A tuple containing:
-    ///   - Whether the path was removed
-    ///   - Whether this node should be removed
-    ///   - The new node after potential modifications
-    fn remove_recursive(
-        node: Option<Box<ARTNode>>,
-        path: &[u8],
-        depth: usize,
-    ) -> (bool, bool, Option<Box<ARTNode>>) {
-        if node.is_none() {
-            return (false, false, None);
-        }
-
-        let mut node_box = node.unwrap();
-
-        let (match_len, exact_match) = node_box.check_prefix(path, depth);
-        let next_depth = depth + match_len;
-
-        // If prefix doesn't match completely, path not found
-        if !exact_match {
-            return (false, false, Some(node_box));
-        }
-
-        if next_depth == path.len() {
-            if !node_box.is_terminal() {
-                return (false, false, Some(node_box));
-            }
-
-            node_box.set_terminal(false);
-            node_box.set_score(None);
-
-            let should_remove = node_box.num_children() == 0;
-
-            return (
-                true,
-                should_remove,
-                if should_remove { None } else { Some(node_box) },
-            );
-        }
-
-        let c = path[next_depth];
-        let mut child_removed = false;
-
-        // Remove from the child
-        if let Some(child_box) = node_box.find_child_mut(c) {
-            let child = child_box.take();
-            let (removed, should_remove_child, new_child) =
-                Self::remove_recursive(child, path, next_depth + 1);
-
-            child_removed = removed;
-
-            if should_remove_child {
-                node_box.remove_child(c);
-            } else if new_child.is_some() {
-                *child_box = new_child;
-            }
-        }
-
-        // Only perform merge/shrink logic if a child was actually removed.
-        if child_removed {
-            if !node_box.is_terminal() && node_box.num_children() == 1 {
-                let children = node_box.iter_children();
-                if children.len() == 1 {
-                    let (key, child) = &children[0];
-                    if child.get_prefix().is_empty() {
-                        let mut merged_child = (**child).clone();
-                        let mut new_prefix = node_box.get_prefix().to_vec();
-                        new_prefix.push(*key);
-                        new_prefix.extend_from_slice(merged_child.get_prefix());
-                        *merged_child.get_prefix_mut() = new_prefix.into();
-                        return (child_removed, false, Some(merged_child));
-                    }
-                }
-            }
-
-            // If this node should not be removed, consider shrinking its type based on child count
-            if !(!node_box.is_terminal() && node_box.num_children() == 0) {
-                let prefix = node_box.get_prefix().to_vec();
-                let is_term = node_box.is_terminal();
-                let score = node_box.get_score();
-
-                match node_box.as_mut() {
-                    // Shrink Node16 to Node4 when <= 4 children
-                    ARTNode::Node16(n) if n.keys.len() <= 4 => {
-                        let mut new_node4 = Node4::new();
-                        new_node4.prefix = prefix.clone().into();
-                        new_node4.is_terminal = is_term;
-                        new_node4.score = score;
-                        for i in 0..n.keys.len() {
-                            if let Some(child_box) = n.children[i].take() {
-                                new_node4.add_child(n.keys[i], Some(child_box));
-                            }
-                        }
-                        node_box = Box::new(ARTNode::Node4(new_node4));
-                    }
-                    // Shrink Node48 to Node16 when <= 16 children
-                    ARTNode::Node48(n) if n.size <= 16 => {
-                        let mut new_node16 = Node16::new();
-                        new_node16.prefix = prefix.clone().into();
-                        new_node16.is_terminal = is_term;
-                        new_node16.score = score;
-                        for byte in 0..256 {
-                            if let Some(idx) = n.child_index[byte] {
-                                if let Some(child_box) = n.children[idx as usize].take() {
-                                    new_node16.add_child(byte as u8, Some(child_box));
-                                }
-                            }
-                        }
-                        node_box = Box::new(ARTNode::Node16(new_node16));
-                    }
-                    // Shrink Node256 to Node48 when <= 48 children
-                    ARTNode::Node256(n) if n.size <= 48 => {
-                        let mut new_node48 = Node48::new();
-                        new_node48.prefix = prefix.clone().into();
-                        new_node48.is_terminal = is_term;
-                        new_node48.score = score;
-                        for byte in 0..256 {
-                            if let Some(child_box) = n.children[byte].take() {
-                                new_node48.add_child(byte as u8, Some(child_box));
-                            }
-                        }
-                        node_box = Box::new(ARTNode::Node48(new_node48));
-                    }
-                    _ => {}
-                }
-            }
-
-            let should_remove = !node_box.is_terminal() && node_box.num_children() == 0;
-            (
-                child_removed,
-                should_remove,
-                if should_remove { None } else { Some(node_box) },
-            )
-        } else {
-            // If no child was removed, don't shrink or merge, just compute should_remove
-            let should_remove = !node_box.is_terminal() && node_box.num_children() == 0;
-            (
-                child_removed,
-                should_remove,
-                if should_remove { None } else { Some(node_box) },
-            )
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -1861,41 +1445,44 @@ impl ART {
         }
     }
 
-    /// Collects up to `max_results` paths under `node`, starting from `base`.
-    /// Stops as soon as `max_results` terminal paths are found.
+    /// Collects up to `max_results` highest-scoring paths under `node`, starting from `base` bytes.
     fn collect_results_with_limit(
         &self,
         start_node: &ARTNode,
-        base: &str,
+        base: &[u8],
         results: &mut Vec<(String, f32)>,
     ) {
         use std::collections::VecDeque;
-        let mut queue = VecDeque::new();
-        // Each item is (node, path_so_far)
-        queue.push_back((start_node, base.to_string()));
+        if self.max_results == 0 {
+            return;
+        }
+        let candidate_limit = self.max_results.saturating_mul(16).max(256);
+        let mut candidates: Vec<(String, f32)> = Vec::new();
+        let mut queue: VecDeque<(&ARTNode, Vec<u8>)> = VecDeque::new();
+        queue.push_back((start_node, base.to_vec()));
 
         while let Some((node, path_so_far)) = queue.pop_front() {
-            // If this node is terminal, record it
             if node.is_terminal() {
                 if let Some(score) = node.get_score() {
-                    results.push((path_so_far.clone(), score));
-                    if results.len() >= self.max_results {
-                        return;
+                    candidates.push((String::from_utf8_lossy(&path_so_far).into_owned(), score));
+                    if candidates.len() >= candidate_limit {
+                        break;
                     }
                 }
             }
 
-            // Enqueue children in order
             for (key, child) in node.iter_children() {
-                // Build child path: path_so_far + key + child.prefix
                 let mut child_path = path_so_far.clone();
-                child_path.push(key as char);
-                if !child.get_prefix().is_empty() {
-                    child_path.push_str(&String::from_utf8_lossy(child.get_prefix()));
-                }
+                child_path.push(key);
+                child_path.extend_from_slice(child.get_prefix());
                 queue.push_back((child, child_path));
             }
         }
+
+        candidates
+            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(self.max_results);
+        results.extend(candidates);
     }
 
     /// Searches for paths matching a query string, with optional context directory and component matching.
@@ -2057,9 +1644,16 @@ mod tests_art_v5 {
         if let Some(&first) = chars.peek() {
             if first == '/' || first == '\\' {
                 result.push('/');
+                chars.next();
+                // Preserve UNC prefix `//` (e.g., `\\server\share` -> `//server/share`)
+                if let Some(&second) = chars.peek() {
+                    if second == '/' || second == '\\' {
+                        result.push('/');
+                        chars.next();
+                    }
+                }
                 saw_slash = true;
                 started = true;
-                chars.next();
             }
         }
 
@@ -3493,8 +3087,9 @@ mod tests_art_v5 {
             "foo/bar/baz/qux.txt"
         );
 
-        // 3. Leading slash and duplicate slashes
-        assert_eq!(art.normalize_path("//foo///bar//baz//"), "/foo/bar/baz");
+        // 3. UNC leading double-slash preserved and duplicate slashes collapsed
+        assert_eq!(art.normalize_path("//foo///bar//baz//"), "//foo/bar/baz");
+        assert_eq!(art.normalize_path("/foo///bar//baz//"), "/foo/bar/baz");
 
         // 4. Spaces inside components
         assert_eq!(
@@ -3567,5 +3162,96 @@ mod tests_art_v5 {
                 path
             );
         }
+    }
+
+    #[test]
+    fn test_tp_search_03_node256_split_and_removal() {
+        let mut trie = ART::new(100);
+        let mut paths = Vec::new();
+
+        // 50 distinct 1-byte branches after "dir/sub/" to trigger Node256
+        for i in 0..50u8 {
+            let ch = (b'!' + i) as char;
+            let p = format!("dir/sub/{}.txt", ch);
+            trie.insert(&p, 1.0);
+            paths.push(p);
+        }
+        assert_eq!(trie.len(), 50);
+
+        trie.insert("dir/sub", 1.0);
+        paths.push("dir/sub".to_string());
+
+        for c in 'A'..='F' {
+            let p = format!("dir/sub{}", c);
+            trie.insert(&p, 1.0);
+            paths.push(p);
+        }
+
+        // Split Node256 by inserting "dir/su"
+        trie.insert("dir/su", 1.0);
+        paths.push("dir/su".to_string());
+        assert_eq!(trie.len(), 58);
+
+        let completions = trie.find_completions("dir/");
+        assert_eq!(completions.len(), 58);
+
+        // Remove 48+ paths one by one
+        for p in paths.iter().take(49) {
+            assert!(trie.remove(p), "Expected removal of {}", p);
+        }
+        assert_eq!(trie.len(), 9);
+        for p in paths.iter().skip(49) {
+            let found = trie.find_completions(p);
+            assert!(found.iter().any(|(res, _)| res == p), "Missing {}", p);
+        }
+    }
+
+    #[test]
+    fn test_tp_search_04_utf8_branching_and_unc_prefix() {
+        let mut trie = ART::new(20);
+        let p1 = "C:/папка/файл_а.txt";
+        let p2 = "C:/папка/файл_б.txt";
+        let p3 = "C:/🚀/тест.md";
+        let p4 = "C:/🚗/тест2.md";
+        let unc = "\\\\server\\share\\doc.pdf";
+
+        trie.insert(p1, 1.0);
+        trie.insert(p2, 1.0);
+        trie.insert(p3, 1.0);
+        trie.insert(p4, 1.0);
+        trie.insert(unc, 1.0);
+
+        assert_eq!(trie.normalize_path(unc), "//server/share/doc.pdf");
+
+        let completions: Vec<String> = trie
+            .find_completions("C:/")
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        for expected in [p1, p2, p3, p4] {
+            assert!(
+                completions.contains(&expected.to_string()),
+                "Missing valid UTF-8 path {} in {:?}",
+                expected,
+                completions
+            );
+        }
+        for path in &completions {
+            assert!(!path.contains('\u{FFFD}'), "Corrupted UTF-8 in {}", path);
+        }
+    }
+
+    #[test]
+    fn test_tp_search_10_deep_8kb_path_no_stack_overflow() {
+        let mut trie = ART::new(10);
+        let mut deep_path = String::from("C:");
+        for i in 0..1100 {
+            deep_path.push_str(&format!("/seg{:04}", i));
+        }
+        assert!(deep_path.len() > 8192);
+        assert!(trie.insert(&deep_path, 1.0));
+        assert_eq!(trie.len(), 1);
+        assert!(trie.remove(&deep_path));
+        assert_eq!(trie.len(), 0);
     }
 }
