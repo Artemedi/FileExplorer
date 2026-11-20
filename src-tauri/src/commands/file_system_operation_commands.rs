@@ -147,6 +147,51 @@ pub async fn open_file(path: &str) -> Result<String, String> {
     .await
 }
 
+#[cfg(target_os = "windows")]
+fn open_path_with_shell_execute(path: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut std::ffi::c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
+    }
+
+    let normalized = path.replace('/', "\\");
+    let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+    let file: Vec<u16> = OsStr::new(&normalized)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    const SW_SHOWNORMAL: i32 = 1;
+
+    // SAFETY: `operation` and `file` are valid NUL-terminated UTF-16 buffers for the call duration.
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    if result > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecuteW failed with code {result}"))
+    }
+}
+
 #[tauri::command]
 pub async fn open_in_default_app(path: &str) -> Result<(), String> {
     let path_owned = path.to_string();
@@ -162,7 +207,12 @@ pub async fn open_in_default_app(path: &str) -> Result<(), String> {
             .to_json());
         }
 
-        open::that(&path_owned).map_err(|err| {
+        #[cfg(target_os = "windows")]
+        let open_res = open_path_with_shell_execute(&path_owned);
+        #[cfg(not(target_os = "windows"))]
+        let open_res = open::that(&path_owned).map_err(|err| err.to_string());
+
+        open_res.map_err(|err| {
             Error::new(
                 ErrorCode::InternalError,
                 format!("Failed to open file in default app: {err}"),
@@ -641,19 +691,51 @@ pub async fn rename(old_path: &str, new_path: &str) -> Result<(), String> {
 /// ```
 #[tauri::command]
 pub async fn move_to_trash(path: &str) -> Result<(), String> {
-    let path_owned = path.to_string();
-    run_blocking(move || match trash::delete(&path_owned) {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            log_error!("Failed to move file or directory to trash: {}", err);
-            Err(Error::new(
+    #[cfg(target_os = "windows")]
+    let normalized_path = path.replace('/', "\\");
+    #[cfg(not(target_os = "windows"))]
+    let normalized_path = path.to_string();
+
+    // Run on a dedicated OS thread on Windows so trash::delete's Shell COM (STA)
+    // never collides with Tokio's pooled spawn_blocking threads.
+    #[cfg(target_os = "windows")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let res = trash::delete(&normalized_path).map_err(|err| {
+                log_error!("Failed to move file or directory to trash: {}", err);
+                Error::new(
+                    ErrorCode::InternalError,
+                    format!("Failed to move file or directory to trash: {err}"),
+                )
+                .to_json()
+            });
+            let _ = tx.send(res);
+        });
+        rx.await.map_err(|err| {
+            Error::new(
                 ErrorCode::InternalError,
-                format!("Failed to move file or directory to trash: {err}"),
+                format!("Background trash task failed: {err}"),
             )
-            .to_json())
-        }
-    })
-    .await
+            .to_json()
+        })?
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        run_blocking(move || match trash::delete(&normalized_path) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                log_error!("Failed to move file or directory to trash: {}", err);
+                Err(Error::new(
+                    ErrorCode::InternalError,
+                    format!("Failed to move file or directory to trash: {err}"),
+                )
+                .to_json())
+            }
+        })
+        .await
+    }
 }
 
 /// Generates a unique destination path by appending ` (n)` if the path already exists.

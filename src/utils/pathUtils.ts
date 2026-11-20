@@ -307,3 +307,21 @@ export const isRootPath = (path?: string | null): boolean => {
 
     return false;
 };
+
+/**
+ * Checks whether `candidatePath` is the same path as `targetPath` or a descendant inside it.
+ */
+export const isPathOrDescendant = (
+    candidatePath?: string | null,
+    targetPath?: string | null
+): boolean => {
+    if (!candidatePath || !targetPath) return false;
+    if (candidatePath === targetPath) return true;
+    const normCandidate = normalizePath(candidatePath);
+    const normTarget = normalizePath(targetPath);
+    if (normCandidate === normTarget) return true;
+    return (
+        normCandidate.startsWith(`${normTarget}/`) ||
+        normCandidate.startsWith(`${normTarget}\\`)
+    );
+};

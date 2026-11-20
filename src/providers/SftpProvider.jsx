@@ -180,7 +180,7 @@ export default function SftpProvider({ children }) {
         const payload = {
             host: connection.host,
             port: portNum,
-            username: connection.username,
+            username: connection.username || '',
             password: connection.password || '',
             ...extraArgs
         };

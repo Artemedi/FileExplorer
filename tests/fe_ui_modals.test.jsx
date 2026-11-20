@@ -395,4 +395,35 @@ describe('Wave 4 UI & Modals (TP-FE-UI-01, TP-FE-UI-03, TP-FE-UI-14..16)', () =>
             expect(mockInvoke).toHaveBeenCalledWith('eject_volume', { mountPoint: 'E:\\' });
         });
     });
+
+    test('AddSftpConnectionView allows guest access without username/password and ignores drag-out overlay click', async () => {
+        const onAdd = vi.fn();
+        const onClose = vi.fn();
+        render(<AddSftpConnectionView isOpen={true} onClose={onClose} onAdd={onAdd} />);
+
+        const nameInput = screen.getByLabelText('Name');
+        const overlay = document.querySelector('.modal-overlay');
+        fireEvent.mouseDown(nameInput);
+        fireEvent.click(overlay);
+        expect(onClose).not.toHaveBeenCalled();
+
+        fireEvent.change(nameInput, { target: { value: 'guest-nas' } });
+        fireEvent.change(screen.getByLabelText('IP / Host'), { target: { value: '192.168.1.50' } });
+
+        const testBtn = screen.getByText('Test Connection');
+        const addBtn = screen.getByText('Add');
+        expect(testBtn).not.toBeDisabled();
+        expect(addBtn).not.toBeDisabled();
+
+        fireEvent.click(addBtn);
+        await waitFor(() => {
+            expect(onAdd).toHaveBeenCalledWith({
+                name: 'guest-nas',
+                host: '192.168.1.50',
+                port: 22,
+                username: ''
+            });
+        });
+        expect(mockInvoke).not.toHaveBeenCalledWith('store_sftp_credentials', expect.anything());
+    });
 });

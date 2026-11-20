@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
@@ -6,7 +6,7 @@ import { useSettings } from '../../providers/SettingsProvider';
 import { useSftp } from '../../providers/SftpProvider';
 import { useTranslation } from '../../i18n';
 import { getDirectoryPath, isRootPath, joinPath, normalizePath } from '../../utils/pathUtils';
-import { showSuccess, showError, showConfirm } from '../../utils/NotificationSystem';
+import { showSuccess, showError, showConfirm, showInfo } from '../../utils/NotificationSystem';
 import FileList from './FileList';
 import './dualPane.css';
 
@@ -15,6 +15,61 @@ const isSameNormalizedPath = (pathA, pathB, isSftp) => {
     const normB = normalizePath(pathB);
     if (!normA || !normB) return false;
     return isSftp ? normA === normB : normA.toLowerCase() === normB.toLowerCase();
+};
+
+/**
+ * Compares two directory listings by entry name and file size.
+ * @returns {{ leftDiffPaths: Set<string>, rightDiffPaths: Set<string>, leftOnlyCount: number, rightOnlyCount: number, modifiedCount: number }}
+ */
+const computeDirectoryDiff = (leftData, rightData) => {
+    const leftDiffPaths = new Set();
+    const rightDiffPaths = new Set();
+    let leftOnlyCount = 0;
+    let rightOnlyCount = 0;
+    let modifiedCount = 0;
+
+    if (!leftData || !rightData) {
+        return { leftDiffPaths, rightDiffPaths, leftOnlyCount, rightOnlyCount, modifiedCount };
+    }
+
+    const leftDirs = new Map((leftData.directories || []).map(d => [d.name, d]));
+    const rightDirs = new Map((rightData.directories || []).map(d => [d.name, d]));
+
+    for (const [name, dir] of leftDirs) {
+        if (!rightDirs.has(name)) {
+            leftDiffPaths.add(dir.path);
+            leftOnlyCount++;
+        }
+    }
+    for (const [name, dir] of rightDirs) {
+        if (!leftDirs.has(name)) {
+            rightDiffPaths.add(dir.path);
+            rightOnlyCount++;
+        }
+    }
+
+    const leftFiles = new Map((leftData.files || []).map(f => [f.name, f]));
+    const rightFiles = new Map((rightData.files || []).map(f => [f.name, f]));
+
+    for (const [name, file] of leftFiles) {
+        const match = rightFiles.get(name);
+        if (!match) {
+            leftDiffPaths.add(file.path);
+            leftOnlyCount++;
+        } else if (file.size_in_bytes !== match.size_in_bytes) {
+            leftDiffPaths.add(file.path);
+            rightDiffPaths.add(match.path);
+            modifiedCount++;
+        }
+    }
+    for (const [name, file] of rightFiles) {
+        if (!leftFiles.has(name)) {
+            rightDiffPaths.add(file.path);
+            rightOnlyCount++;
+        }
+    }
+
+    return { leftDiffPaths, rightDiffPaths, leftOnlyCount, rightOnlyCount, modifiedCount };
 };
 
 /**
@@ -52,6 +107,8 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
     const [rightSelected, setRightSelected] = useState([]);
     const [leftFocused, setLeftFocused] = useState(null);
     const [rightFocused, setRightFocused] = useState(null);
+    const [compareActive, setCompareActive] = useState(false);
+    const [showDiffOnly, setShowDiffOnly] = useState(false);
 
     const leftPathRef = useRef(leftPath);
     const rightPathRef = useRef(rightPath);
@@ -380,6 +437,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
     useEffect(() => {
         const handleKeyDown = (e) => {
             if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target.isContentEditable) return;
+            if (document.querySelector('[role="dialog"], .modal-overlay, .preview-modal-backdrop')) return;
 
             if (e.key === 'F5') {
                 e.preventDefault();
@@ -407,7 +465,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
             } else if (e.key === 'Backspace' || (e.altKey && e.key === 'ArrowUp')) {
                 e.preventDefault();
                 handleGoUp(activePane);
-            } else if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+            } else if ((e.ctrlKey || e.metaKey) && (e.code === 'KeyA' || e.key === 'a' || e.key === 'A')) {
                 e.preventDefault();
                 const activeData = activePane === 'left' ? leftDirData : rightDirData;
                 if (activeData) {
@@ -457,8 +515,63 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
         });
     };
 
-    const leftItemCount = (leftDirData?.directories?.length || 0) + (leftDirData?.files?.length || 0);
-    const rightItemCount = (rightDirData?.directories?.length || 0) + (rightDirData?.files?.length || 0);
+    const diffResult = useMemo(
+        () => (compareActive ? computeDirectoryDiff(leftDirData, rightDirData) : null),
+        [compareActive, leftDirData, rightDirData]
+    );
+
+    const displayedLeftData = useMemo(() => {
+        if (!compareActive || !showDiffOnly || !leftDirData || !diffResult) return leftDirData;
+        return {
+            ...leftDirData,
+            directories: (leftDirData.directories || []).filter(d => diffResult.leftDiffPaths.has(d.path)),
+            files: (leftDirData.files || []).filter(f => diffResult.leftDiffPaths.has(f.path)),
+        };
+    }, [compareActive, showDiffOnly, leftDirData, diffResult]);
+
+    const displayedRightData = useMemo(() => {
+        if (!compareActive || !showDiffOnly || !rightDirData || !diffResult) return rightDirData;
+        return {
+            ...rightDirData,
+            directories: (rightDirData.directories || []).filter(d => diffResult.rightDiffPaths.has(d.path)),
+            files: (rightDirData.files || []).filter(f => diffResult.rightDiffPaths.has(f.path)),
+        };
+    }, [compareActive, showDiffOnly, rightDirData, diffResult]);
+
+    const handleToggleCompare = useCallback(() => {
+        if (compareActive) {
+            setCompareActive(false);
+            setShowDiffOnly(false);
+            return;
+        }
+        const diff = computeDirectoryDiff(leftDirData, rightDirData);
+        setCompareActive(true);
+
+        if (leftDirData) {
+            const leftDiffItems = [
+                ...(leftDirData.directories || []).filter(d => diff.leftDiffPaths.has(d.path)).map(d => ({ ...d, isDirectory: true })),
+                ...(leftDirData.files || []).filter(f => diff.leftDiffPaths.has(f.path)).map(f => ({ ...f, isDirectory: false })),
+            ];
+            setLeftSelected(leftDiffItems);
+        }
+        if (rightDirData) {
+            const rightDiffItems = [
+                ...(rightDirData.directories || []).filter(d => diff.rightDiffPaths.has(d.path)).map(d => ({ ...d, isDirectory: true })),
+                ...(rightDirData.files || []).filter(f => diff.rightDiffPaths.has(f.path)).map(f => ({ ...f, isDirectory: false })),
+            ];
+            setRightSelected(rightDiffItems);
+        }
+
+        const totalDiffs = diff.leftOnlyCount + diff.rightOnlyCount + diff.modifiedCount;
+        if (totalDiffs === 0) {
+            showSuccess('Directories match');
+        } else {
+            showInfo(`Compare: ${diff.leftOnlyCount} left only, ${diff.rightOnlyCount} right only, ${diff.modifiedCount} modified`);
+        }
+    }, [compareActive, leftDirData, rightDirData]);
+
+    const leftItemCount = (displayedLeftData?.directories?.length || 0) + (displayedLeftData?.files?.length || 0);
+    const rightItemCount = (displayedRightData?.directories?.length || 0) + (displayedRightData?.files?.length || 0);
 
     return (
         <div className="dual-pane-wrapper">
@@ -493,6 +606,22 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                     >
                         =
                     </button>
+                    <button
+                        className={`dual-pane-btn ${compareActive ? 'primary' : ''}`}
+                        onClick={handleToggleCompare}
+                        title="Compare directories"
+                    >
+                        ≠ Compare
+                    </button>
+                    {compareActive && (
+                        <button
+                            className={`dual-pane-btn ${showDiffOnly ? 'primary' : ''}`}
+                            onClick={() => setShowDiffOnly(prev => !prev)}
+                            title="Show differences only"
+                        >
+                            {showDiffOnly ? 'Show All' : 'Diff Only'}
+                        </button>
+                    )}
                 </div>
 
                 <div className="dual-pane-toolbar-group">
@@ -571,7 +700,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
 
                     <div className="dual-pane-content">
                         <FileList
-                            data={leftDirData}
+                            data={displayedLeftData}
                             isLoading={leftLoading}
                             viewMode={viewMode}
                             isActive={activePane === 'left'}
@@ -663,7 +792,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
 
                     <div className="dual-pane-content">
                         <FileList
-                            data={rightDirData}
+                            data={displayedRightData}
                             isLoading={rightLoading}
                             viewMode={viewMode}
                             isActive={activePane === 'right'}

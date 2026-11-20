@@ -4,24 +4,12 @@ import { listen } from '@tauri-apps/api/event';
 import { useHistory } from './HistoryProvider';
 import { useSettings } from './SettingsProvider';
 import { useSftp } from './SftpProvider';
-import { getDirectoryPath, getFileName, normalizePath } from '../utils/pathUtils';
+import { getDirectoryPath, getFileName, normalizePath, isPathOrDescendant } from '../utils/pathUtils';
 import { formatErrorMessage } from '../utils/formatters';
 import { showError } from '../utils/NotificationSystem';
 
 // Create file system context
 export const FileSystemContext = createContext(null);
-
-const isPathOrDescendant = (candidatePath, targetPath) => {
-    if (!candidatePath || !targetPath) return false;
-    if (candidatePath === targetPath) return true;
-    const normCandidate = normalizePath(candidatePath);
-    const normTarget = normalizePath(targetPath);
-    if (normCandidate === normTarget) return true;
-    return (
-        normCandidate.startsWith(`${normTarget}/`) ||
-        normCandidate.startsWith(`${normTarget}\\`)
-    );
-};
 
 const isSameDirectoryPath = (a, b) => {
     if (!a || !b) return false;
@@ -500,7 +488,9 @@ export default function FileSystemProvider({ children }) {
     // Move item to trash - enhanced with SFTP support and optional skipReload for batch deletes
     const moveToTrash = useCallback(async (path, options = {}) => {
         const skipReload = Boolean(options?.skipReload);
-        setIsLoading(true);
+        if (!skipReload) {
+            setIsLoading(true);
+        }
         setError(null);
 
         try {
@@ -533,7 +523,9 @@ export default function FileSystemProvider({ children }) {
             showError(`Failed to move item to trash: ${msg}`);
             return false;
         } finally {
-            setIsLoading(false);
+            if (!skipReload) {
+                setIsLoading(false);
+            }
         }
     }, [loadDirectory, isSftpPath, deleteSftpItem, currentPath]);
 

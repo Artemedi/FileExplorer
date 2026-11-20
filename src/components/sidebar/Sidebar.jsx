@@ -114,10 +114,10 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                 key: 'fileExplorerSftpConnections',
                 newValue: JSON.stringify(newConnections)
             }));
+            setIsAddSftpModalOpen(false);
         } catch (err) {
             // ignore
         }
-        setIsAddSftpModalOpen(false);
     };
 
     // Remove SFTP connection with confirmation

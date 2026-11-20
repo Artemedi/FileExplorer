@@ -1,10 +1,10 @@
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileSystem } from './FileSystemProvider';
 import { useHistory } from './HistoryProvider';
 import { useSftp } from './SftpProvider';
 import { useSettings } from './SettingsProvider';
-import { getDirectoryPath, getFileName, joinPath, normalizePath, isRootPath } from '../utils/pathUtils';
+import { getDirectoryPath, getFileName, joinPath, normalizePath, isRootPath, isPathOrDescendant } from '../utils/pathUtils';
 import { showNotification, showError, showSuccess, showConfirm } from '../utils/NotificationSystem';
 
 export const ContextMenuContext = createContext(null);
@@ -350,36 +350,55 @@ export default function ContextMenuProvider({ children }) {
         }
     }, [clipboard, currentPath, loadDirectory, isSftpPath, copySftpItem, moveSftpItem, generateUniqueDestPath]);
 
+    const isDeletingRef = useRef(false);
+
     // Delete items (batch without reloading on every item)
     const deleteItems = useCallback(async (items) => {
-        if (!items.length) return;
+        if (!items.length || isDeletingRef.current) return;
 
-        if (settings?.confirm_delete !== false) {
-            const itemNames = items.map(item => item.name).join(', ');
-            const confirmMessage = `Are you sure you want to move ${items.length === 1 ? itemNames : `${items.length} items`} to trash?`;
-
-            // Use custom confirm dialog
-            const shouldDelete = await showConfirm(confirmMessage, 'Move to Trash');
-            if (!shouldDelete) return;
-        }
-
-        setIsProcessing(true);
+        isDeletingRef.current = true;
         try {
-            let anyDeleted = false;
+            if (settings?.confirm_delete !== false) {
+                const itemNames = items.map(item => item.name).join(', ');
+                const confirmMessage = `Are you sure you want to move ${items.length === 1 ? itemNames : `${items.length} items`} to trash?`;
+
+                // Use custom confirm dialog
+                const shouldDelete = await showConfirm(confirmMessage, 'Move to Trash');
+                if (!shouldDelete) return;
+            }
+
+            // Deduplicate and drop child paths whose ancestor is already being deleted
+            const uniqueItems = [];
+            const seenPaths = new Set();
             for (const item of items) {
-                const ok = await moveToTrash(item.path, { skipReload: true });
-                if (ok) {
-                    anyDeleted = true;
+                if (!item?.path || seenPaths.has(item.path)) continue;
+                seenPaths.add(item.path);
+                uniqueItems.push(item);
+            }
+            const topLevelItems = uniqueItems.filter((item) =>
+                !uniqueItems.some((other) => other !== item && isPathOrDescendant(item.path, other.path))
+            );
+
+            setIsProcessing(true);
+            try {
+                let anyDeleted = false;
+                for (const item of topLevelItems) {
+                    const ok = await moveToTrash(item.path, { skipReload: true });
+                    if (ok) {
+                        anyDeleted = true;
+                    }
                 }
+                if (anyDeleted && currentPath) {
+                    await loadDirectory(currentPath);
+                }
+            } catch (error) {
+                console.error('Delete operation failed:', error);
+                showError(`Failed to delete: ${error.message || error}`);
+            } finally {
+                setIsProcessing(false);
             }
-            if (anyDeleted && currentPath) {
-                await loadDirectory(currentPath);
-            }
-        } catch (error) {
-            console.error('Delete operation failed:', error);
-            showError(`Failed to delete: ${error.message || error}`);
         } finally {
-            setIsProcessing(false);
+            isDeletingRef.current = false;
         }
     }, [moveToTrash, settings?.confirm_delete, currentPath, loadDirectory]);
 

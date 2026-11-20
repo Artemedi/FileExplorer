@@ -652,9 +652,9 @@ const MainLayout = () => {
                 if (parts.length > 1) {
                     parts.pop();
                     const parentRemote = parts.join('/');
-                    navigateTo(`sftp:${parsed.connectionName}:${parentRemote}`);
+                    loadDirectory(`sftp:${parsed.connectionName}:${parentRemote}`);
                 } else {
-                    navigateTo(`sftp:${parsed.connectionName}:.`);
+                    loadDirectory(`sftp:${parsed.connectionName}:.`);
                 }
             }
             return;
@@ -675,7 +675,7 @@ const MainLayout = () => {
                 if (/^[a-zA-Z]:$/.test(parent)) {
                     parent += '\\';
                 }
-                navigateTo(parent);
+                loadDirectory(parent);
             }
             return;
         }
@@ -685,9 +685,9 @@ const MainLayout = () => {
         if (parts.length > 0) {
             parts.pop();
             const parent = '/' + parts.join('/');
-            navigateTo(parent);
+            loadDirectory(parent);
         }
-    }, [isSftpPath, parseSftpPath, navigateTo]);
+    }, [isSftpPath, parseSftpPath, loadDirectory]);
 
     /**
      * Effect to handle keyboard shortcuts
@@ -711,9 +711,12 @@ const MainLayout = () => {
          * Keyboard event handler for shortcuts
          * @param {KeyboardEvent} e - The keyboard event
          */
+        const matchesKey = (e, code, lowerChar) =>
+            e.code === code || (typeof e.key === 'string' && e.key.toLowerCase() === lowerChar);
+
         const handleKeyDown = (e) => {
             // Global search: Ctrl+Shift+F
-            if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+            if ((e.ctrlKey || e.metaKey) && e.shiftKey && matchesKey(e, 'KeyF', 'f')) {
                 e.preventDefault();
                 setIsGlobalSearchOpen(true);
                 return;
@@ -745,14 +748,14 @@ const MainLayout = () => {
             }
 
             // New folder: Ctrl+Shift+N
-            if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'N' || e.key === 'n')) {
+            if ((e.ctrlKey || e.metaKey) && e.shiftKey && matchesKey(e, 'KeyN', 'n')) {
                 e.preventDefault();
                 document.dispatchEvent(new CustomEvent('create-folder'));
                 return;
             }
 
             // New file: Ctrl+N
-            if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'n' || e.key === 'N')) {
+            if ((e.ctrlKey || e.metaKey) && !e.shiftKey && matchesKey(e, 'KeyN', 'n')) {
                 e.preventDefault();
                 document.dispatchEvent(new CustomEvent('create-file'));
                 return;
@@ -812,7 +815,7 @@ const MainLayout = () => {
             }
 
             // Select all: Ctrl+A (respect non-empty text selection)
-            if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+            if ((e.ctrlKey || e.metaKey) && matchesKey(e, 'KeyA', 'a')) {
                 const selectedText = window.getSelection?.()?.toString();
                 if (selectedText && selectedText.length > 0) {
                     return;
@@ -826,7 +829,7 @@ const MainLayout = () => {
             }
 
             // Copy: Ctrl+C (respect non-empty text selection)
-            if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
+            if ((e.ctrlKey || e.metaKey) && matchesKey(e, 'KeyC', 'c')) {
                 const selectedText = window.getSelection?.()?.toString();
                 if (selectedText && selectedText.length > 0) {
                     return;
@@ -842,7 +845,7 @@ const MainLayout = () => {
             }
 
             // Cut: Ctrl+X
-            if ((e.ctrlKey || e.metaKey) && (e.key === 'x' || e.key === 'X')) {
+            if ((e.ctrlKey || e.metaKey) && matchesKey(e, 'KeyX', 'x')) {
                 const targetItems = selectedItemsRef.current.length > 0
                     ? selectedItemsRef.current
                     : (focusedItemRef.current ? [focusedItemRef.current] : []);
@@ -854,7 +857,7 @@ const MainLayout = () => {
             }
 
             // Paste: Ctrl+V
-            if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V')) {
+            if ((e.ctrlKey || e.metaKey) && matchesKey(e, 'KeyV', 'v')) {
                 if (clipboardRef.current?.items?.length > 0) {
                     e.preventDefault();
                     pasteFromClipboard();
@@ -863,7 +866,7 @@ const MainLayout = () => {
             }
 
             // Refresh: F5 or Ctrl+R
-            if (e.key === 'F5' || ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R'))) {
+            if (e.key === 'F5' || ((e.ctrlKey || e.metaKey) && matchesKey(e, 'KeyR', 'r'))) {
                 e.preventDefault();
                 if (currentPathRef.current) {
                     loadDirectory(currentPathRef.current);

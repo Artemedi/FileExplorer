@@ -120,6 +120,9 @@ export const showInfo = (message, duration) => showNotification(message, 'info',
 export const showConfirm = (message, title = 'Confirm') => {
     return new Promise((resolve) => {
         const modal = document.createElement('div');
+        modal.className = 'confirm-dialog-overlay';
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
         modal.style.cssText = `
             position: fixed;
             top: 0;
@@ -194,8 +197,16 @@ export const showConfirm = (message, title = 'Confirm') => {
             if (e.key === 'Escape') {
                 e.preventDefault();
                 e.stopPropagation();
+                e.stopImmediatePropagation?.();
                 cleanup();
                 resolve(false);
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation?.();
+                const shouldConfirm = document.activeElement !== cancelBtn;
+                cleanup();
+                resolve(shouldConfirm);
             }
         };
 

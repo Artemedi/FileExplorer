@@ -379,6 +379,11 @@ const FileList = ({
             setIsShiftKeyPressed(e.shiftKey);
             setIsCtrlKeyPressed(e.ctrlKey || e.metaKey);
 
+            // Do not intercept keys while a modal/confirm dialog/preview is open
+            if (document.querySelector('[role="dialog"], .modal-overlay, .preview-modal-backdrop')) {
+                return;
+            }
+
             // Don't handle arrow keys if user is typing in an input or textarea
             if (e.target instanceof HTMLInputElement || 
                 e.target instanceof HTMLTextAreaElement || 

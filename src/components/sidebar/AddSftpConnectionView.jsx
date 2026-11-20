@@ -67,8 +67,8 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 		const trimmedUsername = username.trim();
 		const portNum = parseValidPort(port);
 
-		if (!trimmedName || !trimmedHost || !trimmedUsername) {
-			setError('Name, host, and username are required');
+		if (!trimmedName || !trimmedHost) {
+			setError('Name and host are required');
 			return;
 		}
 		if (trimmedName.includes(':')) {
@@ -97,8 +97,10 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 		setSaving(true);
 		setError(null);
 		try {
-			const connectionKey = `${trimmedUsername}@${trimmedHost}:${portNum}`;
-			await invoke('store_sftp_credentials', { connectionKey, password });
+			if (password.length > 0) {
+				const connectionKey = `${trimmedUsername}@${trimmedHost}:${portNum}`;
+				await invoke('store_sftp_credentials', { connectionKey, password });
+			}
 
 			onAdd({
 				name: trimmedName,
@@ -143,14 +145,14 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 					<Button
 						variant="secondary"
 						onClick={handleTestConnection}
-						disabled={testing || !host.trim() || !port.trim() || !username.trim()}
+						disabled={testing || !host.trim() || !String(port).trim()}
 					>
 						{testing ? 'Testing...' : 'Test Connection'}
 					</Button>
 					<Button
 						variant="primary"
 						onClick={handleAdd}
-						disabled={saving || !name.trim() || !host.trim() || !String(port).trim() || !username.trim()}
+						disabled={saving || !name.trim() || !host.trim() || !String(port).trim()}
 					>
 						{saving ? 'Adding...' : 'Add'}
 					</Button>
@@ -201,7 +203,7 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 						className="input"
 						value={username}
 						onChange={e => setUsername(e.target.value)}
-						placeholder="Username"
+						placeholder="Username (leave blank for guest)"
 					/>
 				</div>
 				<div className="form-group">

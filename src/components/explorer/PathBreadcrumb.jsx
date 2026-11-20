@@ -49,11 +49,14 @@ const PathBreadcrumb = ({ onCopyPath, isVisible = true, onSearch }) => {
         if (isSftpPath(currentPath)) {
             const parsed = parseSftpPath(currentPath);
             if (parsed && parsed.connection) {
+                const userPrefix = parsed.connection.username
+                    ? `${parsed.connection.username}@`
+                    : '';
                 // Add connection as root segment
                 segments.push({
-                    name: `${parsed.connection.username}@${parsed.connection.host}`,
+                    name: `${userPrefix}${parsed.connection.host}`,
                     path: `sftp:${parsed.connectionName}:.`,
-                    displayPath: `sftp://${parsed.connection.username}@${parsed.connection.host}/`,
+                    displayPath: `sftp://${userPrefix}${parsed.connection.host}/`,
                 });
 
                 // Parse the remote path and add segments
@@ -66,7 +69,7 @@ const PathBreadcrumb = ({ onCopyPath, isVisible = true, onSearch }) => {
                         segments.push({
                             name: pathParts[i],
                             path: `sftp:${parsed.connectionName}:${buildPath}`,
-                            displayPath: `sftp://${parsed.connection.username}@${parsed.connection.host}/${buildPath}`,
+                            displayPath: `sftp://${userPrefix}${parsed.connection.host}/${buildPath}`,
                         });
                     }
                 }

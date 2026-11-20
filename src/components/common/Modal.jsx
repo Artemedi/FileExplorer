@@ -35,6 +35,9 @@ const Modal = ({
                    ...rest
                }) => {
     const modalRef = useRef(null);
+    const mouseDownInsideRef = useRef(false);
+    const onCloseRef = useRef(onClose);
+    onCloseRef.current = onClose;
     const modalId = useId();
     const titleId = useId();
 
@@ -52,7 +55,7 @@ const Modal = ({
                 modalStack[modalStack.length - 1] === modalId
             ) {
                 event.stopPropagation();
-                onClose();
+                onCloseRef.current?.();
             }
         };
 
@@ -68,7 +71,7 @@ const Modal = ({
                 document.body.style.overflow = '';
             }
         };
-    }, [isOpen, onClose, closeOnEsc, modalId]);
+    }, [isOpen, closeOnEsc, modalId]);
 
     // Focus the modal when it opens
     useEffect(() => {
@@ -88,17 +91,27 @@ const Modal = ({
         }
     }, [isOpen]);
 
+    const handleOverlayMouseDown = (event) => {
+        mouseDownInsideRef.current = Boolean(
+            modalRef.current && modalRef.current.contains(event.target)
+        );
+    };
+
     /**
      * Handle clicks on the modal overlay
      * @param {React.MouseEvent} event - Mouse-Event
      */
     const handleOverlayClick = (event) => {
+        if (mouseDownInsideRef.current) {
+            mouseDownInsideRef.current = false;
+            return;
+        }
         if (
             closeOnOverlayClick &&
             modalRef.current &&
             !modalRef.current.contains(event.target)
         ) {
-            onClose();
+            onCloseRef.current?.();
         }
     };
 
@@ -114,7 +127,11 @@ const Modal = ({
 
     // Create portal to render modal at the body level
     return ReactDOM.createPortal(
-        <div className="modal-overlay" onClick={handleOverlayClick}>
+        <div
+            className="modal-overlay"
+            onMouseDown={handleOverlayMouseDown}
+            onClick={handleOverlayClick}
+        >
             <div
                 className={modalClasses}
                 ref={modalRef}

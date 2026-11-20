@@ -435,10 +435,24 @@ fn connect_to_sftp_via_password(
     username: String,
     password: String,
 ) -> Result<Sftp, String> {
-    let secret_password = resolve_sftp_password(&host, port, &username, password)?;
+    let trimmed_user = username.trim();
+    let is_guest_user = trimmed_user.is_empty()
+        || trimmed_user.eq_ignore_ascii_case("anonymous")
+        || trimmed_user.eq_ignore_ascii_case("guest");
+
+    let secret_password = if trimmed_user.is_empty() {
+        ZeroizingString::new(password)
+    } else {
+        match resolve_sftp_password(&host, port, trimmed_user, password) {
+            Ok(secret) => secret,
+            Err(_) if is_guest_user => ZeroizingString::new(String::new()),
+            Err(e) => return Err(e),
+        }
+    };
+
     let (session, live_fingerprint) = connect_ssh_session(&host, port)?;
 
-    // Verify SSH host key BEFORE sending password to prevent MITM credential interception
+    // Verify SSH host key BEFORE sending credentials to prevent MITM credential interception
     let known_contents = load_known_hosts_contents();
     match verify_host_key_against_contents(&host, port, &live_fingerprint, &known_contents) {
         HostKeyVerification::Trusted => {}
@@ -452,9 +466,40 @@ fn connect_to_sftp_via_password(
         }
     }
 
-    session
-        .userauth_password(&username, secret_password.as_str())
-        .map_err(|e| e.to_string())?;
+    if trimmed_user.is_empty() {
+        for guest_user in ["anonymous", "guest"] {
+            let _ = session.auth_methods(guest_user);
+            if session.authenticated() {
+                break;
+            }
+            if session
+                .userauth_password(guest_user, secret_password.as_str())
+                .is_ok()
+                && session.authenticated()
+            {
+                break;
+            }
+            if secret_password.is_empty()
+                && session.userauth_agent(guest_user).is_ok()
+                && session.authenticated()
+            {
+                break;
+            }
+        }
+    } else {
+        if is_guest_user && secret_password.is_empty() {
+            let _ = session.auth_methods(trimmed_user);
+        }
+        if !session.authenticated() {
+            let auth_res = session.userauth_password(trimmed_user, secret_password.as_str());
+            if !session.authenticated() && secret_password.is_empty() {
+                let _ = session.userauth_agent(trimmed_user);
+            }
+            if !session.authenticated() {
+                auth_res.map_err(|e| e.to_string())?;
+            }
+        }
+    }
 
     if !session.authenticated() {
         return Err("Authentication failed".to_string());

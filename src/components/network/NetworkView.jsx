@@ -64,10 +64,10 @@ const NetworkView = () => {
                 newValue: JSON.stringify(newConnections)
             }));
             showSuccess(`SFTP connection "${safeConn.name}" added successfully`);
+            setIsAddSftpModalOpen(false);
         } catch (err) {
             showError('Failed to add SFTP connection');
         }
-        setIsAddSftpModalOpen(false);
     };
 
     // Remove SFTP connection
