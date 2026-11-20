@@ -1,5 +1,4 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useHistory } from '../../providers/HistoryProvider';
@@ -1574,7 +1573,7 @@ const Terminal = ({ isOpen, onToggle }) => {
         }
     };
 
-    const terminalElement = (
+    return (
         <div
             className={`enhanced-terminal${isFullscreen ? ' terminal-fullscreen' : ''}`}
             style={isFullscreen ? undefined : { height: `${terminalHeight}px` }}
@@ -1683,6 +1682,27 @@ const Terminal = ({ isOpen, onToggle }) => {
                     )}
                     {activeSshConnection && (
                         <button
+                            type="button"
+                            className="terminal-control"
+                            onClick={() => {
+                                invoke('open_external_ssh_terminal', {
+                                    host: activeSshConnection.host,
+                                    port: Number(activeSshConnection.port || 22),
+                                    username: activeSshConnection.username || '',
+                                }).catch((e) => {
+                                    setCommandHistory(prev => [
+                                        ...prev,
+                                        { type: 'error', content: `Failed to open external SSH terminal: ${e}`, timestamp: new Date().toLocaleTimeString() },
+                                    ]);
+                                });
+                            }}
+                            title="Open in native OS terminal (best for mc / btop / htop)"
+                        >
+                            Ext SSH
+                        </button>
+                    )}
+                    {activeSshConnection && (
+                        <button
                             className="terminal-control"
                             onClick={() => setActiveTabId('local')}
                             title="Switch to Local terminal tab"
@@ -1701,7 +1721,13 @@ const Terminal = ({ isOpen, onToggle }) => {
                     <button
                         type="button"
                         className="terminal-control"
-                        onClick={() => setIsFullscreen((prev) => !prev)}
+                        onClick={() => {
+                            setIsFullscreen((prev) => {
+                                const next = !prev;
+                                window.dispatchEvent(new CustomEvent('terminal-fullscreen-change', { detail: { isFullscreen: next } }));
+                                return next;
+                            });
+                        }}
                         title={isFullscreen ? 'Restore terminal size' : 'Expand terminal to fullscreen'}
                     >
                         {isFullscreen ? 'Restore' : '⛶'}
@@ -1840,11 +1866,6 @@ const Terminal = ({ isOpen, onToggle }) => {
             )}
         </div>
     );
-
-    if (isFullscreen && typeof document !== 'undefined') {
-        return createPortal(terminalElement, document.body);
-    }
-    return terminalElement;
 };
 
 export default Terminal;

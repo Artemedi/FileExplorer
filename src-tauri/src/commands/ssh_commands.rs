@@ -384,6 +384,7 @@ pub async fn ssh_start_pty(
         let _ = ready_tx.send(Ok(()));
 
         let mut buf = [0u8; 4096];
+        let mut pending_utf8: Vec<u8> = Vec::new();
         let mut exit_reason = "closed".to_string();
 
         loop {
@@ -411,14 +412,17 @@ pub async fn ssh_start_pty(
             match channel.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    let _ = app.emit(
-                        "ssh-pty-output",
-                        SshPtyOutputPayload {
-                            session_id: sid_clone.clone(),
-                            data: text,
-                        },
-                    );
+                    pending_utf8.extend_from_slice(&buf[..n]);
+                    let text = drain_valid_utf8(&mut pending_utf8);
+                    if !text.is_empty() {
+                        let _ = app.emit(
+                            "ssh-pty-output",
+                            SshPtyOutputPayload {
+                                session_id: sid_clone.clone(),
+                                data: text,
+                            },
+                        );
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(15));
@@ -493,6 +497,101 @@ pub fn ssh_close_pty(session_id: String) -> Result<(), String> {
         let _ = sender.send(PtyControl::Close);
     }
     Ok(())
+}
+
+fn drain_valid_utf8(pending: &mut Vec<u8>) -> String {
+    match std::str::from_utf8(pending) {
+        Ok(valid) => {
+            let out = valid.to_string();
+            pending.clear();
+            out
+        }
+        Err(err) => {
+            let valid_up_to = err.valid_up_to();
+            if err.error_len().is_none() {
+                // Incomplete multi-byte UTF-8 sequence at the end of the chunk; keep it for next read.
+                let out = std::str::from_utf8(&pending[..valid_up_to])
+                    .unwrap_or("")
+                    .to_string();
+                pending.drain(..valid_up_to);
+                out
+            } else {
+                let out = String::from_utf8_lossy(pending).into_owned();
+                pending.clear();
+                out
+            }
+        }
+    }
+}
+
+/// Opens the native OS terminal emulator (Windows Terminal / cmd / xterm) connected via `ssh`.
+#[tauri::command]
+pub fn open_external_ssh_terminal(host: String, port: u16, username: String) -> Result<(), String> {
+    let trimmed_host = host.trim();
+    let trimmed_user = username.trim();
+    if trimmed_host.is_empty()
+        || trimmed_host
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '&' | '|' | ';' | '$' | '`' | '"' | '\''))
+    {
+        return Err("Invalid SSH host for external terminal.".to_string());
+    }
+    if trimmed_user
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '&' | '|' | ';' | '$' | '`' | '"' | '\''))
+    {
+        return Err("Invalid SSH username for external terminal.".to_string());
+    }
+    let target = if trimmed_user.is_empty() {
+        trimmed_host.to_string()
+    } else {
+        format!("{trimmed_user}@{trimmed_host}")
+    };
+    let port_str = port.to_string();
+
+    #[cfg(target_os = "windows")]
+    {
+        if std::process::Command::new("wt.exe")
+            .args(["ssh", &target, "-p", &port_str])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        std::process::Command::new("cmd.exe")
+            .args(["/c", "start", "ssh", &target, "-p", &port_str])
+            .spawn()
+            .map_err(|e| format!("Failed to launch external SSH terminal: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let candidates = [
+            (
+                "x-terminal-emulator",
+                vec!["-e", "ssh", &target, "-p", &port_str],
+            ),
+            (
+                "gnome-terminal",
+                vec!["--", "ssh", &target, "-p", &port_str],
+            ),
+            ("konsole", vec!["-e", "ssh", &target, "-p", &port_str]),
+            ("xterm", vec!["-e", "ssh", &target, "-p", &port_str]),
+        ];
+        for (bin, args) in candidates {
+            if std::process::Command::new(bin).args(&args).spawn().is_ok() {
+                return Ok(());
+            }
+        }
+        Err("No supported terminal emulator found (tried x-terminal-emulator, gnome-terminal, konsole, xterm).".to_string())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = (target, port_str);
+        Err("External SSH terminal launch is only supported on Windows and Linux.".to_string())
+    }
 }
 
 #[cfg(test)]

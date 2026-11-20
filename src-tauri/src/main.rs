@@ -115,6 +115,7 @@ fn all_commands() -> fn(Invoke) -> bool {
         ssh_commands::ssh_write_pty,
         ssh_commands::ssh_resize_pty,
         ssh_commands::ssh_close_pty,
+        ssh_commands::open_external_ssh_terminal,
         // Permission commands
         permission_commands::request_full_disk_access,
         permission_commands::check_directory_access,

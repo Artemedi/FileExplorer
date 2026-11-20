@@ -80,6 +80,7 @@ const MainLayout = () => {
         return localStorage.getItem('explr_dual_pane') === 'true';
     });
     const [isTerminalOpen, setIsTerminalOpen] = useState(false);
+    const [isTerminalFullscreen, setIsTerminalFullscreen] = useState(false);
     const [viewMode, setViewMode] = useState(settings.default_view || 'grid');
     const [searchValue, setSearchValue] = useState('');
     const [searchResults, setSearchResults] = useState(null);
@@ -911,7 +912,9 @@ const MainLayout = () => {
 
         document.addEventListener('keydown', handleKeyDown);
         const handleOpenSshTerminal = () => setIsTerminalOpen(true);
+        const handleTerminalFullscreen = (e) => setIsTerminalFullscreen(Boolean(e?.detail?.isFullscreen));
         window.addEventListener('open-ssh-terminal', handleOpenSshTerminal);
+        window.addEventListener('terminal-fullscreen-change', handleTerminalFullscreen);
 
         // Suppress the native WebView context menu ("Save as...", "Print...", etc.) everywhere
         // except editable fields, where Copy/Paste are still useful. App-specific menus are
@@ -930,6 +933,7 @@ const MainLayout = () => {
         return () => {
             document.removeEventListener('keydown', handleKeyDown);
             window.removeEventListener('open-ssh-terminal', handleOpenSshTerminal);
+            window.removeEventListener('terminal-fullscreen-change', handleTerminalFullscreen);
             document.removeEventListener('contextmenu', suppressNativeContextMenu);
         };
     }, [handleGoUp, getSortedData, selectMultiple, clearSelection, copyToClipboard, cutToClipboard, pasteFromClipboard, deleteItems, loadDirectory, loadVolumes, goBack, goForward]);
@@ -1332,12 +1336,20 @@ const MainLayout = () => {
                         {/* Terminal positioned absolutely at the bottom */}
                         <div 
                             className="terminal-wrapper"
-                            style={{
+                            style={isTerminalOpen && isTerminalFullscreen ? {
+                                position: 'fixed',
+                                inset: 0,
+                                height: '100vh',
+                                width: '100vw',
+                                zIndex: 9999,
+                                overflow: 'hidden'
+                            } : {
                                 position: isTerminalOpen ? 'absolute' : 'static',
                                 bottom: isTerminalOpen ? 0 : 'auto',
                                 left: isTerminalOpen ? 0 : 'auto',
                                 right: isTerminalOpen ? 0 : 'auto',
                                 height: isTerminalOpen ? `${terminalHeight}px` : 0,
+                                zIndex: isTerminalOpen ? 30 : 'auto',
                                 overflow: isTerminalOpen ? 'visible' : 'hidden'
                             }}
                         >
