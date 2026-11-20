@@ -25,6 +25,7 @@ import { useTranslation } from '../i18n';
 import CreateFileButton from '../components/explorer/CreateFileButton';
 import RenameModal from '../components/common/RenameModal';
 import Terminal from '../components/terminal/Terminal';
+import ConflictResolutionModal from '../components/common/ConflictResolutionModal';
 import TabManager from '../components/tabs/TabManager';
 import GlobalSearch from '../components/search/GlobalSearch';
 import SettingsPanel from '../components/settings/SettingsPanel';
@@ -1431,6 +1432,8 @@ const MainLayout = () => {
                     isLoading={isPreviewLoading}
                 />
             )}
+
+            <ConflictResolutionModal />
         </div>
     );
 };

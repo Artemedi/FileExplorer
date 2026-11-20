@@ -6,6 +6,7 @@ import { useSftp } from './SftpProvider';
 import { useSettings } from './SettingsProvider';
 import { getDirectoryPath, getFileName, joinPath, normalizePath, isRootPath, isPathOrDescendant } from '../utils/pathUtils';
 import { showNotification, showError, showSuccess, showConfirm } from '../utils/NotificationSystem';
+import { requestConflictResolution } from '../utils/conflictResolver';
 
 export const ContextMenuContext = createContext(null);
 
@@ -309,8 +310,48 @@ export default function ContextMenuProvider({ children }) {
                         }
                     }
                 } else {
-                    // Copy operation - generate unique destination path to allow duplicates
-                    const destPath = await generateUniqueDestPath(destRoot, fileName);
+                    // Copy operation - check if destination already exists and ask how to resolve
+                    let destPath = joinPath(destRoot, fileName);
+                    const isSameLoc = !sourceIsSftp && !destIsSftp
+                        && normalizePath(sourcePath).toLowerCase() === normalizePath(destPath).toLowerCase();
+                    let targetExists = isSameLoc;
+                    if (!targetExists && !destIsSftp) {
+                        try {
+                            const dirJson = await invoke('open_directory', { path: destRoot });
+                            const dirData = JSON.parse(dirJson);
+                            const allEntries = [...(dirData.directories || []), ...(dirData.files || [])];
+                            targetExists = allEntries.some(
+                                (entry) => entry.name.toLowerCase() === fileName.toLowerCase()
+                            );
+                        } catch {
+                            targetExists = false;
+                        }
+                    }
+
+                    if (targetExists) {
+                        const resolution = await requestConflictResolution({
+                            itemName: fileName,
+                            sourcePath,
+                            destPath,
+                            isSameLocation: isSameLoc,
+                        });
+                        if (resolution.action === 'skip') {
+                            continue;
+                        }
+                        if (resolution.action === 'replace') {
+                            await invoke('move_to_trash', { path: destPath }).catch(() => {});
+                        } else if (resolution.action === 'rename_new') {
+                            const chosen = (resolution.customName || '').trim();
+                            destPath = chosen ? joinPath(destRoot, chosen) : await generateUniqueDestPath(destRoot, fileName);
+                        } else if (resolution.action === 'rename_original') {
+                            const origNewName = (resolution.customName || '').trim();
+                            if (!origNewName) continue;
+                            await invoke('rename', {
+                                oldPath: destPath,
+                                newPath: joinPath(destRoot, origNewName),
+                            });
+                        }
+                    }
 
                     if (sourceIsSftp || destIsSftp) {
                         if (sourceIsSftp && destIsSftp) {

@@ -7,6 +7,7 @@ import { useSftp } from '../../providers/SftpProvider';
 import { useTranslation } from '../../i18n';
 import { getDirectoryPath, isRootPath, joinPath, normalizePath } from '../../utils/pathUtils';
 import { showSuccess, showError, showConfirm, showInfo } from '../../utils/NotificationSystem';
+import { requestConflictResolution } from '../../utils/conflictResolver';
 import FileList from './FileList';
 import './dualPane.css';
 
@@ -18,58 +19,68 @@ const isSameNormalizedPath = (pathA, pathB, isSftp) => {
 };
 
 /**
- * Compares two directory listings by entry name and file size.
- * @returns {{ leftDiffPaths: Set<string>, rightDiffPaths: Set<string>, leftOnlyCount: number, rightOnlyCount: number, modifiedCount: number }}
+ * Compares two directory listings by entry name (case-insensitive on local filesystems),
+ * file size, and last_modified timestamp.
  */
-const computeDirectoryDiff = (leftData, rightData) => {
+const computeDirectoryDiff = (leftData, rightData, caseInsensitive = true) => {
     const leftDiffPaths = new Set();
     const rightDiffPaths = new Set();
     let leftOnlyCount = 0;
     let rightOnlyCount = 0;
     let modifiedCount = 0;
+    let identicalCount = 0;
 
     if (!leftData || !rightData) {
-        return { leftDiffPaths, rightDiffPaths, leftOnlyCount, rightOnlyCount, modifiedCount };
+        return { leftDiffPaths, rightDiffPaths, leftOnlyCount, rightOnlyCount, modifiedCount, identicalCount };
     }
 
-    const leftDirs = new Map((leftData.directories || []).map(d => [d.name, d]));
-    const rightDirs = new Map((rightData.directories || []).map(d => [d.name, d]));
+    const keyOf = (name) => (caseInsensitive ? String(name || '').toLowerCase() : String(name || ''));
 
-    for (const [name, dir] of leftDirs) {
-        if (!rightDirs.has(name)) {
+    const leftDirs = new Map((leftData.directories || []).map(d => [keyOf(d.name), d]));
+    const rightDirs = new Map((rightData.directories || []).map(d => [keyOf(d.name), d]));
+
+    for (const [key, dir] of leftDirs) {
+        if (!rightDirs.has(key)) {
             leftDiffPaths.add(dir.path);
             leftOnlyCount++;
+        } else {
+            identicalCount++;
         }
     }
-    for (const [name, dir] of rightDirs) {
-        if (!leftDirs.has(name)) {
+    for (const [key, dir] of rightDirs) {
+        if (!leftDirs.has(key)) {
             rightDiffPaths.add(dir.path);
             rightOnlyCount++;
         }
     }
 
-    const leftFiles = new Map((leftData.files || []).map(f => [f.name, f]));
-    const rightFiles = new Map((rightData.files || []).map(f => [f.name, f]));
+    const leftFiles = new Map((leftData.files || []).map(f => [keyOf(f.name), f]));
+    const rightFiles = new Map((rightData.files || []).map(f => [keyOf(f.name), f]));
 
-    for (const [name, file] of leftFiles) {
-        const match = rightFiles.get(name);
+    for (const [key, file] of leftFiles) {
+        const match = rightFiles.get(key);
         if (!match) {
             leftDiffPaths.add(file.path);
             leftOnlyCount++;
-        } else if (file.size_in_bytes !== match.size_in_bytes) {
+        } else if (
+            file.size_in_bytes !== match.size_in_bytes ||
+            (file.last_modified && match.last_modified && file.last_modified !== match.last_modified)
+        ) {
             leftDiffPaths.add(file.path);
             rightDiffPaths.add(match.path);
             modifiedCount++;
+        } else {
+            identicalCount++;
         }
     }
-    for (const [name, file] of rightFiles) {
-        if (!leftFiles.has(name)) {
+    for (const [key, file] of rightFiles) {
+        if (!leftFiles.has(key)) {
             rightDiffPaths.add(file.path);
             rightOnlyCount++;
         }
     }
 
-    return { leftDiffPaths, rightDiffPaths, leftOnlyCount, rightOnlyCount, modifiedCount };
+    return { leftDiffPaths, rightDiffPaths, leftOnlyCount, rightOnlyCount, modifiedCount, identicalCount };
 };
 
 /**
@@ -312,6 +323,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
         const isLeft = activePane === 'left';
         const sourceItems = isLeft ? leftSelected : rightSelected;
         const targetDir = isLeft ? rightPath : leftPath;
+        const targetData = isLeft ? rightDirData : leftDirData;
         const targetPane = isLeft ? 'right' : 'left';
 
         if (!sourceItems || sourceItems.length === 0) {
@@ -319,15 +331,48 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
             return;
         }
 
+        const existingTargetNames = new Set([
+            ...(targetData?.directories || []).map(d => d.name.toLowerCase()),
+            ...(targetData?.files || []).map(f => f.name.toLowerCase()),
+        ]);
+
         let copied = 0;
 
         for (const item of sourceItems) {
             try {
-                const dest = joinPath(targetDir, item.name);
+                let dest = joinPath(targetDir, item.name);
                 const isSftp = isSftpPath(item.path) || isSftpPath(dest);
-                if (isSameNormalizedPath(item.path, dest, isSftp)) {
+                const isSameLoc = isSameNormalizedPath(item.path, dest, isSftp);
+                const existsInTarget = isSameLoc || existingTargetNames.has(item.name.toLowerCase());
+
+                if (existsInTarget && !isSftp) {
+                    const resolution = await requestConflictResolution({
+                        itemName: item.name,
+                        sourcePath: item.path,
+                        destPath: dest,
+                        isSameLocation: isSameLoc,
+                    });
+                    if (resolution.action === 'skip') {
+                        continue;
+                    }
+                    if (resolution.action === 'replace') {
+                        await invoke('move_to_trash', { path: dest }).catch(() => {});
+                    } else if (resolution.action === 'rename_new') {
+                        const custom = (resolution.customName || '').trim();
+                        if (!custom) continue;
+                        dest = joinPath(targetDir, custom);
+                    } else if (resolution.action === 'rename_original') {
+                        const origNew = (resolution.customName || '').trim();
+                        if (!origNew) continue;
+                        await invoke('rename', {
+                            oldPath: dest,
+                            newPath: joinPath(targetDir, origNew),
+                        });
+                    }
+                } else if (isSameLoc) {
                     continue;
                 }
+
                 await invoke('copy_file_or_dir', {
                     sourcePath: item.path,
                     destinationPath: dest
@@ -515,9 +560,10 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
         });
     };
 
+    const isSftpCompare = isSftpPath(leftPath) || isSftpPath(rightPath);
     const diffResult = useMemo(
-        () => (compareActive ? computeDirectoryDiff(leftDirData, rightDirData) : null),
-        [compareActive, leftDirData, rightDirData]
+        () => (compareActive ? computeDirectoryDiff(leftDirData, rightDirData, !isSftpCompare) : null),
+        [compareActive, leftDirData, rightDirData, isSftpCompare]
     );
 
     const displayedLeftData = useMemo(() => {
@@ -544,8 +590,10 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
             setShowDiffOnly(false);
             return;
         }
-        const diff = computeDirectoryDiff(leftDirData, rightDirData);
+        const diff = computeDirectoryDiff(leftDirData, rightDirData, !(isSftpPath(leftPath) || isSftpPath(rightPath)));
         setCompareActive(true);
+        const totalDiffs = diff.leftOnlyCount + diff.rightOnlyCount + diff.modifiedCount;
+        setShowDiffOnly(totalDiffs > 0);
 
         if (leftDirData) {
             const leftDiffItems = [
@@ -562,13 +610,12 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
             setRightSelected(rightDiffItems);
         }
 
-        const totalDiffs = diff.leftOnlyCount + diff.rightOnlyCount + diff.modifiedCount;
         if (totalDiffs === 0) {
-            showSuccess('Directories match');
+            showSuccess(`Directories match (${diff.identicalCount} identical)`);
         } else {
-            showInfo(`Compare: ${diff.leftOnlyCount} left only, ${diff.rightOnlyCount} right only, ${diff.modifiedCount} modified`);
+            showInfo(`Compare: ${diff.leftOnlyCount} left only, ${diff.rightOnlyCount} right only, ${diff.modifiedCount} modified, ${diff.identicalCount} identical`);
         }
-    }, [compareActive, leftDirData, rightDirData]);
+    }, [compareActive, leftDirData, rightDirData, leftPath, rightPath, isSftpPath]);
 
     const leftItemCount = (displayedLeftData?.directories?.length || 0) + (displayedLeftData?.files?.length || 0);
     const rightItemCount = (displayedRightData?.directories?.length || 0) + (displayedRightData?.files?.length || 0);
