@@ -160,6 +160,7 @@ const NetworkView = () => {
         setNetworkShares(nextShares);
         try {
             localStorage.setItem(NETWORK_SHARES_STORAGE_KEY, JSON.stringify(nextShares));
+            window.dispatchEvent(new CustomEvent('network-shares-updated'));
         } catch {
             // ignore storage quota errors
         }
@@ -301,7 +302,7 @@ const NetworkView = () => {
                                             <span>{health.label}</span>
                                         </span>
                                     </h4>
-                                    <p className="connection-address">
+                                    <p className="connection-address" title={`${share.path}${share.username ? ` · ${share.username}` : ''}`}>
                                         {share.path}
                                         {share.username ? ` · ${share.username}` : ''}
                                     </p>
@@ -379,7 +380,7 @@ const NetworkView = () => {
                                             <span>{health.label}</span>
                                         </span>
                                     </h4>
-                                    <p className="connection-address">
+                                    <p className="connection-address" title={`${connection.username || 'guest'}@${connection.host}:${connection.port}`}>
                                         {connection.username || 'guest'}@{connection.host}:{connection.port}
                                         {connection.authType ? ` · ${connection.authType}` : ''}
                                     </p>

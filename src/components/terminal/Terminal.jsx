@@ -83,6 +83,25 @@ const escapeHtml = (str) => String(str ?? '')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
+const stripAnsiCodes = (str) => String(str ?? '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\r/g, '');
+
+const buildWelcomeEntry = (label, dir) => ({
+    type: 'system',
+    content: `File Explorer Terminal v2.0 (${label})
+Current directory: ${dir || '/'}
+
+Type 'help' to see available commands.
+Command history is persistent across sessions.
+Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
+    timestamp: new Date().toLocaleTimeString(),
+});
+
+const getSshTabId = (conn) =>
+    `ssh:${conn.username || 'guest'}@${conn.host}:${conn.port || 22}`;
+
 const parsePrompt = (promptStr = '') => {
     const atIdx = promptStr.indexOf('@');
     const colonIdx = promptStr.indexOf(':', atIdx + 1);
@@ -152,7 +171,58 @@ const resolveTerminalCdPath = (targetPath, basePath) => {
  * @returns {React.ReactElement} Terminal component
  */
 const Terminal = ({ isOpen, onToggle }) => {
-    const [commandHistory, setCommandHistory] = useState([]);
+    const { currentPath, navigateTo } = useHistory();
+    const { settings } = useSettings();
+    const { isSftpPath, parseSftpPath, executeSshCommand, startSshPty } = useSftp();
+    const parsedSftp = isSftpPath(currentPath) ? parseSftpPath(currentPath) : null;
+
+    const [terminalTabs, setTerminalTabs] = useState(() => ([
+        {
+            id: 'local',
+            label: 'Local',
+            history: [buildWelcomeEntry('Local', currentPath || '/')],
+            sshConnection: null,
+            sshWorkingDir: '.',
+            ptySessionId: null,
+        },
+    ]));
+    const [activeTabId, setActiveTabId] = useState('local');
+    const activeTabIdRef = useRef(activeTabId);
+    activeTabIdRef.current = activeTabId;
+    const terminalTabsRef = useRef(terminalTabs);
+    terminalTabsRef.current = terminalTabs;
+
+    const activeTab = terminalTabs.find((t) => t.id === activeTabId) || terminalTabs[0];
+    const commandHistory = activeTab?.history || [];
+    const activeSshConnection = activeTab?.sshConnection || null;
+    const sshWorkingDir = activeTab?.sshWorkingDir || '.';
+    const ptySessionId = activeTab?.ptySessionId || null;
+
+    const updateTab = (tabId, updater) => {
+        setTerminalTabs((prev) =>
+            prev.map((tab) => {
+                if (tab.id !== tabId) return tab;
+                return typeof updater === 'function' ? updater(tab) : { ...tab, ...updater };
+            })
+        );
+    };
+
+    const setCommandHistory = (updater) => {
+        const targetId = activeTabIdRef.current;
+        updateTab(targetId, (tab) => ({
+            ...tab,
+            history: typeof updater === 'function' ? updater(tab.history) : updater,
+        }));
+    };
+
+    const setSshWorkingDir = (nextDir) => {
+        updateTab(activeTabIdRef.current, { sshWorkingDir: nextDir });
+    };
+
+    const setPtySessionId = (nextSid, targetTabId = activeTabIdRef.current) => {
+        updateTab(targetTabId, { ptySessionId: nextSid });
+    };
+
     const [currentCommand, setCurrentCommand] = useState('');
     const [historyIndex, setHistoryIndex] = useState(-1);
     const [persistentHistory, setPersistentHistory] = useState([]);
@@ -164,18 +234,8 @@ const Terminal = ({ isOpen, onToggle }) => {
     const [selectedSearchIndex, setSelectedSearchIndex] = useState(-1);
     const inputRef = useRef(null);
     const terminalRef = useRef(null);
-    const { currentPath, navigateTo } = useHistory();
-    const { settings } = useSettings();
-    const { isSftpPath, parseSftpPath, executeSshCommand, startSshPty } = useSftp();
-    const [manualSshConnection, setManualSshConnection] = useState(null);
-    const [sshDisabledForPath, setSshDisabledForPath] = useState(false);
-    const [sshWorkingDir, setSshWorkingDir] = useState('.');
-    const [ptySessionId, setPtySessionId] = useState(null);
     const ptySessionIdRef = useRef(null);
     ptySessionIdRef.current = ptySessionId;
-
-    const parsedSftp = isSftpPath(currentPath) ? parseSftpPath(currentPath) : null;
-    const activeSshConnection = manualSshConnection || (!sshDisabledForPath ? parsedSftp?.connection : null);
 
     useEffect(() => {
         let unlistenOut = null;
@@ -186,20 +246,40 @@ const Terminal = ({ isOpen, onToggle }) => {
             try {
                 unlistenOut = await listen('ssh-pty-output', (event) => {
                     const payload = event?.payload;
-                    if (!active || !payload || payload.session_id !== ptySessionIdRef.current) return;
-                    setCommandHistory(prev => [
-                        ...prev,
-                        { type: 'output', content: payload.data, timestamp: new Date().toLocaleTimeString() },
-                    ]);
+                    if (!active || !payload?.session_id) return;
+                    const cleaned = stripAnsiCodes(payload.data);
+                    if (!cleaned) return;
+                    setTerminalTabs((prev) =>
+                        prev.map((tab) =>
+                            tab.ptySessionId === payload.session_id
+                                ? {
+                                    ...tab,
+                                    history: [
+                                        ...tab.history,
+                                        { type: 'output', content: cleaned, timestamp: new Date().toLocaleTimeString() },
+                                    ],
+                                }
+                                : tab
+                        )
+                    );
                 });
                 unlistenExit = await listen('ssh-pty-exit', (event) => {
                     const payload = event?.payload;
-                    if (!active || !payload || payload.session_id !== ptySessionIdRef.current) return;
-                    setPtySessionId(null);
-                    setCommandHistory(prev => [
-                        ...prev,
-                        { type: 'system', content: `[SSH PTY exited: ${payload.reason}]`, timestamp: new Date().toLocaleTimeString() },
-                    ]);
+                    if (!active || !payload?.session_id) return;
+                    setTerminalTabs((prev) =>
+                        prev.map((tab) =>
+                            tab.ptySessionId === payload.session_id
+                                ? {
+                                    ...tab,
+                                    ptySessionId: null,
+                                    history: [
+                                        ...tab.history,
+                                        { type: 'system', content: `[SSH PTY exited: ${payload.reason}]`, timestamp: new Date().toLocaleTimeString() },
+                                    ],
+                                }
+                                : tab
+                        )
+                    );
                 });
             } catch {
                 // Non-Tauri test environments may not mock event listeners
@@ -210,38 +290,66 @@ const Terminal = ({ isOpen, onToggle }) => {
             active = false;
             if (typeof unlistenOut === 'function') unlistenOut();
             if (typeof unlistenExit === 'function') unlistenExit();
-            if (ptySessionIdRef.current) {
-                invoke('ssh_close_pty', { sessionId: ptySessionIdRef.current }).catch(() => {});
+            for (const tab of terminalTabsRef.current) {
+                if (tab.ptySessionId) {
+                    invoke('ssh_close_pty', { sessionId: tab.ptySessionId }).catch(() => {});
+                }
             }
         };
     }, []);
+
+    const ensureAndSelectSshTab = (conn, remoteDir = '.') => {
+        const tabId = getSshTabId(conn);
+        const label = `SSH: ${conn.name || conn.host}`;
+        setTerminalTabs((prev) => {
+            const exists = prev.some((t) => t.id === tabId);
+            if (exists) {
+                return prev.map((t) =>
+                    t.id === tabId
+                        ? { ...t, sshConnection: conn, sshWorkingDir: remoteDir || t.sshWorkingDir }
+                        : t
+                );
+            }
+            return [
+                ...prev,
+                {
+                    id: tabId,
+                    label,
+                    history: [
+                        buildWelcomeEntry(label, remoteDir || '.'),
+                        {
+                            type: 'system',
+                            content: `[SSH] Terminal session ready for ${conn.username || 'guest'}@${conn.host}:${conn.port || 22}`,
+                            timestamp: new Date().toLocaleTimeString(),
+                        },
+                    ],
+                    sshConnection: conn,
+                    sshWorkingDir: remoteDir || '.',
+                    ptySessionId: null,
+                },
+            ];
+        });
+        setActiveTabId(tabId);
+    };
 
     useEffect(() => {
         const handleOpenSsh = (e) => {
             const conn = e?.detail?.connection;
             if (!conn?.host) return;
-            setManualSshConnection(conn);
-            setSshDisabledForPath(false);
-            setSshWorkingDir('.');
-            setCommandHistory(prev => [
-                ...prev,
-                {
-                    type: 'system',
-                    content: `[SSH] Connected terminal context to ${conn.username || 'guest'}@${conn.host}:${conn.port || 22}`,
-                    timestamp: new Date().toLocaleTimeString(),
-                },
-            ]);
+            ensureAndSelectSshTab(conn, '.');
         };
         window.addEventListener('open-ssh-terminal', handleOpenSsh);
         return () => window.removeEventListener('open-ssh-terminal', handleOpenSsh);
     }, []);
 
+    // Automatically switch terminal tab when user switches active explorer window/path
     useEffect(() => {
         if (parsedSftp?.connection) {
-            setSshWorkingDir(parsedSftp.remotePath || '.');
-            setSshDisabledForPath(false);
+            ensureAndSelectSshTab(parsedSftp.connection, parsedSftp.remotePath || '.');
+        } else if (activeTabIdRef.current.startsWith('ssh:')) {
+            setActiveTabId('local');
         }
-    }, [currentPath, parsedSftp?.connection, parsedSftp?.remotePath]);
+    }, [currentPath, parsedSftp?.connection?.host, parsedSftp?.connection?.username, parsedSftp?.connection?.port, parsedSftp?.remotePath]);
 
     /**
      * Get terminal height from settings with fallback to default value
@@ -261,25 +369,6 @@ const Terminal = ({ isOpen, onToggle }) => {
             }
         } catch (error) {
             console.error('Failed to load command history:', error);
-        }
-    }, []);
-
-    /**
-     * Initialize terminal with welcome message on first render
-     */
-    useEffect(() => {
-        if (commandHistory.length === 0) {
-            const welcomeMessage = {
-                type: 'system',
-                content: `File Explorer Terminal v2.0
-Current directory: ${currentPath || '/'}
-
-Type 'help' to see available commands.
-Command history is persistent across sessions.
-Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
-                timestamp: new Date().toLocaleTimeString(),
-            };
-            setCommandHistory([welcomeMessage]);
         }
     }, []);
 
@@ -1337,29 +1426,92 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
             onKeyDown={handleTerminalKeyDown}
         >
             <div className="terminal-header">
-                <div className="terminal-title">
-                    <span>Terminal</span>
-                    {activeSshConnection && (
-                        <span
-                            className="terminal-ssh-badge"
-                            style={{ marginLeft: '8px', fontSize: '12px', opacity: 0.85 }}
-                        >
-                            [SSH: {activeSshConnection.username || 'guest'}@{activeSshConnection.host}:{sshWorkingDir}]
-                        </span>
-                    )}
+                <div className="terminal-title" style={{ display: 'flex', alignItems: 'center', gap: '6px', overflowX: 'auto', minWidth: 0 }}>
+                    {terminalTabs.map((tab) => {
+                        const isTabActive = tab.id === activeTab?.id;
+                        return (
+                            <div
+                                key={tab.id}
+                                onClick={() => setActiveTabId(tab.id)}
+                                style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '6px',
+                                    padding: '3px 9px',
+                                    borderRadius: '5px',
+                                    fontSize: '12px',
+                                    cursor: 'pointer',
+                                    whiteSpace: 'nowrap',
+                                    background: isTabActive ? 'var(--accent, #0672ef)' : 'rgba(255,255,255,0.06)',
+                                    color: isTabActive ? '#fff' : 'inherit',
+                                    fontWeight: isTabActive ? 600 : 400,
+                                }}
+                                title={tab.sshConnection ? `${tab.sshConnection.username || 'guest'}@${tab.sshConnection.host}:${tab.sshWorkingDir}` : 'Local shell'}
+                            >
+                                <span>{tab.label}</span>
+                                {terminalTabs.length > 1 && (
+                                    <span
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            if (tab.ptySessionId) {
+                                                invoke('ssh_close_pty', { sessionId: tab.ptySessionId }).catch(() => {});
+                                            }
+                                            setTerminalTabs((prev) => {
+                                                const remaining = prev.filter((t) => t.id !== tab.id);
+                                                if (activeTabIdRef.current === tab.id && remaining.length > 0) {
+                                                    setActiveTabId(remaining[0].id);
+                                                }
+                                                return remaining;
+                                            });
+                                        }}
+                                        style={{ opacity: 0.75, fontSize: '13px', lineHeight: 1 }}
+                                        title="Close terminal tab"
+                                    >
+                                        ×
+                                    </span>
+                                )}
+                            </div>
+                        );
+                    })}
+                    <button
+                        type="button"
+                        className="terminal-control"
+                        onClick={() => {
+                            const newId = `local-${Date.now()}`;
+                            const num = terminalTabs.filter((t) => !t.sshConnection).length + 1;
+                            const label = `Local #${num}`;
+                            setTerminalTabs((prev) => [
+                                ...prev,
+                                {
+                                    id: newId,
+                                    label,
+                                    history: [buildWelcomeEntry(label, currentPath || '/')],
+                                    sshConnection: null,
+                                    sshWorkingDir: '.',
+                                    ptySessionId: null,
+                                },
+                            ]);
+                            setActiveTabId(newId);
+                        }}
+                        title="New local terminal tab"
+                        style={{ padding: '2px 7px', fontSize: '13px', lineHeight: 1 }}
+                    >
+                        +
+                    </button>
                 </div>
                 <div className="terminal-controls">
                     {activeSshConnection && (
                         <button
                             className="terminal-control"
                             onClick={async () => {
+                                const tabId = activeTab.id;
                                 if (ptySessionId) {
                                     await invoke('ssh_close_pty', { sessionId: ptySessionId }).catch(() => {});
-                                    setPtySessionId(null);
+                                    setPtySessionId(null, tabId);
                                 } else {
                                     try {
                                         const sid = await startSshPty(activeSshConnection, sshWorkingDir);
-                                        setPtySessionId(sid);
+                                        setPtySessionId(sid, tabId);
                                     } catch (e) {
                                         setCommandHistory(prev => [
                                             ...prev,
@@ -1376,15 +1528,8 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
                     {activeSshConnection && (
                         <button
                             className="terminal-control"
-                            onClick={async () => {
-                                if (ptySessionId) {
-                                    await invoke('ssh_close_pty', { sessionId: ptySessionId }).catch(() => {});
-                                    setPtySessionId(null);
-                                }
-                                setManualSshConnection(null);
-                                setSshDisabledForPath(true);
-                            }}
-                            title="Switch back to local terminal"
+                            onClick={() => setActiveTabId('local')}
+                            title="Switch to Local terminal tab"
                         >
                             Local
                         </button>

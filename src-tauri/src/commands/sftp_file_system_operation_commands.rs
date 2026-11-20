@@ -490,37 +490,67 @@ fn connect_ssh_session_with_compression(
         ));
     }
 
-    let mut last_err = None;
-    let mut connected_tcp = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, SFTP_TCP_CONNECT_TIMEOUT) {
-            Ok(stream) => {
-                connected_tcp = Some(stream);
+    let mut last_handshake_err = None;
+    let mut established_session = None;
+
+    for attempt in 0..3 {
+        let mut last_err = None;
+        let mut connected_tcp = None;
+        for addr in &addrs {
+            match TcpStream::connect_timeout(addr, SFTP_TCP_CONNECT_TIMEOUT) {
+                Ok(stream) => {
+                    connected_tcp = Some(stream);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let tcp = connected_tcp.ok_or_else(|| {
+            last_err
+                .map(|e| format!("Failed to connect to '{trimmed_host}:{port}': {e}"))
+                .unwrap_or_else(|| format!("Failed to connect to '{trimmed_host}:{port}'"))
+        })?;
+
+        let io_timeout = Duration::from_millis(SFTP_SSH_SESSION_TIMEOUT_MS as u64);
+        let _ = tcp.set_read_timeout(Some(io_timeout));
+        let _ = tcp.set_write_timeout(Some(io_timeout));
+        let _ = tcp.set_nodelay(true);
+
+        let mut session =
+            Session::new().map_err(|_| "Could not initialize SSH session".to_string())?;
+        session.set_tcp_stream(tcp);
+        session.set_timeout(SFTP_SSH_SESSION_TIMEOUT_MS);
+        if compress {
+            session.set_compress(true);
+        }
+
+        match session.handshake() {
+            Ok(()) => {
+                established_session = Some(session);
                 break;
             }
             Err(e) => {
-                last_err = Some(e);
+                let msg = e.to_string();
+                let lower = msg.to_ascii_lowercase();
+                let is_transient = lower.contains("banner")
+                    || lower.contains("timeout")
+                    || lower.contains("would block")
+                    || lower.contains("reset")
+                    || lower.contains("eof");
+                last_handshake_err = Some(msg);
+                if !is_transient || attempt == 2 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
             }
         }
     }
 
-    let tcp = connected_tcp.ok_or_else(|| {
-        last_err
-            .map(|e| format!("Failed to connect to '{trimmed_host}:{port}': {e}"))
-            .unwrap_or_else(|| format!("Failed to connect to '{trimmed_host}:{port}'"))
-    })?;
-
-    let io_timeout = Duration::from_millis(SFTP_SSH_SESSION_TIMEOUT_MS as u64);
-    let _ = tcp.set_read_timeout(Some(io_timeout));
-    let _ = tcp.set_write_timeout(Some(io_timeout));
-
-    let mut session = Session::new().map_err(|_| "Could not initialize SSH session".to_string())?;
-    session.set_tcp_stream(tcp);
-    session.set_timeout(SFTP_SSH_SESSION_TIMEOUT_MS);
-    if compress {
-        session.set_compress(true);
-    }
-    session.handshake().map_err(|e| e.to_string())?;
+    let session = established_session
+        .ok_or_else(|| last_handshake_err.unwrap_or_else(|| "SSH handshake failed".to_string()))?;
 
     let (host_key_bytes, _key_type) = session
         .host_key()

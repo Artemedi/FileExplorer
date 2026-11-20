@@ -6,7 +6,7 @@ import { invoke } from '@tauri-apps/api/core';
  * @param {Array<{id: string, host: string, port?: number|null, unc_path?: string|null}>} targets
  * @param {number} [intervalMs=10000]
  */
-export function useNetworkHealth(targets, intervalMs = 10000) {
+export function useNetworkHealth(targets, intervalMs = 30000) {
     const [statusesById, setStatusesById] = useState({});
     const [isChecking, setIsChecking] = useState(false);
     const targetsRef = useRef(targets);

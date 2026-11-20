@@ -1,6 +1,6 @@
 /* Network View Styles */
 .network-view {
-    padding: 24px;
+    padding: 20px 24px;
     max-width: 1200px;
     margin: 0 auto;
     height: 100%;
@@ -8,145 +8,63 @@
 }
 
 .network-view-header {
-    margin-bottom: 32px;
-    text-align: center;
+    margin-bottom: 20px;
+    text-align: left;
 }
 
 .network-view-title {
-    font-size: 2.5rem;
+    font-size: 1.5rem;
     font-weight: 700;
     color: var(--text-primary);
-    margin: 0 0 8px 0;
+    margin: 0 0 4px 0;
     display: flex;
     align-items: center;
-    justify-content: center;
-    gap: 12px;
+    justify-content: flex-start;
+    gap: 10px;
 }
 
 .network-view-title::before {
     content: '';
     display: inline-block;
-    width: 32px;
-    height: 32px;
+    width: 22px;
+    height: 22px;
     background: var(--accent);
-    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z'/%3E%3Cline x1='3' y1='6' x2='21' y2='6'/%3E%3Cpath d='m16 10-4 4-4-4'/%3E%3C/svg%3E") no-repeat center;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2' y='2' width='20' height='8' rx='2' ry='2'/%3E%3Crect x='2' y='14' width='20' height='8' rx='2' ry='2'/%3E%3Cline x1='6' y1='6' x2='6.01' y2='6'/%3E%3Cline x1='6' y1='18' x2='6.01' y2='18'/%3E%3C/svg%3E") no-repeat center;
     mask-size: cover;
 }
 
 .network-view-subtitle {
-    font-size: 1.1rem;
+    font-size: 0.9rem;
     color: var(--text-secondary);
     margin: 0;
 }
 
 .network-connections-section {
-    margin-bottom: 48px;
+    margin-bottom: 28px;
 }
 
 .section-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 24px;
-    padding-bottom: 16px;
-    border-bottom: 2px solid var(--border);
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
 }
 
 .section-title {
-    font-size: 1.5rem;
+    font-size: 1.05rem;
     font-weight: 600;
     color: var(--text-primary);
     margin: 0;
 }
 
 .add-connection-button {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 16px;
-    background: var(--accent);
-    color: white;
-    border: none;
-    border-radius: 8px;
-    font-size: 14px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.2s ease;
-}
-
-.add-connection-button:hover {
-    background: var(--accent-hover);
-    transform: translateY(-1px);
-}
-
-.connections-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-    gap: 20px;
-}
-
-.connection-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 20px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    transition: all 0.2s ease;
-    cursor: pointer;
-}
-
-.connection-card:hover {
-    border-color: var(--accent);
-    transform: translateY(-2px);
-    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
-}
-
-.connection-icon {
-    width: 48px;
-    height: 48px;
-    background: var(--accent);
-    border-radius: 12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-}
-
-.connection-icon .icon {
-    font-size: 24px;
-    color: white;
-}
-
-.connection-details {
-    flex: 1;
-}
-
-.connection-name {
-    font-size: 1.1rem;
-    font-weight: 600;
-    color: var(--text-primary);
-    margin: 0 0 4px 0;
-}
-
-.connection-address {
-    font-size: 0.9rem;
-    color: var(--text-secondary);
-    margin: 0;
-    font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Consolas', 'Courier New', monospace;
-}
-
-.connection-actions {
-    flex-shrink: 0;
-}
-
-.connect-button {
-    display: flex;
+    display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 8px 14px;
-    background: var(--success);
+    padding: 7px 12px;
+    background: var(--accent);
     color: white;
     border: none;
     border-radius: 6px;
@@ -156,8 +74,126 @@
     transition: all 0.2s ease;
 }
 
+.add-connection-button:hover {
+    background: var(--accent-hover);
+}
+
+.connections-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    gap: 14px;
+}
+
+.connection-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    overflow: hidden;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.connection-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+}
+
+.connection-icon {
+    width: 38px;
+    height: 38px;
+    background: var(--accent);
+    border-radius: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.connection-icon .icon {
+    font-size: 18px;
+    color: white;
+}
+
+.connection-details {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.connection-name {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0 0 3px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.connection-address {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin: 0;
+    font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Consolas', 'Courier New', monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.connection-actions {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.connect-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 30px;
+    padding: 0 10px;
+    background: var(--success, #22c55e);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: opacity 0.2s ease;
+}
+
 .connect-button:hover {
-    background: var(--success-hover, #45a049);
+    opacity: 0.9;
+}
+
+.remove-connection-button {
+    width: 30px;
+    height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: all 0.15s ease;
+}
+
+.remove-connection-button:hover {
+    border-color: #ef4444;
+    color: #ef4444;
+    background: rgba(239, 68, 68, 0.1);
 }
 
 .empty-connections {

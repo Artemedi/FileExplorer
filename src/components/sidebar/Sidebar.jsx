@@ -46,17 +46,31 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
     const [newSourcePath, setNewSourcePath] = useState('');
     const addSourceInputRef = useRef(null);
 
-    // SFTP Connections state
+    // SFTP & Network Share Connections state
     const [sftpConnections, setSftpConnections] = useState([]);
+    const [networkShares, setNetworkShares] = useState(() => {
+        try {
+            const saved = JSON.parse(localStorage.getItem('fileExplorerNetworkShares') || '[]');
+            return Array.isArray(saved) ? saved : [];
+        } catch {
+            return [];
+        }
+    });
     const [isAddSftpModalOpen, setIsAddSftpModalOpen] = useState(false);
-    const { statusesById: sftpHealthById } = useNetworkHealth(
-        sftpConnections.map((conn) => ({
+    const { statusesById: networkHealthById } = useNetworkHealth([
+        ...networkShares.map((share) => ({
+            id: `smb:${share.path}`,
+            host: '',
+            port: null,
+            unc_path: share.path
+        })),
+        ...sftpConnections.map((conn) => ({
             id: `sftp:${conn.name}`,
             host: conn.host,
             port: Number(conn.port || 22),
             unc_path: null
         }))
-    );
+    ]);
     
     // Permission helper state
     const [isPermissionHelperOpen, setIsPermissionHelperOpen] = useState(false);
@@ -172,6 +186,26 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
             showError('Failed to remove SFTP connection: ' + err.message);
         }
     };
+
+    useEffect(() => {
+        const loadShares = () => {
+            try {
+                const saved = JSON.parse(localStorage.getItem('fileExplorerNetworkShares') || '[]');
+                setNetworkShares(Array.isArray(saved) ? saved : []);
+            } catch {
+                setNetworkShares([]);
+            }
+        };
+        const storageHandler = (e) => {
+            if (e.key === 'fileExplorerNetworkShares') loadShares();
+        };
+        window.addEventListener('network-shares-updated', loadShares);
+        window.addEventListener('storage', storageHandler);
+        return () => {
+            window.removeEventListener('network-shares-updated', loadShares);
+            window.removeEventListener('storage', storageHandler);
+        };
+    }, []);
 
     // State for collapsible sections
     const [sectionCollapsed, setSectionCollapsed] = useState(() => {
@@ -667,48 +701,83 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                         </div>
                         {!sectionCollapsed.network && (
                             <ul className="sidebar-list">
-                                {sftpConnections.length === 0 ? (
+                                {sftpConnections.length === 0 && networkShares.length === 0 ? (
                                     <div className="sidebar-empty-state">
                                         <div className="empty-state-icon">
                                             <span className="icon icon-network"></span>
                                         </div>
                                         <div className="empty-state-text">
-                                            <p>No SFTP connections</p>
-                                            <span>Add a connection to get started</span>
+                                            <p>No network connections</p>
+                                            <span>Add SFTP or SMB share to get started</span>
                                         </div>
                                     </div>
                                 ) : (
-                                    sftpConnections.map((conn) => (
-                                        <SidebarItem
-                                            key={conn.name}
-                                            icon="network"
-                                            name={conn.name}
-                                            path={`sftp://${conn.username}@${conn.host}:${conn.port}`}
-                                            statusBadge={getHealthDisplay(sftpHealthById[`sftp:${conn.name}`])}
-                                            isActive={
-                                                currentView === 'explorer' &&
-                                                isSftpPath(currentPath) &&
-                                                parseSftpPath(currentPath)?.connection?.name === conn.name
-                                            }
-                                            onClick={async () => {
-                                                try {
-                                                    const sftpPath = createSftpUrl(conn, '.');
-                                                    window.dispatchEvent(new CustomEvent('force-explorer-view'));
-                                                    const ok = await loadDirectory(sftpPath);
-                                                    if (ok) {
-                                                        navigateTo(sftpPath);
-                                                    }
-                                                } catch (error) {
-                                                    console.error('Failed to connect to SFTP:', error);
+                                    <>
+                                        {networkShares.map((share) => (
+                                            <SidebarItem
+                                                key={`smb:${share.path}`}
+                                                icon="folder"
+                                                name={share.name}
+                                                path={share.path}
+                                                statusBadge={getHealthDisplay(networkHealthById[`smb:${share.path}`])}
+                                                isActive={
+                                                    currentView === 'explorer' &&
+                                                    typeof currentPath === 'string' &&
+                                                    currentPath.toLowerCase().startsWith(share.path.toLowerCase().replace(/\\+$/, ''))
                                                 }
-                                            }}
-                                            actions={[{
-                                                icon: 'x',
-                                                tooltip: 'Remove SFTP Connection',
-                                                onClick: () => removeSftpConnection(conn)
-                                            }]}
-                                        />
-                                    ))
+                                                onClick={async () => {
+                                                    try {
+                                                        if (share.username) {
+                                                            await invoke('connect_network_share', {
+                                                                uncPath: share.path,
+                                                                username: share.username,
+                                                                password: '',
+                                                                remember: false
+                                                            }).catch(() => {});
+                                                        }
+                                                        window.dispatchEvent(new CustomEvent('force-explorer-view'));
+                                                        const ok = await loadDirectory(share.path);
+                                                        if (ok) {
+                                                            navigateTo(share.path);
+                                                        }
+                                                    } catch (error) {
+                                                        console.error('Failed to open network share:', error);
+                                                    }
+                                                }}
+                                            />
+                                        ))}
+                                        {sftpConnections.map((conn) => (
+                                            <SidebarItem
+                                                key={conn.name}
+                                                icon="network"
+                                                name={conn.name}
+                                                path={`sftp://${conn.username}@${conn.host}:${conn.port}`}
+                                                statusBadge={getHealthDisplay(networkHealthById[`sftp:${conn.name}`])}
+                                                isActive={
+                                                    currentView === 'explorer' &&
+                                                    isSftpPath(currentPath) &&
+                                                    parseSftpPath(currentPath)?.connection?.name === conn.name
+                                                }
+                                                onClick={async () => {
+                                                    try {
+                                                        const sftpPath = createSftpUrl(conn, '.');
+                                                        window.dispatchEvent(new CustomEvent('force-explorer-view'));
+                                                        const ok = await loadDirectory(sftpPath);
+                                                        if (ok) {
+                                                            navigateTo(sftpPath);
+                                                        }
+                                                    } catch (error) {
+                                                        console.error('Failed to connect to SFTP:', error);
+                                                    }
+                                                }}
+                                                actions={[{
+                                                    icon: 'x',
+                                                    tooltip: 'Remove SFTP Connection',
+                                                    onClick: () => removeSftpConnection(conn)
+                                                }]}
+                                            />
+                                        ))}
+                                    </>
                                 )}
                             </ul>
                         )}
