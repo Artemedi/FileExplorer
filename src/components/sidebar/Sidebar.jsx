@@ -15,6 +15,7 @@ import './sidebar.css';
 import {showConfirm, showError, showSuccess} from "../../utils/NotificationSystem.js";
 import {useTranslation} from '../../i18n';
 import {useNetworkHealth, getHealthDisplay} from '../../hooks/useNetworkHealth';
+import {compareNetworkItems} from '../../utils/networkSort';
 
 /**
  * Sidebar component - Provides navigation, favorites, and quick access
@@ -713,7 +714,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                                     </div>
                                 ) : (
                                     <>
-                                        {networkShares.map((share) => (
+                                        {[...networkShares].sort(compareNetworkItems).map((share) => (
                                             <SidebarItem
                                                 key={`smb:${share.path}`}
                                                 icon="folder"
@@ -746,7 +747,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                                                 }}
                                             />
                                         ))}
-                                        {sftpConnections.map((conn) => (
+                                        {[...sftpConnections].sort(compareNetworkItems).map((conn) => (
                                             <SidebarItem
                                                 key={conn.name}
                                                 icon="network"

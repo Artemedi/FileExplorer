@@ -424,6 +424,15 @@ const Terminal = ({ isOpen, onToggle }) => {
      * @returns {string} Formatted prompt string
      */
     const getPrompt = () => {
+        if (activeSshConnection) {
+            const username = activeSshConnection.username || 'user';
+            const hostname = activeSshConnection.host;
+            const pathDisplay = sshWorkingDir || '.';
+            const displayPath = pathDisplay.length > 50
+                ? '...' + pathDisplay.slice(-47)
+                : pathDisplay;
+            return `${username}@${hostname}:${displayPath}$`;
+        }
         const username = 'user';
         const hostname = 'localhost';
         const pathDisplay = currentPath || '/';
@@ -1098,17 +1107,18 @@ const Terminal = ({ isOpen, onToggle }) => {
         });
 
         // Process command
-        let response;
+        let response = null;
+        const lowerCmd = cmd.toLowerCase();
 
-        console.log('[Terminal] Processing command:', cmd.toLowerCase(), 'with args:', args);
+        // When SSH/PTY is active, only local UI commands (clear/exit/help) are handled as built-ins;
+        // ls, cd, pwd, cat, etc. must execute on the remote SSH server.
+        const isRemoteMode = Boolean(activeSshConnection || ptySessionIdRef.current);
+        if (!isRemoteMode || ['clear', 'exit', 'help'].includes(lowerCmd)) {
+            response = await handleBuiltinCommand(lowerCmd, args);
+        }
 
-        // Check for built-in commands first
-        response = await handleBuiltinCommand(cmd.toLowerCase(), args);
-        console.log('[Terminal] Built-in command response:', response);
-
-        // If not a built-in command, execute as system command
-        if (response === null && cmd.toLowerCase() !== 'clear') {
-            console.log('[Terminal] Falling back to system command execution');
+        // If not a built-in command, execute as system / SSH command
+        if (response === null && lowerCmd !== 'clear') {
             response = await executeCommand(command);
         }
 
@@ -1415,8 +1425,37 @@ const Terminal = ({ isOpen, onToggle }) => {
     /**
      * Handles clearing the terminal display
      */
+    const [copiedFeedback, setCopiedFeedback] = useState(false);
+
     const handleClearTerminal = () => {
         setCommandHistory([]);
+    };
+
+    const handleCopyTerminal = async () => {
+        const formatted = commandHistory
+            .map((entry) => {
+                if (entry.type === 'command') {
+                    return `${entry.prompt || '$'} ${entry.content || ''}`;
+                }
+                return entry.content || '';
+            })
+            .filter(Boolean)
+            .join('\n');
+        try {
+            await navigator.clipboard.writeText(formatted);
+            setCopiedFeedback(true);
+            setTimeout(() => setCopiedFeedback(false), 1500);
+        } catch {
+            // Fallback for older webviews
+            const ta = document.createElement('textarea');
+            ta.value = formatted;
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            setCopiedFeedback(true);
+            setTimeout(() => setCopiedFeedback(false), 1500);
+        }
     };
 
     return (
@@ -1426,7 +1465,7 @@ const Terminal = ({ isOpen, onToggle }) => {
             onKeyDown={handleTerminalKeyDown}
         >
             <div className="terminal-header">
-                <div className="terminal-title" style={{ display: 'flex', alignItems: 'center', gap: '6px', overflowX: 'auto', minWidth: 0 }}>
+                <div className="terminal-title">
                     {terminalTabs.map((tab) => {
                         const isTabActive = tab.id === activeTab?.id;
                         return (
@@ -1534,6 +1573,14 @@ const Terminal = ({ isOpen, onToggle }) => {
                             Local
                         </button>
                     )}
+                    <button
+                        type="button"
+                        className="terminal-control"
+                        onClick={handleCopyTerminal}
+                        title="Copy entire terminal output (formatted)"
+                    >
+                        {copiedFeedback ? 'Copied!' : 'Copy'}
+                    </button>
                     <button 
                         className="terminal-control terminal-clear"
                         onClick={handleClearTerminal}

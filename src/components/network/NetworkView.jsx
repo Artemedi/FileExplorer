@@ -8,6 +8,7 @@ import AddSftpConnectionView from '../sidebar/AddSftpConnectionView';
 import Modal from '../common/Modal';
 import Button from '../common/Button';
 import { useNetworkHealth, getHealthDisplay } from '../../hooks/useNetworkHealth';
+import { compareNetworkItems, groupNetworkItems } from '../../utils/networkSort';
 import './networkView.css';
 
 const NETWORK_SHARES_STORAGE_KEY = 'fileExplorerNetworkShares';
@@ -38,6 +39,7 @@ const NetworkView = () => {
     const [shareRemember, setShareRemember] = useState(true);
     const [shareConnecting, setShareConnecting] = useState(false);
     const [shareError, setShareError] = useState(null);
+    const [groupByAlpha, setGroupByAlpha] = useState(true);
 
     const networkTargets = [
         ...networkShares.map((s) => ({
@@ -244,9 +246,27 @@ const NetworkView = () => {
 
     return (
         <div className="network-view">
-            <div className="network-view-header">
-                <h2 className="network-view-title">Network</h2>
-                <p className="network-view-subtitle">Manage and connect to remote servers and SMB/UNC shares</p>
+            <div className="network-view-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+                <div>
+                    <h2 className="network-view-title">Network</h2>
+                    <p className="network-view-subtitle">Manage and connect to remote servers and SMB/UNC shares</p>
+                </div>
+                <button
+                    type="button"
+                    onClick={() => setGroupByAlpha((prev) => !prev)}
+                    style={{
+                        padding: '6px 12px',
+                        fontSize: '12px',
+                        borderRadius: '6px',
+                        border: '1px solid var(--border)',
+                        background: 'var(--surface)',
+                        color: 'var(--text-primary)',
+                        cursor: 'pointer'
+                    }}
+                    title="Toggle grouping (0-9 · A-Z · А-Я)"
+                >
+                    {groupByAlpha ? 'Grouped: 0-9 · A-Z · А-Я' : 'Sorted: 0-9 → A-Z → А-Я'}
+                </button>
             </div>
 
             <div className="network-connections-section">
@@ -283,8 +303,60 @@ const NetworkView = () => {
                                 Add Network Share
                             </button>
                         </div>
+                    ) : groupByAlpha ? (
+                        groupNetworkItems(networkShares).map(({ group, items }) => (
+                            <React.Fragment key={group}>
+                                <div style={{ gridColumn: '1 / -1', fontSize: '11px', fontWeight: 700, letterSpacing: '0.08em', opacity: 0.65, paddingTop: '4px' }}>
+                                    {group} ({items.length})
+                                </div>
+                                {items.map((share) => {
+                                    const health = getHealthDisplay(endpointHealthById[`smb:${share.path}`]);
+                                    return (
+                                    <div key={share.path} className="connection-card">
+                                        <div className="connection-icon">
+                                            <span className="icon icon-folder"></span>
+                                        </div>
+                                        <div className="connection-details">
+                                            <h4 className="connection-name" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                                <span>{share.name}</span>
+                                                <span
+                                                    title={health.title}
+                                                    style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '11px', fontWeight: 500, opacity: 0.9 }}
+                                                >
+                                                    <span style={{ width: '7px', height: '7px', borderRadius: '50%', backgroundColor: health.color, display: 'inline-block' }} />
+                                                    <span>{health.label}</span>
+                                                </span>
+                                            </h4>
+                                            <p className="connection-address" title={`${share.path}${share.username ? ` · ${share.username}` : ''}`}>
+                                                {share.path}
+                                                {share.username ? ` · ${share.username}` : ''}
+                                            </p>
+                                        </div>
+                                        <div className="connection-actions">
+                                            <button
+                                                className="connect-button"
+                                                onClick={() => handleOpenNetworkShare(share)}
+                                                title="Open network share"
+                                            >
+                                                <span className="icon icon-play"></span>
+                                                Open
+                                            </button>
+                                            <button
+                                                className="remove-connection-button"
+                                                onClick={() => handleRemoveNetworkShare(share)}
+                                                title="Remove network share"
+                                                aria-label={`Remove ${share.name}`}
+                                            >
+                                                <span className="icon icon-x"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    );
+                                })}
+                            </React.Fragment>
+                        ))
                     ) : (
-                        networkShares.map((share) => {
+                        [...networkShares].sort(compareNetworkItems).map((share) => {
                             const health = getHealthDisplay(endpointHealthById[`smb:${share.path}`]);
                             return (
                             <div key={share.path} className="connection-card">
@@ -361,8 +433,68 @@ const NetworkView = () => {
                                 Add Your First Connection
                             </button>
                         </div>
+                    ) : groupByAlpha ? (
+                        groupNetworkItems(localSftpConnections).map(({ group, items }) => (
+                            <React.Fragment key={group}>
+                                <div style={{ gridColumn: '1 / -1', fontSize: '11px', fontWeight: 700, letterSpacing: '0.08em', opacity: 0.65, paddingTop: '4px' }}>
+                                    {group} ({items.length})
+                                </div>
+                                {items.map((connection) => {
+                                    const health = getHealthDisplay(endpointHealthById[`sftp:${connection.name}`]);
+                                    return (
+                                    <div key={connection.name} className="connection-card">
+                                        <div className="connection-icon">
+                                            <span className="icon icon-network"></span>
+                                        </div>
+                                        <div className="connection-details">
+                                            <h4 className="connection-name" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                                <span>{connection.name}</span>
+                                                <span
+                                                    title={health.title}
+                                                    style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '11px', fontWeight: 500, opacity: 0.9 }}
+                                                >
+                                                    <span style={{ width: '7px', height: '7px', borderRadius: '50%', backgroundColor: health.color, display: 'inline-block' }} />
+                                                    <span>{health.label}</span>
+                                                </span>
+                                            </h4>
+                                            <p className="connection-address" title={`${connection.username || 'guest'}@${connection.host}:${connection.port}`}>
+                                                {connection.username || 'guest'}@{connection.host}:{connection.port}
+                                                {connection.authType ? ` · ${connection.authType}` : ''}
+                                            </p>
+                                        </div>
+                                        <div className="connection-actions">
+                                            <button
+                                                className="connect-button"
+                                                onClick={() => handleConnectToSftp(connection)}
+                                                title="Connect to this SFTP server"
+                                            >
+                                                <span className="icon icon-play"></span>
+                                                Connect
+                                            </button>
+                                            <button
+                                                className="connect-button"
+                                                onClick={() => window.dispatchEvent(new CustomEvent('open-ssh-terminal', { detail: { connection } }))}
+                                                title="Open SSH terminal for this server"
+                                            >
+                                                <span className="icon icon-terminal"></span>
+                                                SSH
+                                            </button>
+                                            <button
+                                                className="remove-connection-button"
+                                                onClick={() => removeSftpConnection(connection)}
+                                                title="Remove SFTP Connection"
+                                                aria-label={`Remove ${connection.name}`}
+                                            >
+                                                <span className="icon icon-x"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    );
+                                })}
+                            </React.Fragment>
+                        ))
                     ) : (
-                        localSftpConnections.map((connection) => {
+                        [...localSftpConnections].sort(compareNetworkItems).map((connection) => {
                             const health = getHealthDisplay(endpointHealthById[`sftp:${connection.name}`]);
                             return (
                             <div key={connection.name} className="connection-card">
