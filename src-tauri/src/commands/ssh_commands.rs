@@ -395,7 +395,15 @@ pub async fn ssh_start_pty(
                         let _ = channel.flush();
                     }
                     PtyControl::Resize(c, r) => {
-                        let _ = channel.request_pty_size(c, r, None, None);
+                        for _ in 0..10 {
+                            match channel.request_pty_size(c, r, None, None) {
+                                Ok(()) => break,
+                                Err(e) if matches!(e.code(), ssh2::ErrorCode::Session(-37)) => {
+                                    thread::sleep(Duration::from_millis(10));
+                                }
+                                Err(_) => break,
+                            }
+                        }
                     }
                     PtyControl::Close => {
                         let _ = channel.close();
@@ -526,7 +534,12 @@ fn drain_valid_utf8(pending: &mut Vec<u8>) -> String {
 
 /// Opens the native OS terminal emulator (Windows Terminal / cmd / xterm) connected via `ssh`.
 #[tauri::command]
-pub fn open_external_ssh_terminal(host: String, port: u16, username: String) -> Result<(), String> {
+pub fn open_external_ssh_terminal(
+    host: String,
+    port: u16,
+    username: String,
+    private_key_path: Option<String>,
+) -> Result<(), String> {
     let trimmed_host = host.trim();
     let trimmed_user = username.trim();
     if trimmed_host.is_empty()
@@ -548,18 +561,36 @@ pub fn open_external_ssh_terminal(host: String, port: u16, username: String) -> 
         format!("{trimmed_user}@{trimmed_host}")
     };
     let port_str = port.to_string();
+    let clean_key = private_key_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty() && !k.chars().any(|c| matches!(c, '\n' | '\r' | '\0')))
+        .map(str::to_string);
 
     #[cfg(target_os = "windows")]
     {
+        let mut wt_args = vec!["ssh".to_string()];
+        if let Some(ref key) = clean_key {
+            wt_args.push("-i".to_string());
+            wt_args.push(key.clone());
+        }
+        wt_args.extend([target.clone(), "-p".to_string(), port_str.clone()]);
+
         if std::process::Command::new("wt.exe")
-            .args(["ssh", &target, "-p", &port_str])
+            .args(&wt_args)
             .spawn()
             .is_ok()
         {
             return Ok(());
         }
+        let mut cmd_args = vec!["/c".to_string(), "start".to_string(), "ssh".to_string()];
+        if let Some(ref key) = clean_key {
+            cmd_args.push("-i".to_string());
+            cmd_args.push(key.clone());
+        }
+        cmd_args.extend([target, "-p".to_string(), port_str]);
         std::process::Command::new("cmd.exe")
-            .args(["/c", "start", "ssh", &target, "-p", &port_str])
+            .args(&cmd_args)
             .spawn()
             .map_err(|e| format!("Failed to launch external SSH terminal: {e}"))?;
         Ok(())
@@ -567,17 +598,24 @@ pub fn open_external_ssh_terminal(host: String, port: u16, username: String) -> 
 
     #[cfg(target_os = "linux")]
     {
-        let candidates = [
+        let mut ssh_tail = Vec::new();
+        if let Some(ref key) = clean_key {
+            ssh_tail.push("-i");
+            ssh_tail.push(key.as_str());
+        }
+        ssh_tail.extend([target.as_str(), "-p", port_str.as_str()]);
+
+        let candidates: Vec<(&str, Vec<&str>)> = vec![
             (
                 "x-terminal-emulator",
-                vec!["-e", "ssh", &target, "-p", &port_str],
+                [vec!["-e", "ssh"], ssh_tail.clone()].concat(),
             ),
             (
                 "gnome-terminal",
-                vec!["--", "ssh", &target, "-p", &port_str],
+                [vec!["--", "ssh"], ssh_tail.clone()].concat(),
             ),
-            ("konsole", vec!["-e", "ssh", &target, "-p", &port_str]),
-            ("xterm", vec!["-e", "ssh", &target, "-p", &port_str]),
+            ("konsole", [vec!["-e", "ssh"], ssh_tail.clone()].concat()),
+            ("xterm", [vec!["-e", "ssh"], ssh_tail].concat()),
         ];
         for (bin, args) in candidates {
             if std::process::Command::new(bin).args(&args).spawn().is_ok() {
@@ -589,7 +627,7 @@ pub fn open_external_ssh_terminal(host: String, port: u16, username: String) -> 
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
-        let _ = (target, port_str);
+        let _ = (target, port_str, clean_key);
         Err("External SSH terminal launch is only supported on Windows and Linux.".to_string())
     }
 }

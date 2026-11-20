@@ -1689,6 +1689,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                                     host: activeSshConnection.host,
                                     port: Number(activeSshConnection.port || 22),
                                     username: activeSshConnection.username || '',
+                                    privateKeyPath: activeSshConnection.privateKeyPath || null,
                                 }).catch((e) => {
                                     setCommandHistory(prev => [
                                         ...prev,

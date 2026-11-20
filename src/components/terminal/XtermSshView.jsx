@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 
 /**
@@ -40,6 +41,7 @@ const XtermSshView = ({
             term = new XTerm({
                 cursorBlink: true,
                 convertEol: false,
+                customGlyphs: true,
                 fontFamily: "'Consolas', 'Courier New', monospace",
                 fontSize: 13,
                 lineHeight: 1.0,
@@ -55,6 +57,21 @@ const XtermSshView = ({
             fitAddon = new FitAddon();
             term.loadAddon(fitAddon);
             term.open(mountEl);
+
+            // Enable GPU-accelerated WebGL cell grid rendering for crisp box-drawing (mc/btop/htop)
+            try {
+                const webglAddon = new WebglAddon();
+                webglAddon.onContextLoss(() => {
+                    try {
+                        webglAddon.dispose();
+                    } catch {
+                        // ignore
+                    }
+                });
+                term.loadAddon(webglAddon);
+            } catch {
+                // Fallback to DOM renderer when WebGL is unavailable
+            }
 
             termRef.current = term;
             fitAddonRef.current = fitAddon;
