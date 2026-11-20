@@ -2239,6 +2239,10 @@ mod sftp_file_system_operation_commands_tests {
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             ".".to_string(),
+            None,
+            None,
+            None,
+            None,
         )
         .await;
 
@@ -2263,6 +2267,10 @@ mod sftp_file_system_operation_commands_tests {
             TEST_USERNAME.to_string(),
             TEST_WRONG_PASSWORD.to_string(),
             ".".to_string(),
+            None,
+            None,
+            None,
+            None,
         )
         .await;
 
@@ -2278,6 +2286,10 @@ mod sftp_file_system_operation_commands_tests {
             TEST_USERNAME.to_string(),
             TEST_PASSWORD.to_string(),
             "/nonexistent/directory".to_string(),
+            None,
+            None,
+            None,
+            None,
         )
         .await;
 
