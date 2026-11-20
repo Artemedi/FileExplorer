@@ -491,6 +491,7 @@ pub async fn connect_network_share(
 pub struct PartitionInfo {
     pub number: u32,
     pub drive_letter: Option<String>,
+    pub device_path: Option<String>,
     pub label: Option<String>,
     pub file_system: Option<String>,
     pub size_bytes: u64,
@@ -504,6 +505,7 @@ pub struct PartitionInfo {
 pub struct PhysicalDiskInfo {
     pub index: u32,
     pub model: String,
+    pub device_path: Option<String>,
     pub bus_type: String,
     pub partition_style: String,
     pub size_bytes: u64,
@@ -527,6 +529,7 @@ $disks = @(Get-Disk | Sort-Object Number | ForEach-Object {
         [PSCustomObject]@{
             number = [uint32]$p.PartitionNumber
             drive_letter = $dl
+            device_path = if ($dl) { "\\.\$dl" } else { $null }
             label = if ($vol -and $vol.FileSystemLabel) { [string]$vol.FileSystemLabel } else { $null }
             file_system = if ($vol -and $vol.FileSystem) { [string]$vol.FileSystem } else { $null }
             size_bytes = [uint64]$p.Size
@@ -539,6 +542,7 @@ $disks = @(Get-Disk | Sort-Object Number | ForEach-Object {
     [PSCustomObject]@{
         index = [uint32]$d.Number
         model = [string]($d.FriendlyName)
+        device_path = "\\.\PhysicalDrive$($d.Number)"
         bus_type = [string]($d.BusType)
         partition_style = [string]($d.PartitionStyle)
         size_bytes = [uint64]$d.Size
@@ -615,14 +619,14 @@ fn get_physical_disks_linux() -> Result<Vec<PhysicalDiskInfo>, String> {
                 if is_sys {
                     disk_is_system = true;
                 }
+                let dev_node = child
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|n| format!("/dev/{n}"));
                 partitions.push(PartitionInfo {
                     number: (p_idx + 1) as u32,
-                    drive_letter: mount.or_else(|| {
-                        child
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(|n| format!("/dev/{n}"))
-                    }),
+                    drive_letter: mount.or_else(|| dev_node.clone()),
+                    device_path: dev_node,
                     label: child
                         .get("label")
                         .and_then(|v| v.as_str())
@@ -643,6 +647,10 @@ fn get_physical_disks_linux() -> Result<Vec<PhysicalDiskInfo>, String> {
                 });
             }
         }
+        let disk_dev = dev
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|n| format!("/dev/{n}"));
         disks.push(PhysicalDiskInfo {
             index: idx as u32,
             model: dev
@@ -652,6 +660,7 @@ fn get_physical_disks_linux() -> Result<Vec<PhysicalDiskInfo>, String> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| dev.get("name").and_then(|v| v.as_str()).unwrap_or("Disk"))
                 .to_string(),
+            device_path: disk_dev,
             bus_type: dev
                 .get("tran")
                 .and_then(|v| v.as_str())
@@ -690,6 +699,1078 @@ pub async fn get_physical_disks_info() -> Result<Vec<PhysicalDiskInfo>, String> 
     })
     .await
     .map_err(|e| Error::internal(format!("Physical disk query failed: {e}")).to_json())?
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PartitionSupportedSize {
+    pub min_bytes: u64,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiskImageProgress {
+    pub operation: String,
+    pub bytes_processed: u64,
+    pub total_bytes: u64,
+    pub percent: f64,
+    pub stage: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SftpImageTarget {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: Option<String>,
+    pub auth_type: Option<String>,
+    pub private_key_path: Option<String>,
+    pub certificate_path: Option<String>,
+    pub remote_path: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiskImageResult {
+    pub bytes_processed: u64,
+    pub destination: String,
+    pub compressed: bool,
+}
+
+fn validate_confirm_token(expected: &str, provided: &str) -> Result<(), String> {
+    if provided.trim() != expected {
+        return Err(format!(
+            "Confirmation mismatch: type '{expected}' to proceed."
+        ));
+    }
+    Ok(())
+}
+
+fn validate_filesystem_name(fs: &str, is_windows: bool) -> Result<String, String> {
+    let normalized = fs.trim().to_ascii_lowercase();
+    if is_windows {
+        match normalized.as_str() {
+            "ntfs" => Ok("NTFS".to_string()),
+            "fat32" => Ok("FAT32".to_string()),
+            "exfat" => Ok("exFAT".to_string()),
+            "refs" => Ok("ReFS".to_string()),
+            _ => Err(format!(
+                "Unsupported Windows filesystem '{fs}'. Allowed: NTFS, FAT32, exFAT, ReFS."
+            )),
+        }
+    } else {
+        match normalized.as_str() {
+            "ext4" | "ext3" | "ext2" | "xfs" | "btrfs" | "f2fs" | "vfat" | "exfat" | "ntfs"
+            | "swap" => Ok(normalized),
+            "fat32" => Ok("vfat".to_string()),
+            _ => Err(format!(
+                "Unsupported Linux filesystem '{fs}'. Allowed: ext4, ext3, ext2, xfs, btrfs, f2fs, vfat, exfat, ntfs, swap."
+            )),
+        }
+    }
+}
+
+fn validate_volume_label(label: &str) -> Result<String, String> {
+    let trimmed = label.trim();
+    if trimmed.len() > 32 {
+        return Err("Volume label must be 32 characters or fewer.".to_string());
+    }
+    if trimmed.chars().any(|c| {
+        matches!(
+            c,
+            '\'' | '"' | '`' | '$' | ';' | '&' | '|' | '\n' | '\r' | '\0'
+        )
+    }) {
+        return Err("Volume label contains invalid characters.".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_partition_style(style: &str) -> Result<String, String> {
+    match style.trim().to_ascii_uppercase().as_str() {
+        "GPT" => Ok("GPT".to_string()),
+        "MBR" => Ok("MBR".to_string()),
+        _ => Err(format!(
+            "Unsupported partition style '{style}'. Allowed: GPT, MBR."
+        )),
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn validate_drive_letter(letter: &str) -> Result<char, String> {
+    let clean = letter.trim().trim_end_matches(':');
+    let mut chars = clean.chars();
+    let Some(ch) = chars.next() else {
+        return Err("Drive letter cannot be empty.".to_string());
+    };
+    if chars.next().is_some() || !ch.is_ascii_alphabetic() {
+        return Err(format!("Invalid drive letter '{letter}'."));
+    }
+    let upper = ch.to_ascii_uppercase();
+    if upper == 'C' {
+        return Err("Drive letter C: is reserved for the system volume.".to_string());
+    }
+    Ok(upper)
+}
+
+fn ensure_non_system_disk(disk: &PhysicalDiskInfo) -> Result<(), String> {
+    if disk.is_system || disk.partitions.iter().any(|p| p.is_system) {
+        return Err(format!(
+            "Refusing destructive operation on system disk {} ({}).",
+            disk.index, disk.model
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_non_system_partition(
+    disk: &PhysicalDiskInfo,
+    part: &PartitionInfo,
+) -> Result<(), String> {
+    if disk.is_system || part.is_system {
+        return Err(format!(
+            "Refusing destructive operation on system partition {} (Disk {}).",
+            part.number, disk.index
+        ));
+    }
+    Ok(())
+}
+
+fn is_zstd_magic(header: &[u8]) -> bool {
+    header.len() >= 4 && header[..4] == [0x28, 0xB5, 0x2F, 0xFD]
+}
+
+fn find_disk_and_partition(
+    disks: &[PhysicalDiskInfo],
+    disk_index: u32,
+    partition_number: Option<u32>,
+) -> Result<(&PhysicalDiskInfo, Option<&PartitionInfo>), String> {
+    let disk = disks
+        .iter()
+        .find(|d| d.index == disk_index)
+        .ok_or_else(|| format!("Physical disk {disk_index} not found."))?;
+    let part = match partition_number {
+        Some(num) => Some(
+            disk.partitions
+                .iter()
+                .find(|p| p.number == num)
+                .ok_or_else(|| format!("Partition {num} on disk {disk_index} not found."))?,
+        ),
+        None => None,
+    };
+    Ok((disk, part))
+}
+
+#[cfg(target_os = "windows")]
+fn run_powershell_disk_cmd(ps_script: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("Failed to invoke PowerShell: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        if detail.to_ascii_lowercase().contains("access is denied")
+            || detail.to_ascii_lowercase().contains("permissiondenied")
+        {
+            return Err(format!(
+                "Administrator privileges required for this disk operation. Run Explr as Administrator.\n{detail}"
+            ));
+        }
+        return Err(if detail.is_empty() {
+            "Disk operation failed.".to_string()
+        } else {
+            detail
+        });
+    }
+    Ok(stdout)
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_disk_cmd(
+    program: &str,
+    args: &[&str],
+    sudo_password: Option<&str>,
+) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let output = if let Some(pw) = sudo_password.filter(|s| !s.is_empty()) {
+        let mut child = Command::new("sudo")
+            .arg("-S")
+            .arg("-p")
+            .arg("")
+            .arg(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to invoke sudo {program}: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{pw}");
+        }
+        child
+            .wait_with_output()
+            .map_err(|e| format!("Failed waiting for sudo {program}: {e}"))?
+    } else {
+        Command::new("pkexec")
+            .arg(program)
+            .args(args)
+            .output()
+            .or_else(|_| Command::new(program).args(args).output())
+            .map_err(|e| format!("Failed to run {program}: {e}"))?
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(if detail.is_empty() {
+            format!("{program} exited with status {}", output.status)
+        } else {
+            detail
+        });
+    }
+    Ok(stdout)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_unmount_if_mounted(device_path: &str, sudo_password: Option<&str>) {
+    let _ = run_linux_disk_cmd("umount", &[device_path], sudo_password);
+}
+
+fn query_disks_sync() -> Result<Vec<PhysicalDiskInfo>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        get_physical_disks_windows()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        get_physical_disks_linux()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+/// Returns the list of supported filesystems for formatting on the current OS.
+#[tauri::command]
+pub fn get_supported_filesystems() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        vec![
+            "NTFS".to_string(),
+            "exFAT".to_string(),
+            "FAT32".to_string(),
+            "ReFS".to_string(),
+        ]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![
+            "ext4".to_string(),
+            "ext3".to_string(),
+            "ext2".to_string(),
+            "xfs".to_string(),
+            "btrfs".to_string(),
+            "f2fs".to_string(),
+            "vfat".to_string(),
+            "exfat".to_string(),
+            "ntfs".to_string(),
+            "swap".to_string(),
+        ]
+    }
+}
+
+/// Returns supported minimum and maximum sizes in bytes for resizing a partition.
+#[tauri::command]
+pub async fn get_partition_supported_size(
+    disk_index: u32,
+    partition_number: u32,
+) -> Result<PartitionSupportedSize, String> {
+    tokio::task::spawn_blocking(move || {
+        let disks = query_disks_sync()?;
+        let (_disk, _part) = find_disk_and_partition(&disks, disk_index, Some(partition_number))?;
+        let _part = _part.expect("partition_number was Some");
+        #[cfg(target_os = "windows")]
+        {
+            let script = format!(
+                "$s = Get-PartitionSupportedSize -DiskNumber {disk_index} -PartitionNumber {partition_number}; \
+                 [PSCustomObject]@{{ min_bytes = [uint64]$s.SizeMin; max_bytes = [uint64]$s.SizeMax }} | ConvertTo-Json -Compress"
+            );
+            let out = run_powershell_disk_cmd(&script)?;
+            serde_json::from_str::<PartitionSupportedSize>(&out)
+                .map_err(|e| format!("Failed to parse supported partition size: {e}"))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(PartitionSupportedSize {
+                min_bytes: 64 * 1024 * 1024,
+                max_bytes: _disk.size_bytes.max(_part.size_bytes),
+            })
+        }
+    })
+    .await
+    .map_err(|e| format!("Supported size query failed: {e}"))?
+}
+
+/// Formats a non-system partition with the specified filesystem and optional volume label.
+#[tauri::command]
+pub async fn format_partition(
+    disk_index: u32,
+    partition_number: u32,
+    file_system: String,
+    label: Option<String>,
+    quick: bool,
+    confirm_target: String,
+    sudo_password: Option<String>,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        validate_confirm_token(&format!("PART-{disk_index}-{partition_number}"), &confirm_target)?;
+        let disks = query_disks_sync()?;
+        let (disk, part) = find_disk_and_partition(&disks, disk_index, Some(partition_number))?;
+        let part = part.expect("partition_number was Some");
+        ensure_non_system_partition(disk, part)?;
+
+        let clean_label = match label.as_deref() {
+            Some(l) if !l.trim().is_empty() => Some(validate_volume_label(l)?),
+            _ => None,
+        };
+
+        #[cfg(target_os = "windows")]
+        {
+            let _ = sudo_password;
+            let fs = validate_filesystem_name(&file_system, true)?;
+            let label_arg = clean_label
+                .as_ref()
+                .map(|l| format!(" -NewFileSystemLabel '{l}'"))
+                .unwrap_or_default();
+            let full_flag = if quick { "" } else { " -Full" };
+            let script = format!(
+                "$p = Get-Partition -DiskNumber {disk_index} -PartitionNumber {partition_number} -ErrorAction Stop; \
+                 $p | Format-Volume -FileSystem {fs}{label_arg}{full_flag} -Confirm:$false -Force | Out-Null; \
+                 'Formatted'"
+            );
+            run_powershell_disk_cmd(&script)?;
+            Ok(format!(
+                "Partition {partition_number} on Disk {disk_index} formatted as {fs}."
+            ))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = quick;
+            let fs = validate_filesystem_name(&file_system, false)?;
+            let dev = part
+                .device_path
+                .as_deref()
+                .ok_or_else(|| "Partition device path is unavailable.".to_string())?;
+            linux_unmount_if_mounted(dev, sudo_password.as_deref());
+            let pw = sudo_password.as_deref();
+            match fs.as_str() {
+                "swap" => {
+                    let mut args = vec![dev];
+                    if let Some(ref l) = clean_label {
+                        args.extend_from_slice(&["-L", l.as_str()]);
+                    }
+                    run_linux_disk_cmd("mkswap", &args, pw)?;
+                }
+                "vfat" => {
+                    let mut args = vec!["-F", "32"];
+                    if let Some(ref l) = clean_label {
+                        args.extend_from_slice(&["-n", l.as_str()]);
+                    }
+                    args.push(dev);
+                    run_linux_disk_cmd("mkfs.vfat", &args, pw)?;
+                }
+                "ext4" | "ext3" | "ext2" => {
+                    let cmd = format!("mkfs.{fs}");
+                    let mut args = vec!["-F"];
+                    if let Some(ref l) = clean_label {
+                        args.extend_from_slice(&["-L", l.as_str()]);
+                    }
+                    args.push(dev);
+                    run_linux_disk_cmd(&cmd, &args, pw)?;
+                }
+                "xfs" => {
+                    let mut args = vec!["-f"];
+                    if let Some(ref l) = clean_label {
+                        args.extend_from_slice(&["-L", l.as_str()]);
+                    }
+                    args.push(dev);
+                    run_linux_disk_cmd("mkfs.xfs", &args, pw)?;
+                }
+                "btrfs" => {
+                    let mut args = vec!["-f"];
+                    if let Some(ref l) = clean_label {
+                        args.extend_from_slice(&["-L", l.as_str()]);
+                    }
+                    args.push(dev);
+                    run_linux_disk_cmd("mkfs.btrfs", &args, pw)?;
+                }
+                "exfat" => {
+                    let mut args = Vec::new();
+                    if let Some(ref l) = clean_label {
+                        args.extend_from_slice(&["-n", l.as_str()]);
+                    }
+                    args.push(dev);
+                    run_linux_disk_cmd("mkfs.exfat", &args, pw)?;
+                }
+                "ntfs" => {
+                    let mut args = vec!["-f"];
+                    if let Some(ref l) = clean_label {
+                        args.extend_from_slice(&["-L", l.as_str()]);
+                    }
+                    args.push(dev);
+                    run_linux_disk_cmd("mkfs.ntfs", &args, pw)?;
+                }
+                "f2fs" => {
+                    let mut args = vec!["-f"];
+                    if let Some(ref l) = clean_label {
+                        args.extend_from_slice(&["-l", l.as_str()]);
+                    }
+                    args.push(dev);
+                    run_linux_disk_cmd("mkfs.f2fs", &args, pw)?;
+                }
+                _ => return Err(format!("Unsupported filesystem: {fs}")),
+            }
+            Ok(format!("Partition {dev} formatted as {fs}."))
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let _ = (clean_label, quick, file_system, sudo_password);
+            Err("Partition formatting is only supported on Windows and Linux.".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Format partition task failed: {e}"))?
+}
+
+/// Creates a new partition on a non-system disk and optionally formats it.
+#[tauri::command]
+pub async fn create_partition(
+    disk_index: u32,
+    size_mb: Option<u64>,
+    file_system: Option<String>,
+    label: Option<String>,
+    drive_letter: Option<String>,
+    confirm_target: String,
+    sudo_password: Option<String>,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        validate_confirm_token(&format!("DISK-{disk_index}"), &confirm_target)?;
+        let disks = query_disks_sync()?;
+        let (disk, _) = find_disk_and_partition(&disks, disk_index, None)?;
+        ensure_non_system_disk(disk)?;
+
+        let clean_label = match label.as_deref() {
+            Some(l) if !l.trim().is_empty() => Some(validate_volume_label(l)?),
+            _ => None,
+        };
+
+        #[cfg(target_os = "windows")]
+        {
+            let _ = sudo_password;
+            let size_arg = match size_mb {
+                Some(mb) if mb > 0 => format!("-Size ({mb} * 1MB)"),
+                _ => "-UseMaximumSize".to_string(),
+            };
+            let letter_arg = match drive_letter.as_deref() {
+                Some(l) if !l.trim().is_empty() => {
+                    let ch = validate_drive_letter(l)?;
+                    format!("-DriveLetter '{ch}'")
+                }
+                _ => "-AssignDriveLetter".to_string(),
+            };
+            let format_stmt = match file_system.as_deref() {
+                Some(fs_raw) if !fs_raw.trim().is_empty() => {
+                    let fs = validate_filesystem_name(fs_raw, true)?;
+                    let label_arg = clean_label
+                        .as_ref()
+                        .map(|l| format!(" -NewFileSystemLabel '{l}'"))
+                        .unwrap_or_default();
+                    format!(" | Format-Volume -FileSystem {fs}{label_arg} -Confirm:$false -Force")
+                }
+                _ => String::new(),
+            };
+            let script = format!(
+                "New-Partition -DiskNumber {disk_index} {size_arg} {letter_arg}{format_stmt} | Out-Null; 'Created'"
+            );
+            run_powershell_disk_cmd(&script)?;
+            Ok(format!("Partition created on Disk {disk_index}."))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (drive_letter, clean_label);
+            let dev = disk
+                .device_path
+                .as_deref()
+                .ok_or_else(|| "Disk device path is unavailable.".to_string())?;
+            let end_spec = match size_mb {
+                Some(mb) if mb > 0 => format!("{mb}MiB"),
+                _ => "100%".to_string(),
+            };
+            let fs_hint = match file_system.as_deref() {
+                Some(fs_raw) if !fs_raw.trim().is_empty() => {
+                    Some(validate_filesystem_name(fs_raw, false)?)
+                }
+                _ => None,
+            };
+            let parted_fs = match fs_hint.as_deref() {
+                Some("vfat") => "fat32",
+                Some("swap") => "linux-swap",
+                Some("ntfs") => "ntfs",
+                _ => "ext4",
+            };
+            run_linux_disk_cmd(
+                "parted",
+                &["-s", dev, "mkpart", "primary", parted_fs, "1MiB", &end_spec],
+                sudo_password.as_deref(),
+            )?;
+            Ok(format!("Partition created on {dev}."))
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let _ = (size_mb, file_system, clean_label, drive_letter, sudo_password);
+            Err("Partition creation is only supported on Windows and Linux.".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Create partition task failed: {e}"))?
+}
+
+/// Deletes a non-system partition from a non-system disk.
+#[tauri::command]
+pub async fn delete_partition(
+    disk_index: u32,
+    partition_number: u32,
+    confirm_target: String,
+    sudo_password: Option<String>,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        validate_confirm_token(&format!("PART-{disk_index}-{partition_number}"), &confirm_target)?;
+        let disks = query_disks_sync()?;
+        let (disk, part) = find_disk_and_partition(&disks, disk_index, Some(partition_number))?;
+        let part = part.expect("partition_number was Some");
+        ensure_non_system_partition(disk, part)?;
+
+        #[cfg(target_os = "windows")]
+        {
+            let _ = sudo_password;
+            let script = format!(
+                "Remove-Partition -DiskNumber {disk_index} -PartitionNumber {partition_number} -Confirm:$false; 'Deleted'"
+            );
+            run_powershell_disk_cmd(&script)?;
+            Ok(format!(
+                "Partition {partition_number} deleted from Disk {disk_index}."
+            ))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let disk_dev = disk
+                .device_path
+                .as_deref()
+                .ok_or_else(|| "Disk device path is unavailable.".to_string())?;
+            if let Some(part_dev) = part.device_path.as_deref() {
+                linux_unmount_if_mounted(part_dev, sudo_password.as_deref());
+            }
+            let part_num_str = partition_number.to_string();
+            run_linux_disk_cmd(
+                "parted",
+                &["-s", disk_dev, "rm", &part_num_str],
+                sudo_password.as_deref(),
+            )?;
+            Ok(format!("Partition {partition_number} deleted from {disk_dev}."))
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let _ = sudo_password;
+            Err("Partition deletion is only supported on Windows and Linux.".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Delete partition task failed: {e}"))?
+}
+
+/// Resizes a non-system partition to `new_size_mb`.
+#[tauri::command]
+pub async fn resize_partition(
+    disk_index: u32,
+    partition_number: u32,
+    new_size_mb: u64,
+    confirm_target: String,
+    sudo_password: Option<String>,
+) -> Result<String, String> {
+    if new_size_mb < 16 {
+        return Err("New partition size must be at least 16 MB.".to_string());
+    }
+    tokio::task::spawn_blocking(move || {
+        validate_confirm_token(&format!("PART-{disk_index}-{partition_number}"), &confirm_target)?;
+        let disks = query_disks_sync()?;
+        let (disk, part) = find_disk_and_partition(&disks, disk_index, Some(partition_number))?;
+        let part = part.expect("partition_number was Some");
+        ensure_non_system_partition(disk, part)?;
+
+        #[cfg(target_os = "windows")]
+        {
+            let _ = sudo_password;
+            let script = format!(
+                "Resize-Partition -DiskNumber {disk_index} -PartitionNumber {partition_number} -Size ({new_size_mb} * 1MB); 'Resized'"
+            );
+            run_powershell_disk_cmd(&script)?;
+            Ok(format!(
+                "Partition {partition_number} on Disk {disk_index} resized to {new_size_mb} MB."
+            ))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let disk_dev = disk
+                .device_path
+                .as_deref()
+                .ok_or_else(|| "Disk device path is unavailable.".to_string())?;
+            let part_num_str = partition_number.to_string();
+            let end_mb = format!("{new_size_mb}MiB");
+            run_linux_disk_cmd(
+                "parted",
+                &["-s", disk_dev, "resizepart", &part_num_str, &end_mb],
+                sudo_password.as_deref(),
+            )?;
+            Ok(format!(
+                "Partition {partition_number} on {disk_dev} resized to {new_size_mb} MB."
+            ))
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let _ = sudo_password;
+            Err("Partition resizing is only supported on Windows and Linux.".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Resize partition task failed: {e}"))?
+}
+
+/// Initializes a non-system disk with GPT or MBR partition table.
+#[tauri::command]
+pub async fn initialize_disk(
+    disk_index: u32,
+    partition_style: String,
+    confirm_target: String,
+    sudo_password: Option<String>,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        validate_confirm_token(&format!("DISK-{disk_index}"), &confirm_target)?;
+        let style = validate_partition_style(&partition_style)?;
+        let disks = query_disks_sync()?;
+        let (disk, _) = find_disk_and_partition(&disks, disk_index, None)?;
+        ensure_non_system_disk(disk)?;
+
+        #[cfg(target_os = "windows")]
+        {
+            let _ = sudo_password;
+            let script = format!(
+                "Clear-Disk -Number {disk_index} -RemoveData -RemoveOEM -Confirm:$false -ErrorAction SilentlyContinue; \
+                 Initialize-Disk -Number {disk_index} -PartitionStyle {style}; 'Initialized'"
+            );
+            run_powershell_disk_cmd(&script)?;
+            Ok(format!("Disk {disk_index} initialized as {style}."))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let disk_dev = disk
+                .device_path
+                .as_deref()
+                .ok_or_else(|| "Disk device path is unavailable.".to_string())?;
+            let label = if style == "GPT" { "gpt" } else { "msdos" };
+            run_linux_disk_cmd(
+                "parted",
+                &["-s", disk_dev, "mklabel", label],
+                sudo_password.as_deref(),
+            )?;
+            Ok(format!("Disk {disk_dev} initialized as {style}."))
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let _ = sudo_password;
+            Err("Disk initialization is only supported on Windows and Linux.".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Initialize disk task failed: {e}"))?
+}
+
+fn stream_copy_with_progress<R: std::io::Read, W: std::io::Write>(
+    mut reader: R,
+    mut writer: W,
+    total_bytes: u64,
+    operation: &str,
+    stage: &str,
+    app: &tauri::AppHandle,
+) -> Result<u64, String> {
+    use tauri::Emitter;
+
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut processed: u64 = 0;
+    let mut last_emit: u64 = 0;
+
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                // Raw disk devices on Windows sometimes report EOF as ERROR_HANDLE_EOF or ERROR_SECTOR_NOT_FOUND near end.
+                if processed > 0 && processed >= total_bytes {
+                    break;
+                }
+                return Err(format!("Read error at {processed} bytes: {e}"));
+            }
+        };
+
+        let to_write = if total_bytes > 0 && processed + (n as u64) > total_bytes {
+            (total_bytes - processed) as usize
+        } else {
+            n
+        };
+        if to_write == 0 {
+            break;
+        }
+
+        writer
+            .write_all(&buf[..to_write])
+            .map_err(|e| format!("Write error at {processed} bytes: {e}"))?;
+        processed += to_write as u64;
+
+        if processed - last_emit >= 4 * 1024 * 1024 || (total_bytes > 0 && processed >= total_bytes)
+        {
+            last_emit = processed;
+            let pct = if total_bytes > 0 {
+                ((processed as f64 / total_bytes as f64) * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+            let _ = app.emit(
+                "disk-image-progress",
+                DiskImageProgress {
+                    operation: operation.to_string(),
+                    bytes_processed: processed,
+                    total_bytes,
+                    percent: pct,
+                    stage: stage.to_string(),
+                },
+            );
+        }
+
+        if total_bytes > 0 && processed >= total_bytes {
+            break;
+        }
+    }
+
+    writer
+        .flush()
+        .map_err(|e| format!("Failed to flush output stream: {e}"))?;
+    Ok(processed)
+}
+
+/// Creates a raw (.img) or Zstd-compressed (.img.zst) image of a disk or partition,
+/// optionally uploading it to a remote SFTP server.
+#[tauri::command]
+pub async fn create_disk_image(
+    app: tauri::AppHandle,
+    disk_index: u32,
+    partition_number: Option<u32>,
+    output_path: String,
+    compress_zstd: bool,
+    sftp_target: Option<SftpImageTarget>,
+) -> Result<DiskImageResult, String> {
+    tokio::task::spawn_blocking(move || {
+        let out_trimmed = output_path.trim().to_string();
+        if out_trimmed.is_empty() {
+            return Err("Output image path cannot be empty.".to_string());
+        }
+
+        let disks = query_disks_sync()?;
+        let (disk, part) = find_disk_and_partition(&disks, disk_index, partition_number)?;
+        let (source_path, total_bytes) = match part {
+            Some(p) => (
+                p.device_path
+                    .clone()
+                    .ok_or_else(|| format!("Partition {} has no raw device path.", p.number))?,
+                p.size_bytes,
+            ),
+            None => (
+                disk.device_path
+                    .clone()
+                    .ok_or_else(|| format!("Disk {} has no raw device path.", disk.index))?,
+                disk.size_bytes,
+            ),
+        };
+
+        let src_file = std::fs::File::open(&source_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                format!("Administrator/root privileges required to read {source_path}: {e}")
+            } else {
+                format!("Failed to open source device {source_path}: {e}")
+            }
+        })?;
+
+        let dst_file = std::fs::File::create(&out_trimmed)
+            .map_err(|e| format!("Failed to create image file '{out_trimmed}': {e}"))?;
+
+        let bytes_written = if compress_zstd {
+            let mut encoder = zstd::stream::Encoder::new(dst_file, 3)
+                .map_err(|e| format!("Failed to initialize Zstd encoder: {e}"))?;
+            let written = stream_copy_with_progress(
+                src_file,
+                &mut encoder,
+                total_bytes,
+                "create_image",
+                "Creating compressed disk image (.img.zst)...",
+                &app,
+            )?;
+            encoder
+                .finish()
+                .map_err(|e| format!("Failed to finalize Zstd image: {e}"))?;
+            written
+        } else {
+            stream_copy_with_progress(
+                src_file,
+                dst_file,
+                total_bytes,
+                "create_image",
+                "Creating raw disk image (.img)...",
+                &app,
+            )?
+        };
+
+        let mut final_dest = out_trimmed.clone();
+        if let Some(sftp_cfg) = sftp_target {
+            let options = super::sftp_file_system_operation_commands::resolve_ssh_profile(
+                &sftp_cfg.host,
+                sftp_cfg.port,
+                &sftp_cfg.username,
+                super::sftp_file_system_operation_commands::SshAuthOptions {
+                    auth_type: sftp_cfg.auth_type.clone(),
+                    private_key_path: sftp_cfg.private_key_path.clone(),
+                    certificate_path: sftp_cfg.certificate_path.clone(),
+                    compression_mode: Some("off".to_string()),
+                },
+            );
+            let pw = super::sftp_file_system_operation_commands::resolve_sftp_password(
+                &sftp_cfg.host,
+                sftp_cfg.port,
+                &sftp_cfg.username,
+                sftp_cfg.password.unwrap_or_default(),
+            )?
+            .as_str()
+            .to_string();
+            let sftp = super::sftp_file_system_operation_commands::connect_to_sftp_with_options(
+                sftp_cfg.host.clone(),
+                sftp_cfg.port,
+                sftp_cfg.username.clone(),
+                pw,
+                &options,
+            )?;
+            let local_img = std::fs::File::open(&out_trimmed)
+                .map_err(|e| format!("Failed to open created image for SFTP upload: {e}"))?;
+            let img_size = local_img.metadata().map(|m| m.len()).unwrap_or(0);
+            let remote_file = sftp
+                .create(std::path::Path::new(&sftp_cfg.remote_path))
+                .map_err(|e| {
+                    format!(
+                        "Failed to create remote SFTP file '{}': {e}",
+                        sftp_cfg.remote_path
+                    )
+                })?;
+            stream_copy_with_progress(
+                local_img,
+                remote_file,
+                img_size,
+                "upload_image",
+                "Uploading disk image over SFTP...",
+                &app,
+            )?;
+            final_dest = format!(
+                "sftp://{}:{}{}",
+                sftp_cfg.host, sftp_cfg.port, sftp_cfg.remote_path
+            );
+        }
+
+        Ok(DiskImageResult {
+            bytes_processed: bytes_written,
+            destination: final_dest,
+            compressed: compress_zstd,
+        })
+    })
+    .await
+    .map_err(|e| format!("Create disk image task failed: {e}"))?
+}
+
+/// Clones a disk/partition or restores an `.img` / `.img.zst` file onto a non-system target disk/partition.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn clone_or_restore_disk(
+    app: tauri::AppHandle,
+    source_kind: String,
+    source_disk_index: Option<u32>,
+    source_partition_number: Option<u32>,
+    source_image_path: Option<String>,
+    target_disk_index: u32,
+    target_partition_number: Option<u32>,
+    confirm_target: String,
+) -> Result<DiskImageResult, String> {
+    tokio::task::spawn_blocking(move || {
+        let expected_token = match target_partition_number {
+            Some(p) => format!("PART-{target_disk_index}-{p}"),
+            None => format!("DISK-{target_disk_index}"),
+        };
+        validate_confirm_token(&expected_token, &confirm_target)?;
+
+        let disks = query_disks_sync()?;
+        let (target_disk, target_part) =
+            find_disk_and_partition(&disks, target_disk_index, target_partition_number)?;
+        if let Some(tp) = target_part {
+            ensure_non_system_partition(target_disk, tp)?;
+        } else {
+            ensure_non_system_disk(target_disk)?;
+        }
+
+        let target_capacity = target_part.map(|p| p.size_bytes).unwrap_or(target_disk.size_bytes);
+        let target_dev = match target_part {
+            Some(p) => p
+                .device_path
+                .clone()
+                .ok_or_else(|| format!("Target partition {} has no raw device path.", p.number))?,
+            None => target_disk
+                .device_path
+                .clone()
+                .ok_or_else(|| format!("Target disk {} has no raw device path.", target_disk.index))?,
+        };
+
+        let dst_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target_dev)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    format!("Administrator/root privileges required to write to {target_dev}: {e}")
+                } else {
+                    format!("Failed to open target device {target_dev}: {e}")
+                }
+            })?;
+
+        let (bytes_written, compressed) = match source_kind.trim().to_ascii_lowercase().as_str() {
+            "disk" | "partition" => {
+                let s_disk_idx = source_disk_index
+                    .ok_or_else(|| "Source disk index is required.".to_string())?;
+                if s_disk_idx == target_disk_index && source_partition_number == target_partition_number {
+                    return Err("Source and target cannot be the same device.".to_string());
+                }
+                let (src_disk, src_part) =
+                    find_disk_and_partition(&disks, s_disk_idx, source_partition_number)?;
+                let (src_dev, src_size) = match src_part {
+                    Some(p) => (
+                        p.device_path
+                            .clone()
+                            .ok_or_else(|| "Source partition has no raw device path.".to_string())?,
+                        p.size_bytes,
+                    ),
+                    None => (
+                        src_disk
+                            .device_path
+                            .clone()
+                            .ok_or_else(|| "Source disk has no raw device path.".to_string())?,
+                        src_disk.size_bytes,
+                    ),
+                };
+                if src_size > target_capacity {
+                    return Err(format!(
+                        "Target capacity ({target_capacity} bytes) is smaller than source ({src_size} bytes)."
+                    ));
+                }
+                let src_file = std::fs::File::open(&src_dev)
+                    .map_err(|e| format!("Failed to open source device {src_dev}: {e}"))?;
+                let written = stream_copy_with_progress(
+                    src_file,
+                    dst_file,
+                    src_size,
+                    "clone",
+                    "Cloning raw blocks...",
+                    &app,
+                )?;
+                (written, false)
+            }
+            "image" => {
+                use std::io::{Read, Seek, SeekFrom};
+                let img_path = source_image_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "Source image path is required.".to_string())?;
+                let mut img_file = std::fs::File::open(img_path)
+                    .map_err(|e| format!("Failed to open image '{img_path}': {e}"))?;
+                let img_file_len = img_file.metadata().map(|m| m.len()).unwrap_or(0);
+                let mut magic = [0u8; 4];
+                let read_magic = img_file.read(&mut magic).unwrap_or(0);
+                img_file
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|e| format!("Failed to rewind image file: {e}"))?;
+
+                let is_zst = is_zstd_magic(&magic[..read_magic])
+                    || img_path.to_ascii_lowercase().ends_with(".zst");
+                if is_zst {
+                    let decoder = zstd::stream::Decoder::new(img_file)
+                        .map_err(|e| format!("Failed to initialize Zstd decoder: {e}"))?;
+                    let written = stream_copy_with_progress(
+                        decoder,
+                        dst_file,
+                        target_capacity,
+                        "restore_image",
+                        "Restoring compressed image (.img.zst)...",
+                        &app,
+                    )?;
+                    (written, true)
+                } else {
+                    if img_file_len > target_capacity {
+                        return Err(format!(
+                            "Image size ({img_file_len} bytes) exceeds target capacity ({target_capacity} bytes)."
+                        ));
+                    }
+                    let written = stream_copy_with_progress(
+                        img_file,
+                        dst_file,
+                        img_file_len,
+                        "restore_image",
+                        "Restoring raw image (.img)...",
+                        &app,
+                    )?;
+                    (written, false)
+                }
+            }
+            other => return Err(format!("Unsupported source_kind '{other}'.")),
+        };
+
+        Ok(DiskImageResult {
+            bytes_processed: bytes_written,
+            destination: target_dev,
+            compressed,
+        })
+    })
+    .await
+    .map_err(|e| format!("Clone/restore disk task failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -793,5 +1874,86 @@ mod tests {
             network_share_keyring_key(r"CORP\alice", r"\\filesrv\Public"),
             r"smb:CORP\alice@\\filesrv\Public"
         );
+    }
+
+    #[test]
+    fn test_disk_manager_validation_and_safety() {
+        assert!(validate_confirm_token("DISK-1", "DISK-1").is_ok());
+        assert!(validate_confirm_token("DISK-1", "DISK-0").is_err());
+
+        assert_eq!(validate_filesystem_name("ntfs", true).unwrap(), "NTFS");
+        assert_eq!(validate_filesystem_name("FAT32", true).unwrap(), "FAT32");
+        assert!(validate_filesystem_name("ext4", true).is_err());
+        assert_eq!(validate_filesystem_name("ext4", false).unwrap(), "ext4");
+        assert_eq!(validate_filesystem_name("FAT32", false).unwrap(), "vfat");
+        assert!(validate_filesystem_name("apfs", false).is_err());
+
+        assert_eq!(validate_volume_label("  BACKUP_01 ").unwrap(), "BACKUP_01");
+        assert!(validate_volume_label("bad'label").is_err());
+        assert!(validate_volume_label("bad;rm -rf").is_err());
+        assert!(validate_volume_label(&"A".repeat(33)).is_err());
+
+        assert_eq!(validate_partition_style("gpt").unwrap(), "GPT");
+        assert_eq!(validate_partition_style("MBR").unwrap(), "MBR");
+        assert!(validate_partition_style("APFS").is_err());
+
+        assert_eq!(validate_drive_letter("e:").unwrap(), 'E');
+        assert!(validate_drive_letter("C:").is_err());
+        assert!(validate_drive_letter("1:").is_err());
+
+        assert!(is_zstd_magic(&[0x28, 0xB5, 0x2F, 0xFD, 0x00]));
+        assert!(!is_zstd_magic(&[0x00, 0x00, 0x00, 0x00]));
+
+        let sys_part = PartitionInfo {
+            number: 1,
+            drive_letter: Some("C:".to_string()),
+            device_path: Some(r"\\.\C:".to_string()),
+            label: Some("OS".to_string()),
+            file_system: Some("NTFS".to_string()),
+            size_bytes: 100_000,
+            free_bytes: Some(50_000),
+            offset_bytes: 0,
+            partition_type: "Basic".to_string(),
+            is_system: true,
+        };
+        let sys_disk = PhysicalDiskInfo {
+            index: 0,
+            model: "NVMe".to_string(),
+            device_path: Some(r"\\.\PhysicalDrive0".to_string()),
+            bus_type: "NVMe".to_string(),
+            partition_style: "GPT".to_string(),
+            size_bytes: 100_000,
+            health_status: "Healthy".to_string(),
+            is_system: true,
+            partitions: vec![sys_part.clone()],
+        };
+        assert!(ensure_non_system_disk(&sys_disk).is_err());
+        assert!(ensure_non_system_partition(&sys_disk, &sys_part).is_err());
+
+        let data_part = PartitionInfo {
+            number: 1,
+            drive_letter: Some("E:".to_string()),
+            device_path: Some(r"\\.\E:".to_string()),
+            label: Some("USB".to_string()),
+            file_system: Some("exFAT".to_string()),
+            size_bytes: 64_000_000,
+            free_bytes: Some(60_000_000),
+            offset_bytes: 1024,
+            partition_type: "Basic".to_string(),
+            is_system: false,
+        };
+        let data_disk = PhysicalDiskInfo {
+            index: 2,
+            model: "USB Flash".to_string(),
+            device_path: Some(r"\\.\PhysicalDrive2".to_string()),
+            bus_type: "USB".to_string(),
+            partition_style: "GPT".to_string(),
+            size_bytes: 64_000_000,
+            health_status: "Healthy".to_string(),
+            is_system: false,
+            partitions: vec![data_part.clone()],
+        };
+        assert!(ensure_non_system_disk(&data_disk).is_ok());
+        assert!(ensure_non_system_partition(&data_disk, &data_part).is_ok());
     }
 }

@@ -5,6 +5,7 @@ import { useHistory } from '../../providers/HistoryProvider';
 import { formatFileSize } from '../../utils/formatters';
 import './thisPc.css';
 import {showConfirm, showError, showSuccess} from "../../utils/NotificationSystem.js";
+import DiskManagerModal from './DiskManagerModal';
 
 /**
  * ThisPCView component - Displays system information, user folders, and storage drives
@@ -23,6 +24,7 @@ const ThisPCView = () => {
     const [physicalDisks, setPhysicalDisks] = useState([]);
     const [disksLoading, setDisksLoading] = useState(false);
     const [disksError, setDisksError] = useState(null);
+    const [diskActionState, setDiskActionState] = useState(null);
     const ejectTimerRef = useRef(null);
 
     const loadPhysicalDisks = async () => {
@@ -473,8 +475,45 @@ const ThisPCView = () => {
                                                 </span>
                                             )}
                                         </div>
-                                        <div style={{ fontSize: '12px', opacity: 0.8 }}>
-                                            {disk.partition_style} • {disk.bus_type} • {formatFileSize(disk.size_bytes)} • {disk.health_status}
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                                            <span style={{ fontSize: '12px', opacity: 0.8, marginRight: '4px' }}>
+                                                {disk.partition_style} • {disk.bus_type} • {formatFileSize(disk.size_bytes)} • {disk.health_status}
+                                            </span>
+                                            <button
+                                                type="button"
+                                                disabled={disk.is_system}
+                                                onClick={() => setDiskActionState({ mode: 'create_partition', disk })}
+                                                title={disk.is_system ? 'Disabled on system disk' : 'Create new partition'}
+                                                style={{ padding: '3px 8px', fontSize: '11px', borderRadius: '4px', border: '1px solid var(--border, #2a2d32)', background: 'transparent', color: 'inherit', cursor: disk.is_system ? 'not-allowed' : 'pointer', opacity: disk.is_system ? 0.45 : 1 }}
+                                            >
+                                                + Partition
+                                            </button>
+                                            <button
+                                                type="button"
+                                                disabled={disk.is_system}
+                                                onClick={() => setDiskActionState({ mode: 'initialize_disk', disk })}
+                                                title={disk.is_system ? 'Disabled on system disk' : 'Initialize GPT / MBR'}
+                                                style={{ padding: '3px 8px', fontSize: '11px', borderRadius: '4px', border: '1px solid var(--border, #2a2d32)', background: 'transparent', color: 'inherit', cursor: disk.is_system ? 'not-allowed' : 'pointer', opacity: disk.is_system ? 0.45 : 1 }}
+                                            >
+                                                GPT/MBR
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => setDiskActionState({ mode: 'create_image', disk })}
+                                                title="Create .img or .img.zst image of this disk"
+                                                style={{ padding: '3px 8px', fontSize: '11px', borderRadius: '4px', border: '1px solid var(--border, #2a2d32)', background: 'transparent', color: 'inherit', cursor: 'pointer' }}
+                                            >
+                                                Image
+                                            </button>
+                                            <button
+                                                type="button"
+                                                disabled={disk.is_system}
+                                                onClick={() => setDiskActionState({ mode: 'clone_restore', disk })}
+                                                title={disk.is_system ? 'Disabled on system disk' : 'Clone disk/partition or restore image'}
+                                                style={{ padding: '3px 8px', fontSize: '11px', borderRadius: '4px', border: '1px solid var(--border, #2a2d32)', background: 'transparent', color: 'inherit', cursor: disk.is_system ? 'not-allowed' : 'pointer', opacity: disk.is_system ? 0.45 : 1 }}
+                                            >
+                                                Clone / Restore
+                                            </button>
                                         </div>
                                     </div>
 
@@ -499,39 +538,74 @@ const ThisPCView = () => {
                                                     const openPath = part.drive_letter && part.drive_letter.endsWith(':')
                                                         ? `${part.drive_letter}\\`
                                                         : part.drive_letter;
+                                                    const protectedPart = disk.is_system || part.is_system;
                                                     return (
-                                                        <button
+                                                        <div
                                                             key={part.number}
-                                                            type="button"
-                                                            disabled={!isMounted}
-                                                            onClick={() => {
-                                                                if (openPath) {
-                                                                    loadDirectory(openPath).then((ok) => {
-                                                                        if (ok) navigateTo(openPath);
-                                                                    });
-                                                                }
-                                                            }}
                                                             style={{
-                                                                textAlign: 'left',
-                                                                padding: '6px 10px',
+                                                                padding: '8px 10px',
                                                                 borderRadius: '6px',
                                                                 border: '1px solid var(--border, #2a2d32)',
-                                                                background: 'transparent',
-                                                                color: 'inherit',
-                                                                cursor: isMounted ? 'pointer' : 'default',
+                                                                background: 'rgba(255,255,255,0.02)',
                                                                 fontSize: '12px',
-                                                                opacity: isMounted ? 1 : 0.75
+                                                                display: 'flex',
+                                                                flexDirection: 'column',
+                                                                gap: '6px',
                                                             }}
                                                         >
-                                                            <div style={{ fontWeight: 600 }}>
-                                                                {part.drive_letter || `Part ${part.number}`}
-                                                                {part.label ? ` (${part.label})` : ''}
+                                                            <div
+                                                                onClick={() => {
+                                                                    if (isMounted && openPath) {
+                                                                        loadDirectory(openPath).then((ok) => {
+                                                                            if (ok) navigateTo(openPath);
+                                                                        });
+                                                                    }
+                                                                }}
+                                                                style={{ cursor: isMounted ? 'pointer' : 'default' }}
+                                                            >
+                                                                <div style={{ fontWeight: 600 }}>
+                                                                    {part.drive_letter || `Part ${part.number}`}
+                                                                    {part.label ? ` (${part.label})` : ''}
+                                                                </div>
+                                                                <div style={{ opacity: 0.75 }}>
+                                                                    {part.file_system || part.partition_type} • {formatFileSize(part.size_bytes)}
+                                                                    {typeof part.free_bytes === 'number' ? ` (${formatFileSize(part.free_bytes)} free)` : ''}
+                                                                </div>
                                                             </div>
-                                                            <div style={{ opacity: 0.75 }}>
-                                                                {part.file_system || part.partition_type} • {formatFileSize(part.size_bytes)}
-                                                                {typeof part.free_bytes === 'number' ? ` (${formatFileSize(part.free_bytes)} free)` : ''}
+                                                            <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                                                                <button
+                                                                    type="button"
+                                                                    disabled={protectedPart}
+                                                                    onClick={() => setDiskActionState({ mode: 'format', disk, partition: part })}
+                                                                    style={{ padding: '2px 6px', fontSize: '11px', borderRadius: '4px', border: '1px solid var(--border, #2a2d32)', background: 'transparent', color: 'inherit', cursor: protectedPart ? 'not-allowed' : 'pointer', opacity: protectedPart ? 0.45 : 1 }}
+                                                                >
+                                                                    Format
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    disabled={protectedPart}
+                                                                    onClick={() => setDiskActionState({ mode: 'resize_partition', disk, partition: part })}
+                                                                    style={{ padding: '2px 6px', fontSize: '11px', borderRadius: '4px', border: '1px solid var(--border, #2a2d32)', background: 'transparent', color: 'inherit', cursor: protectedPart ? 'not-allowed' : 'pointer', opacity: protectedPart ? 0.45 : 1 }}
+                                                                >
+                                                                    Resize
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    disabled={protectedPart}
+                                                                    onClick={() => setDiskActionState({ mode: 'delete_partition', disk, partition: part })}
+                                                                    style={{ padding: '2px 6px', fontSize: '11px', borderRadius: '4px', border: '1px solid var(--border, #2a2d32)', background: 'transparent', color: '#f87171', cursor: protectedPart ? 'not-allowed' : 'pointer', opacity: protectedPart ? 0.45 : 1 }}
+                                                                >
+                                                                    Delete
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => setDiskActionState({ mode: 'create_image', disk, partition: part })}
+                                                                    style={{ padding: '2px 6px', fontSize: '11px', borderRadius: '4px', border: '1px solid var(--border, #2a2d32)', background: 'transparent', color: 'inherit', cursor: 'pointer' }}
+                                                                >
+                                                                    Image
+                                                                </button>
                                                             </div>
-                                                        </button>
+                                                        </div>
                                                     );
                                                 })}
                                             </div>
@@ -573,6 +647,18 @@ const ThisPCView = () => {
                         )}
                     </div>
                 </div>
+            )}
+            {diskActionState && (
+                <DiskManagerModal
+                    actionState={diskActionState}
+                    disks={physicalDisks}
+                    isLinux={Boolean(systemInfo?.current_running_os?.toLowerCase().includes('linux'))}
+                    onClose={() => setDiskActionState(null)}
+                    onCompleted={() => {
+                        loadPhysicalDisks();
+                        loadVolumes();
+                    }}
+                />
             )}
         </div>
     );
