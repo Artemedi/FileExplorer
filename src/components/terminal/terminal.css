@@ -18,6 +18,15 @@
     border-top: 1px solid #333;
 }
 
+.enhanced-terminal.terminal-fullscreen {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh !important;
+    border-radius: 0;
+    z-index: 1500;
+}
+
 .terminal-header {
     display: flex;
     justify-content: space-between;

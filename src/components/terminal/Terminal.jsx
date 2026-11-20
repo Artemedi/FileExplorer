@@ -2,9 +2,11 @@ import React, { useState, useRef, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useHistory } from '../../providers/HistoryProvider';
+import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useSettings } from '../../providers/SettingsProvider';
 import { useSftp } from '../../providers/SftpProvider';
 import Icon from '../common/Icon';
+import XtermSshView from './XtermSshView';
 import { joinPath } from '../../utils/pathUtils';
 import './terminal.css';
 
@@ -102,6 +104,33 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
 const getSshTabId = (conn) =>
     `ssh:${conn.username || 'guest'}@${conn.host}:${conn.port || 22}`;
 
+const extractOscDirectory = (chunk) => {
+    if (!chunk || typeof chunk !== 'string') return null;
+    // OSC 7: \x1b]7;file://host/path\x07 or ST
+    const osc7 = chunk.match(/\x1b\]7;file:\/\/[^/\x07\x1b]*([^\x07\x1b]+)(?:\x07|\x1b\\)/g);
+    if (osc7 && osc7.length > 0) {
+        const last = osc7[osc7.length - 1];
+        const m = last.match(/\x1b\]7;file:\/\/[^/\x07\x1b]*([^\x07\x1b]+)/);
+        if (m?.[1]) {
+            try {
+                return decodeURIComponent(m[1]);
+            } catch {
+                return m[1];
+            }
+        }
+    }
+    // OSC 0 / 2 title: \x1b]0;user@host:/path\x07 (common on RHEL/CentOS/Ubuntu bashrc)
+    const oscTitle = chunk.match(/\x1b\][02];[^:\x07\x1b]+:(\/[^\x07\x1b]*|~[^\x07\x1b]*)(?:\x07|\x1b\\)/g);
+    if (oscTitle && oscTitle.length > 0) {
+        const last = oscTitle[oscTitle.length - 1];
+        const m = last.match(/\x1b\][02];[^:\x07\x1b]+:(\/[^\x07\x1b]*|~[^\x07\x1b]*)/);
+        if (m?.[1] && m[1].startsWith('/')) {
+            return m[1];
+        }
+    }
+    return null;
+};
+
 const parsePrompt = (promptStr = '') => {
     const atIdx = promptStr.indexOf('@');
     const colonIdx = promptStr.indexOf(':', atIdx + 1);
@@ -172,9 +201,17 @@ const resolveTerminalCdPath = (targetPath, basePath) => {
  */
 const Terminal = ({ isOpen, onToggle }) => {
     const { currentPath, navigateTo } = useHistory();
+    const { loadDirectory } = useFileSystem();
     const { settings } = useSettings();
-    const { isSftpPath, parseSftpPath, executeSshCommand, startSshPty } = useSftp();
+    const { isSftpPath, parseSftpPath, createSftpUrl, executeSshCommand, startSshPty } = useSftp();
     const parsedSftp = isSftpPath(currentPath) ? parseSftpPath(currentPath) : null;
+    const currentPathRef = useRef(currentPath);
+    currentPathRef.current = currentPath;
+
+    const [isFullscreen, setIsFullscreen] = useState(false);
+    const xtermControllersRef = useRef({});
+    const autoPtyAttemptedRef = useRef(new Set());
+    const syncingFromTerminalRef = useRef(false);
 
     const [terminalTabs, setTerminalTabs] = useState(() => ([
         {
@@ -184,6 +221,7 @@ const Terminal = ({ isOpen, onToggle }) => {
             sshConnection: null,
             sshWorkingDir: '.',
             ptySessionId: null,
+            ptyDisabledManually: false,
         },
     ]));
     const [activeTabId, setActiveTabId] = useState('local');
@@ -247,21 +285,56 @@ const Terminal = ({ isOpen, onToggle }) => {
                 unlistenOut = await listen('ssh-pty-output', (event) => {
                     const payload = event?.payload;
                     if (!active || !payload?.session_id) return;
-                    const cleaned = stripAnsiCodes(payload.data);
-                    if (!cleaned) return;
-                    setTerminalTabs((prev) =>
-                        prev.map((tab) =>
-                            tab.ptySessionId === payload.session_id
-                                ? {
-                                    ...tab,
-                                    history: [
-                                        ...tab.history,
-                                        { type: 'output', content: cleaned, timestamp: new Date().toLocaleTimeString() },
-                                    ],
+
+                    // Feed raw VT100 stream directly to xterm.js controller
+                    const ctrl = xtermControllersRef.current[payload.session_id];
+                    if (ctrl) {
+                        ctrl.write(payload.data);
+                    } else {
+                        const cleaned = stripAnsiCodes(payload.data);
+                        if (cleaned) {
+                            setTerminalTabs((prev) =>
+                                prev.map((tab) =>
+                                    tab.ptySessionId === payload.session_id
+                                        ? {
+                                            ...tab,
+                                            history: [
+                                                ...tab.history,
+                                                { type: 'output', content: cleaned, timestamp: new Date().toLocaleTimeString() },
+                                            ],
+                                        }
+                                        : tab
+                                )
+                            );
+                        }
+                    }
+
+                    // Follow directory changes emitted by remote shell (OSC 7 / OSC 0/2)
+                    const detectedDir = extractOscDirectory(payload.data);
+                    if (detectedDir && detectedDir.startsWith('/')) {
+                        const ownerTab = terminalTabsRef.current.find((t) => t.ptySessionId === payload.session_id);
+                        if (ownerTab && ownerTab.sshConnection && ownerTab.sshWorkingDir !== detectedDir) {
+                            updateTab(ownerTab.id, { sshWorkingDir: detectedDir });
+                            const cur = currentPathRef.current;
+                            if (isSftpPath(cur)) {
+                                const parsedCur = parseSftpPath(cur);
+                                if (parsedCur && getSshTabId(parsedCur.connection) === ownerTab.id) {
+                                    const nextSftpUrl = createSftpUrl(ownerTab.sshConnection, detectedDir);
+                                    if (nextSftpUrl !== cur) {
+                                        syncingFromTerminalRef.current = true;
+                                        loadDirectory(nextSftpUrl)
+                                            .then((ok) => {
+                                                if (ok) navigateTo(nextSftpUrl);
+                                            })
+                                            .catch(() => {})
+                                            .finally(() => {
+                                                setTimeout(() => { syncingFromTerminalRef.current = false; }, 100);
+                                            });
+                                    }
                                 }
-                                : tab
-                        )
-                    );
+                            }
+                        }
+                    }
                 });
                 unlistenExit = await listen('ssh-pty-exit', (event) => {
                     const payload = event?.payload;
@@ -326,6 +399,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                     sshConnection: conn,
                     sshWorkingDir: remoteDir || '.',
                     ptySessionId: null,
+                    ptyDisabledManually: false,
                 },
             ];
         });
@@ -344,12 +418,44 @@ const Terminal = ({ isOpen, onToggle }) => {
 
     // Automatically switch terminal tab when user switches active explorer window/path
     useEffect(() => {
+        if (syncingFromTerminalRef.current) return;
         if (parsedSftp?.connection) {
             ensureAndSelectSshTab(parsedSftp.connection, parsedSftp.remotePath || '.');
         } else if (activeTabIdRef.current.startsWith('ssh:')) {
             setActiveTabId('local');
         }
     }, [currentPath, parsedSftp?.connection?.host, parsedSftp?.connection?.username, parsedSftp?.connection?.port, parsedSftp?.remotePath]);
+
+    // Auto-start full interactive PTY by default whenever an SSH tab is active and terminal is open
+    useEffect(() => {
+        if (!isOpen || !activeTab?.sshConnection || activeTab?.ptySessionId || activeTab?.ptyDisabledManually) {
+            return;
+        }
+        if (autoPtyAttemptedRef.current.has(activeTab.id)) {
+            return;
+        }
+        autoPtyAttemptedRef.current.add(activeTab.id);
+
+        const targetTabId = activeTab.id;
+        const conn = activeTab.sshConnection;
+        const dir = activeTab.sshWorkingDir || '.';
+
+        startSshPty(conn, dir, 100, 30)
+            .then((sid) => {
+                if (sid) {
+                    setPtySessionId(sid, targetTabId);
+                }
+            })
+            .catch((e) => {
+                updateTab(targetTabId, (tab) => ({
+                    ...tab,
+                    history: [
+                        ...tab.history,
+                        { type: 'error', content: `Failed to auto-start SSH PTY: ${e}`, timestamp: new Date().toLocaleTimeString() },
+                    ],
+                }));
+            });
+    }, [isOpen, activeTab?.id, activeTab?.ptySessionId, activeTab?.ptyDisabledManually]);
 
     /**
      * Get terminal height from settings with fallback to default value
@@ -1428,11 +1534,17 @@ const Terminal = ({ isOpen, onToggle }) => {
     const [copiedFeedback, setCopiedFeedback] = useState(false);
 
     const handleClearTerminal = () => {
+        if (ptySessionId && xtermControllersRef.current[ptySessionId]) {
+            xtermControllersRef.current[ptySessionId].clear();
+        }
         setCommandHistory([]);
     };
 
     const handleCopyTerminal = async () => {
-        const formatted = commandHistory
+        const xtermText = ptySessionId && xtermControllersRef.current[ptySessionId]
+            ? xtermControllersRef.current[ptySessionId].getBufferText()
+            : '';
+        const formatted = xtermText || commandHistory
             .map((entry) => {
                 if (entry.type === 'command') {
                     return `${entry.prompt || '$'} ${entry.content || ''}`;
@@ -1460,8 +1572,8 @@ const Terminal = ({ isOpen, onToggle }) => {
 
     return (
         <div
-            className="enhanced-terminal"
-            style={{ height: `${terminalHeight}px` }}
+            className={`enhanced-terminal${isFullscreen ? ' terminal-fullscreen' : ''}`}
+            style={isFullscreen ? undefined : { height: `${terminalHeight}px` }}
             onKeyDown={handleTerminalKeyDown}
         >
             <div className="terminal-header">
@@ -1546,10 +1658,11 @@ const Terminal = ({ isOpen, onToggle }) => {
                                 const tabId = activeTab.id;
                                 if (ptySessionId) {
                                     await invoke('ssh_close_pty', { sessionId: ptySessionId }).catch(() => {});
-                                    setPtySessionId(null, tabId);
+                                    updateTab(tabId, { ptySessionId: null, ptyDisabledManually: true });
                                 } else {
                                     try {
-                                        const sid = await startSshPty(activeSshConnection, sshWorkingDir);
+                                        updateTab(tabId, { ptyDisabledManually: false });
+                                        const sid = await startSshPty(activeSshConnection, sshWorkingDir, 100, 30);
                                         setPtySessionId(sid, tabId);
                                     } catch (e) {
                                         setCommandHistory(prev => [
@@ -1581,6 +1694,14 @@ const Terminal = ({ isOpen, onToggle }) => {
                     >
                         {copiedFeedback ? 'Copied!' : 'Copy'}
                     </button>
+                    <button
+                        type="button"
+                        className="terminal-control"
+                        onClick={() => setIsFullscreen((prev) => !prev)}
+                        title={isFullscreen ? 'Restore terminal size' : 'Expand terminal to fullscreen'}
+                    >
+                        {isFullscreen ? 'Restore' : '⛶'}
+                    </button>
                     <button 
                         className="terminal-control terminal-clear"
                         onClick={handleClearTerminal}
@@ -1597,6 +1718,30 @@ const Terminal = ({ isOpen, onToggle }) => {
                     </button>
                 </div>
             </div>
+            {terminalTabs
+                .filter((tab) => Boolean(tab.ptySessionId))
+                .map((tab) => (
+                    <XtermSshView
+                        key={tab.ptySessionId}
+                        sessionId={tab.ptySessionId}
+                        isVisible={isOpen && tab.id === activeTab?.id}
+                        isFullscreen={isFullscreen}
+                        onData={(data) => {
+                            invoke('ssh_write_pty', { sessionId: tab.ptySessionId, data }).catch(() => {});
+                        }}
+                        onResize={(cols, rows) => {
+                            invoke('ssh_resize_pty', { sessionId: tab.ptySessionId, cols, rows }).catch(() => {});
+                        }}
+                        registerController={(sid, ctrl) => {
+                            if (ctrl) {
+                                xtermControllersRef.current[sid] = ctrl;
+                            } else {
+                                delete xtermControllersRef.current[sid];
+                            }
+                        }}
+                    />
+                ))}
+            {!ptySessionId && (
             <div className="terminal-content" ref={terminalRef}>
                 {commandHistory.map((entry, index) => (
                     <div
@@ -1688,6 +1833,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                     </div>
                 )}
             </div>
+            )}
         </div>
     );
 };
