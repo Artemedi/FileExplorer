@@ -25,7 +25,8 @@ const SidebarItem = ({
                          isActive = false,
                          onClick,
                          onContextMenu,
-                         actions = []
+                         actions = [],
+                         statusBadge = null
                      }) => {
     /**
      * Handle context menu
@@ -77,6 +78,32 @@ const SidebarItem = ({
                 <span className="sidebar-item-name">{name}</span>
                 {info && <span className="sidebar-item-info">{info}</span>}
             </div>
+
+            {statusBadge && !isCollapsed && (
+                <span
+                    title={statusBadge.title}
+                    style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        fontSize: '11px',
+                        marginRight: '4px',
+                        opacity: 0.9,
+                        whiteSpace: 'nowrap'
+                    }}
+                >
+                    <span
+                        style={{
+                            width: '7px',
+                            height: '7px',
+                            borderRadius: '50%',
+                            backgroundColor: statusBadge.color,
+                            display: 'inline-block'
+                        }}
+                    />
+                    <span>{statusBadge.label}</span>
+                </span>
+            )}
 
             {actions.length > 0 && !isCollapsed && (
                 <div className="sidebar-item-actions">

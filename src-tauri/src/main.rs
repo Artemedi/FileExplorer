@@ -53,6 +53,7 @@ fn all_commands() -> fn(Invoke) -> bool {
         volume_operations_commands::initialize_disk,
         volume_operations_commands::create_disk_image,
         volume_operations_commands::clone_or_restore_disk,
+        volume_operations_commands::check_network_endpoints,
         // Settings commands
         settings_commands::get_settings_as_json,
         settings_commands::update_settings_field,

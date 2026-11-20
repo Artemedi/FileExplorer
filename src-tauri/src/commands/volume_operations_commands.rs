@@ -1621,8 +1621,8 @@ pub async fn create_disk_image(
 }
 
 /// Clones a disk/partition or restores an `.img` / `.img.zst` file onto a non-system target disk/partition.
-#[tauri::command]
 #[allow(clippy::too_many_arguments)]
+#[tauri::command]
 pub async fn clone_or_restore_disk(
     app: tauri::AppHandle,
     source_kind: String,
@@ -1771,6 +1771,114 @@ pub async fn clone_or_restore_disk(
     })
     .await
     .map_err(|e| format!("Clone/restore disk task failed: {e}"))?
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NetworkEndpointTarget {
+    pub id: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub unc_path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NetworkEndpointStatus {
+    pub id: String,
+    pub reachable: bool,
+    pub latency_ms: Option<u64>,
+    pub status: String,
+}
+
+fn extract_unc_host(unc_path: &str) -> Option<String> {
+    let trimmed = unc_path.trim().replace('/', "\\");
+    let rest = trimmed.strip_prefix("\\\\")?;
+    let host = rest.split('\\').next()?.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+async fn probe_tcp_latency(host: &str, port: u16) -> Option<u64> {
+    let start = std::time::Instant::now();
+    let connect_fut = tokio::net::TcpStream::connect((host, port));
+    match tokio::time::timeout(std::time::Duration::from_millis(1500), connect_fut).await {
+        Ok(Ok(_stream)) => Some(start.elapsed().as_millis() as u64),
+        _ => None,
+    }
+}
+
+async fn check_single_endpoint(target: NetworkEndpointTarget) -> NetworkEndpointStatus {
+    if let Some(ref unc) = target.unc_path {
+        if let Some(host) = extract_unc_host(unc) {
+            if let Some(ms) = probe_tcp_latency(&host, 445).await {
+                return NetworkEndpointStatus {
+                    id: target.id,
+                    reachable: true,
+                    latency_ms: Some(ms),
+                    status: "online".to_string(),
+                };
+            }
+            if let Some(ms) = probe_tcp_latency(&host, 139).await {
+                return NetworkEndpointStatus {
+                    id: target.id,
+                    reachable: true,
+                    latency_ms: Some(ms),
+                    status: "online".to_string(),
+                };
+            }
+        }
+        return NetworkEndpointStatus {
+            id: target.id,
+            reachable: false,
+            latency_ms: None,
+            status: "offline".to_string(),
+        };
+    }
+
+    let host = target.host.trim();
+    if host.is_empty() {
+        return NetworkEndpointStatus {
+            id: target.id,
+            reachable: false,
+            latency_ms: None,
+            status: "offline".to_string(),
+        };
+    }
+    let port = target.port.unwrap_or(22);
+    match probe_tcp_latency(host, port).await {
+        Some(ms) => NetworkEndpointStatus {
+            id: target.id,
+            reachable: true,
+            latency_ms: Some(ms),
+            status: "online".to_string(),
+        },
+        None => NetworkEndpointStatus {
+            id: target.id,
+            reachable: false,
+            latency_ms: None,
+            status: "offline".to_string(),
+        },
+    }
+}
+
+/// Checks reachability and TCP latency (ms) for SFTP and SMB/UNC network endpoints in parallel.
+#[tauri::command]
+pub async fn check_network_endpoints(
+    targets: Vec<NetworkEndpointTarget>,
+) -> Result<Vec<NetworkEndpointStatus>, String> {
+    let mut set = tokio::task::JoinSet::new();
+    for target in targets {
+        set.spawn(check_single_endpoint(target));
+    }
+    let mut results = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(status) = res {
+            results.push(status);
+        }
+    }
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -1955,5 +2063,18 @@ mod tests {
         };
         assert!(ensure_non_system_disk(&data_disk).is_ok());
         assert!(ensure_non_system_partition(&data_disk, &data_part).is_ok());
+    }
+
+    #[test]
+    fn test_extract_unc_host_and_endpoint_check() {
+        assert_eq!(
+            extract_unc_host(r"\\devops_storage\Storage\AKUZ\updates\").as_deref(),
+            Some("devops_storage")
+        );
+        assert_eq!(
+            extract_unc_host("//filesrv.corp.local/Public").as_deref(),
+            Some("filesrv.corp.local")
+        );
+        assert_eq!(extract_unc_host("C:\\local\\path"), None);
     }
 }

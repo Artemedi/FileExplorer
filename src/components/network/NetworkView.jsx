@@ -7,6 +7,7 @@ import { showSuccess, showError, showConfirm } from '../../utils/NotificationSys
 import AddSftpConnectionView from '../sidebar/AddSftpConnectionView';
 import Modal from '../common/Modal';
 import Button from '../common/Button';
+import { useNetworkHealth, getHealthDisplay } from '../../hooks/useNetworkHealth';
 import './networkView.css';
 
 const NETWORK_SHARES_STORAGE_KEY = 'fileExplorerNetworkShares';
@@ -37,6 +38,22 @@ const NetworkView = () => {
     const [shareRemember, setShareRemember] = useState(true);
     const [shareConnecting, setShareConnecting] = useState(false);
     const [shareError, setShareError] = useState(null);
+
+    const networkTargets = [
+        ...networkShares.map((s) => ({
+            id: `smb:${s.path}`,
+            host: '',
+            port: null,
+            unc_path: s.path
+        })),
+        ...localSftpConnections.map((c) => ({
+            id: `sftp:${c.name}`,
+            host: c.host,
+            port: Number(c.port || 22),
+            unc_path: null
+        }))
+    ];
+    const { statusesById: endpointHealthById } = useNetworkHealth(networkTargets);
 
     // Load SFTP connections
     useEffect(() => {
@@ -266,13 +283,24 @@ const NetworkView = () => {
                             </button>
                         </div>
                     ) : (
-                        networkShares.map((share) => (
+                        networkShares.map((share) => {
+                            const health = getHealthDisplay(endpointHealthById[`smb:${share.path}`]);
+                            return (
                             <div key={share.path} className="connection-card">
                                 <div className="connection-icon">
                                     <span className="icon icon-folder"></span>
                                 </div>
                                 <div className="connection-details">
-                                    <h4 className="connection-name">{share.name}</h4>
+                                    <h4 className="connection-name" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                        <span>{share.name}</span>
+                                        <span
+                                            title={health.title}
+                                            style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '11px', fontWeight: 500, opacity: 0.9 }}
+                                        >
+                                            <span style={{ width: '7px', height: '7px', borderRadius: '50%', backgroundColor: health.color, display: 'inline-block' }} />
+                                            <span>{health.label}</span>
+                                        </span>
+                                    </h4>
                                     <p className="connection-address">
                                         {share.path}
                                         {share.username ? ` · ${share.username}` : ''}
@@ -297,7 +325,8 @@ const NetworkView = () => {
                                     </button>
                                 </div>
                             </div>
-                        ))
+                            );
+                        })
                     )}
                 </div>
             </div>
@@ -332,13 +361,24 @@ const NetworkView = () => {
                             </button>
                         </div>
                     ) : (
-                        localSftpConnections.map((connection) => (
+                        localSftpConnections.map((connection) => {
+                            const health = getHealthDisplay(endpointHealthById[`sftp:${connection.name}`]);
+                            return (
                             <div key={connection.name} className="connection-card">
                                 <div className="connection-icon">
                                     <span className="icon icon-network"></span>
                                 </div>
                                 <div className="connection-details">
-                                    <h4 className="connection-name">{connection.name}</h4>
+                                    <h4 className="connection-name" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                        <span>{connection.name}</span>
+                                        <span
+                                            title={health.title}
+                                            style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '11px', fontWeight: 500, opacity: 0.9 }}
+                                        >
+                                            <span style={{ width: '7px', height: '7px', borderRadius: '50%', backgroundColor: health.color, display: 'inline-block' }} />
+                                            <span>{health.label}</span>
+                                        </span>
+                                    </h4>
                                     <p className="connection-address">
                                         {connection.username || 'guest'}@{connection.host}:{connection.port}
                                         {connection.authType ? ` · ${connection.authType}` : ''}
@@ -371,7 +411,8 @@ const NetworkView = () => {
                                     </button>
                                 </div>
                             </div>
-                        ))
+                            );
+                        })
                     )}
                 </div>
             </div>

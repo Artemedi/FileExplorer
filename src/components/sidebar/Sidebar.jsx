@@ -14,6 +14,7 @@ import {open} from '@tauri-apps/plugin-dialog';
 import './sidebar.css';
 import {showConfirm, showError, showSuccess} from "../../utils/NotificationSystem.js";
 import {useTranslation} from '../../i18n';
+import {useNetworkHealth, getHealthDisplay} from '../../hooks/useNetworkHealth';
 
 /**
  * Sidebar component - Provides navigation, favorites, and quick access
@@ -48,6 +49,14 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
     // SFTP Connections state
     const [sftpConnections, setSftpConnections] = useState([]);
     const [isAddSftpModalOpen, setIsAddSftpModalOpen] = useState(false);
+    const { statusesById: sftpHealthById } = useNetworkHealth(
+        sftpConnections.map((conn) => ({
+            id: `sftp:${conn.name}`,
+            host: conn.host,
+            port: Number(conn.port || 22),
+            unc_path: null
+        }))
+    );
     
     // Permission helper state
     const [isPermissionHelperOpen, setIsPermissionHelperOpen] = useState(false);
@@ -675,6 +684,7 @@ const Sidebar = ({ onTerminalToggle, isTerminalOpen, currentView }) => {
                                             icon="network"
                                             name={conn.name}
                                             path={`sftp://${conn.username}@${conn.host}:${conn.port}`}
+                                            statusBadge={getHealthDisplay(sftpHealthById[`sftp:${conn.name}`])}
                                             isActive={
                                                 currentView === 'explorer' &&
                                                 isSftpPath(currentPath) &&
