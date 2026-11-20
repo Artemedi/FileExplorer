@@ -5,8 +5,8 @@ import '@xterm/xterm/css/xterm.css';
 
 /**
  * Real VT100 / xterm-256color terminal emulator view for interactive SSH PTY sessions.
- * Supports full-screen TUI apps (mc, htop, vim), hidden password prompts (sudo),
- * mouse selection, and automatic resize fitting.
+ * Uses a zero-padding inner mount element inside a flex-1 wrapper so FitAddon calculates
+ * exact cols/rows for TUI apps (mc, htop, vim) without line-wrapping artifacts.
  */
 const XtermSshView = ({
     sessionId,
@@ -16,30 +16,34 @@ const XtermSshView = ({
     onResize,
     registerController,
 }) => {
-    const containerRef = useRef(null);
+    const mountRef = useRef(null);
     const termRef = useRef(null);
     const fitAddonRef = useRef(null);
     const onDataRef = useRef(onData);
     const onResizeRef = useRef(onResize);
+    const writeQueueRef = useRef(Promise.resolve());
     onDataRef.current = onData;
     onResizeRef.current = onResize;
 
     useEffect(() => {
-        const container = containerRef.current;
-        if (!container) return undefined;
+        const mountEl = mountRef.current;
+        if (!mountEl) return undefined;
 
         let term = null;
         let fitAddon = null;
         let resizeObserver = null;
         let dataDisposable = null;
+        let lastCols = 0;
+        let lastRows = 0;
 
         try {
             term = new XTerm({
                 cursorBlink: true,
                 convertEol: false,
-                fontFamily: "'Cascadia Code', 'Fira Code', 'Consolas', 'Courier New', monospace",
+                fontFamily: "'Consolas', 'Courier New', monospace",
                 fontSize: 13,
-                lineHeight: 1.25,
+                lineHeight: 1.0,
+                letterSpacing: 0,
                 scrollback: 5000,
                 theme: {
                     background: '#14161a',
@@ -50,30 +54,39 @@ const XtermSshView = ({
             });
             fitAddon = new FitAddon();
             term.loadAddon(fitAddon);
-            term.open(container);
+            term.open(mountEl);
 
             termRef.current = term;
             fitAddonRef.current = fitAddon;
 
             const safeFit = () => {
-                if (!fitAddonRef.current || !termRef.current) return;
+                if (!fitAddonRef.current || !termRef.current || !mountRef.current) return;
+                if (mountRef.current.clientWidth < 20 || mountRef.current.clientHeight < 20) return;
                 try {
                     fitAddonRef.current.fit();
-                    if (termRef.current.cols > 0 && termRef.current.rows > 0) {
-                        onResizeRef.current?.(termRef.current.cols, termRef.current.rows);
+                    const { cols, rows } = termRef.current;
+                    if (cols > 0 && rows > 0 && (cols !== lastCols || rows !== lastRows)) {
+                        lastCols = cols;
+                        lastRows = rows;
+                        onResizeRef.current?.(cols, rows);
                     }
                 } catch {
-                    // Ignore fit errors when container has 0 dimensions
+                    // Ignore fit errors when container is hidden
                 }
             };
 
-            requestAnimationFrame(safeFit);
-
-            dataDisposable = term.onData((data) => {
-                onDataRef.current?.(data);
+            requestAnimationFrame(() => {
+                safeFit();
+                setTimeout(safeFit, 80);
             });
 
-            // Support Ctrl+Shift+C (and Ctrl+C when text is selected) to copy
+            // Serialize PTY writes to preserve strict keystroke ordering across async IPC
+            dataDisposable = term.onData((data) => {
+                writeQueueRef.current = writeQueueRef.current
+                    .then(() => onDataRef.current?.(data))
+                    .catch(() => {});
+            });
+
             term.attachCustomKeyEventHandler((ev) => {
                 if (ev.type === 'keydown' && ev.ctrlKey && ev.shiftKey && ev.key.toLowerCase() === 'c') {
                     const sel = term.getSelection();
@@ -95,7 +108,7 @@ const XtermSshView = ({
                 resizeObserver = new ResizeObserver(() => {
                     safeFit();
                 });
-                resizeObserver.observe(container);
+                resizeObserver.observe(mountEl);
             }
 
             registerController?.(sessionId, {
@@ -118,7 +131,6 @@ const XtermSshView = ({
                         const line = buf.getLine(i);
                         if (line) lines.push(line.translateToString(true));
                     }
-                    // Trim trailing empty lines
                     while (lines.length > 0 && lines[lines.length - 1] === '') {
                         lines.pop();
                     }
@@ -140,8 +152,8 @@ const XtermSshView = ({
     }, [sessionId]);
 
     useEffect(() => {
-        if (!isVisible) return;
-        const id = requestAnimationFrame(() => {
+        if (!isVisible) return undefined;
+        const fitNow = () => {
             try {
                 fitAddonRef.current?.fit();
                 if (termRef.current && termRef.current.cols > 0 && termRef.current.rows > 0) {
@@ -151,24 +163,41 @@ const XtermSshView = ({
             } catch {
                 // ignore
             }
-        });
-        return () => cancelAnimationFrame(id);
+        };
+        const id = requestAnimationFrame(fitNow);
+        const t = setTimeout(fitNow, 80);
+        return () => {
+            cancelAnimationFrame(id);
+            clearTimeout(t);
+        };
     }, [isVisible, isFullscreen]);
 
     return (
         <div
-            ref={containerRef}
-            className="xterm-ssh-container"
+            className="xterm-ssh-wrapper"
             style={{
+                flex: 1,
+                minHeight: 0,
                 width: '100%',
-                height: '100%',
-                display: isVisible ? 'block' : 'none',
-                padding: '6px 8px',
+                display: isVisible ? 'flex' : 'none',
+                padding: '4px 6px',
                 boxSizing: 'border-box',
                 backgroundColor: '#14161a',
                 overflow: 'hidden',
             }}
-        />
+        >
+            <div
+                ref={mountRef}
+                className="xterm-ssh-container"
+                style={{
+                    width: '100%',
+                    height: '100%',
+                    padding: 0,
+                    margin: 0,
+                    overflow: 'hidden',
+                }}
+            />
+        </div>
     );
 };
 

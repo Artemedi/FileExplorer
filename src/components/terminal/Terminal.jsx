@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useHistory } from '../../providers/HistoryProvider';
@@ -1400,6 +1401,9 @@ const Terminal = ({ isOpen, onToggle }) => {
     };
 
     const handleTerminalKeyDown = (e) => {
+        if (ptySessionIdRef.current) {
+            return;
+        }
         if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
             const selectedText = window.getSelection?.()?.toString() || '';
             if (selectedText) {
@@ -1570,7 +1574,7 @@ const Terminal = ({ isOpen, onToggle }) => {
         }
     };
 
-    return (
+    const terminalElement = (
         <div
             className={`enhanced-terminal${isFullscreen ? ' terminal-fullscreen' : ''}`}
             style={isFullscreen ? undefined : { height: `${terminalHeight}px` }}
@@ -1836,6 +1840,11 @@ const Terminal = ({ isOpen, onToggle }) => {
             )}
         </div>
     );
+
+    if (isFullscreen && typeof document !== 'undefined') {
+        return createPortal(terminalElement, document.body);
+    }
+    return terminalElement;
 };
 
 export default Terminal;
