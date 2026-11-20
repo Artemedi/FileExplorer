@@ -7,6 +7,7 @@ pub mod preview_commands;
 pub mod search_engine_commands;
 pub mod settings_commands;
 pub mod sftp_file_system_operation_commands;
+pub mod ssh_commands;
 pub mod system_integration_commands;
 pub mod template_commands;
 pub mod volume_operations_commands;

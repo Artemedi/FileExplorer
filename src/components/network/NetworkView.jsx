@@ -164,7 +164,8 @@ const NetworkView = () => {
                                 <div className="connection-details">
                                     <h4 className="connection-name">{connection.name}</h4>
                                     <p className="connection-address">
-                                        {connection.username}@{connection.host}:{connection.port}
+                                        {connection.username || 'guest'}@{connection.host}:{connection.port}
+                                        {connection.authType ? ` · ${connection.authType}` : ''}
                                     </p>
                                 </div>
                                 <div className="connection-actions">
@@ -175,6 +176,14 @@ const NetworkView = () => {
                                     >
                                         <span className="icon icon-play"></span>
                                         Connect
+                                    </button>
+                                    <button
+                                        className="connect-button"
+                                        onClick={() => window.dispatchEvent(new CustomEvent('open-ssh-terminal', { detail: { connection } }))}
+                                        title="Open SSH terminal for this server"
+                                    >
+                                        <span className="icon icon-terminal"></span>
+                                        SSH
                                     </button>
                                     <button
                                         className="remove-connection-button"

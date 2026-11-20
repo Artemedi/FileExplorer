@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { showConfirm, showError, showSuccess } from '../utils/NotificationSystem';
+import { showConfirm, showError, showPasswordPrompt, showSuccess } from '../utils/NotificationSystem';
 
 const SFTP_CONNECTIONS_STORAGE_KEY = 'fileExplorerSftpConnections';
 const HOST_KEY_UNTRUSTED_PREFIX = 'HOST_KEY_UNTRUSTED:';
@@ -23,7 +23,10 @@ const SftpContext = createContext({
     navigateToSftpConnection: () => {},
     disconnectSftp: () => {},
     createSftpUrl: () => null,
-    createSftpPath: () => null
+    createSftpPath: () => null,
+    executeSshCommand: async () => null,
+    runSshSudoOperation: async () => false,
+    startSshPty: async () => null
 });
 
 export const useSftp = () => useContext(SftpContext);
@@ -143,6 +146,23 @@ export default function SftpProvider({ children }) {
                 pendingMigrationRef.current = pendingMigrationRef.current.then(() => migrationJob);
             }
 
+            // Sync SSH auth/compression profiles to Rust backend
+            for (const conn of sanitized) {
+                if (!conn?.host) continue;
+                const connectionKey = buildSftpConnectionKey(conn);
+                if (conn.authType || conn.privateKeyPath || conn.certificatePath || conn.compressionMode) {
+                    Promise.resolve(
+                        invoke('store_ssh_profile', {
+                            connectionKey,
+                            authType: conn.authType || null,
+                            privateKeyPath: conn.privateKeyPath || null,
+                            certificatePath: conn.certificatePath || null,
+                            compressionMode: conn.compressionMode || null
+                        })
+                    ).catch(() => {});
+                }
+            }
+
             return sanitized;
         } catch (err) {
             console.error('Failed to load SFTP connections:', getErrorMessage(err));
@@ -182,6 +202,17 @@ export default function SftpProvider({ children }) {
             port: portNum,
             username: connection.username || '',
             password: connection.password || '',
+            ...(command === 'load_dir' && (
+                connection.authType ||
+                connection.privateKeyPath ||
+                connection.certificatePath ||
+                connection.compressionMode
+            ) ? {
+                authType: connection.authType || null,
+                privateKeyPath: connection.privateKeyPath || null,
+                certificatePath: connection.certificatePath || null,
+                compressionMode: connection.compressionMode || null
+            } : {}),
             ...extraArgs
         };
 
@@ -408,40 +439,108 @@ export default function SftpProvider({ children }) {
         }
     }, [parseSftpPath, navigateToSftpConnection]);
 
+    const isPermissionDeniedError = (err) => {
+        const msg = getErrorMessage(err).toLowerCase();
+        return msg.includes('permission denied') || msg.includes('eacces') || msg.includes('operation not permitted');
+    };
+
+    const runSshSudoOperation = useCallback(async (connection, operation, remotePath, targetPath = null, content = null) => {
+        if (!connection?.host) return false;
+        const sudoPassword = await showPasswordPrompt(
+            `Permission denied for "${remotePath}".\nEnter sudo password to run "${operation}" on ${connection.host}:`,
+            'Elevated SSH Operation (sudo)'
+        );
+        if (!sudoPassword) return false;
+
+        try {
+            await invokeSftp('ssh_sudo_exec', connection, {
+                sudoPassword,
+                operation,
+                path: remotePath,
+                targetPath,
+                content,
+                authType: connection.authType || null,
+                privateKeyPath: connection.privateKeyPath || null,
+                certificatePath: connection.certificatePath || null,
+                compressionMode: connection.compressionMode || null
+            });
+            return true;
+        } catch (sudoErr) {
+            showError(`sudo ${operation} failed: ${getErrorMessage(sudoErr)}`);
+            return false;
+        }
+    }, [invokeSftp]);
+
+    const executeSshCommand = useCallback(async (connection, command, workingDir = null) => {
+        const raw = await invokeSftp('ssh_execute_command', connection, {
+            command,
+            workingDir,
+            authType: connection.authType || null,
+            privateKeyPath: connection.privateKeyPath || null,
+            certificatePath: connection.certificatePath || null,
+            compressionMode: connection.compressionMode || null
+        });
+        return typeof raw === 'string' ? JSON.parse(raw) : raw;
+    }, [invokeSftp]);
+
+    const startSshPty = useCallback(async (connection, workingDir = '.') => {
+        return await invokeSftp('ssh_start_pty', connection, {
+            workingDir,
+            authType: connection.authType || null,
+            privateKeyPath: connection.privateKeyPath || null,
+            certificatePath: connection.certificatePath || null,
+            compressionMode: connection.compressionMode || null
+        });
+    }, [invokeSftp]);
+
     // SFTP file operations
     const createSftpFile = useCallback(async (sftpPath, fileName) => {
         const parsed = parseSftpPath(sftpPath);
         if (!parsed || !parsed.connection) return false;
 
+        const filePath = `${parsed.remotePath}/${fileName}`.replace(/\/+/g, '/');
         try {
-            const filePath = `${parsed.remotePath}/${fileName}`.replace(/\/+/g, '/');
             await invokeSftp('create_file_sftp', parsed.connection, { filePath });
             showSuccess(`File "${fileName}" created successfully`);
             return true;
         } catch (error) {
+            if (isPermissionDeniedError(error)) {
+                const elevated = await runSshSudoOperation(parsed.connection, 'create_file', filePath);
+                if (elevated) {
+                    showSuccess(`File "${fileName}" created with sudo`);
+                    return true;
+                }
+            }
             const errMsg = getErrorMessage(error);
             console.error('Failed to create SFTP file:', errMsg);
             showError(`Failed to create file: ${errMsg}`);
             return false;
         }
-    }, [parseSftpPath, invokeSftp]);
+    }, [parseSftpPath, invokeSftp, runSshSudoOperation]);
 
     const createSftpDirectory = useCallback(async (sftpPath, dirName) => {
         const parsed = parseSftpPath(sftpPath);
         if (!parsed || !parsed.connection) return false;
 
+        const directoryPath = `${parsed.remotePath}/${dirName}`.replace(/\/+/g, '/');
         try {
-            const directoryPath = `${parsed.remotePath}/${dirName}`.replace(/\/+/g, '/');
             await invokeSftp('create_directory_sftp', parsed.connection, { directoryPath });
             showSuccess(`Directory "${dirName}" created successfully`);
             return true;
         } catch (error) {
+            if (isPermissionDeniedError(error)) {
+                const elevated = await runSshSudoOperation(parsed.connection, 'mkdir', directoryPath);
+                if (elevated) {
+                    showSuccess(`Directory "${dirName}" created with sudo`);
+                    return true;
+                }
+            }
             const errMsg = getErrorMessage(error);
             console.error('Failed to create SFTP directory:', errMsg);
             showError(`Failed to create directory: ${errMsg}`);
             return false;
         }
-    }, [parseSftpPath, invokeSftp]);
+    }, [parseSftpPath, invokeSftp, runSshSudoOperation]);
 
     const deleteSftpItem = useCallback(async (sftpPath, isDirectory) => {
         const parsed = parseSftpPath(sftpPath);
@@ -470,23 +569,35 @@ export default function SftpProvider({ children }) {
                 return true;
             }
         } catch (error) {
+            if (
+                isPermissionDeniedError(error) &&
+                parsed.remotePath !== '/' &&
+                parsed.remotePath !== '.'
+            ) {
+                const op = isDirectory === false ? 'delete_file' : 'delete_dir';
+                const elevated = await runSshSudoOperation(parsed.connection, op, parsed.remotePath);
+                if (elevated) {
+                    showSuccess('Item deleted with sudo');
+                    return true;
+                }
+            }
             const errMsg = getErrorMessage(error);
             console.error('Failed to delete SFTP item:', errMsg);
             showError(`Failed to delete item: ${errMsg}`);
             return false;
         }
-    }, [parseSftpPath, invokeSftp]);
+    }, [parseSftpPath, invokeSftp, runSshSudoOperation]);
 
     const renameSftpItem = useCallback(async (sftpPath, newName, isDirectory) => {
         const parsed = parseSftpPath(sftpPath);
         if (!parsed || !parsed.connection) return false;
 
-        try {
-            const normalizedRemote = normalizeSftpEntryPath(parsed.remotePath);
-            const pathParts = normalizedRemote.split('/');
-            pathParts[pathParts.length - 1] = newName;
-            const newPath = pathParts.join('/');
+        const normalizedRemote = normalizeSftpEntryPath(parsed.remotePath);
+        const pathParts = normalizedRemote.split('/');
+        pathParts[pathParts.length - 1] = newName;
+        const newPath = pathParts.join('/');
 
+        try {
             if (isDirectory === true) {
                 await invokeSftp('rename_directory_sftp', parsed.connection, {
                     oldPath: parsed.remotePath,
@@ -515,12 +626,19 @@ export default function SftpProvider({ children }) {
             showSuccess(`Item renamed to "${newName}" successfully`);
             return true;
         } catch (error) {
+            if (isPermissionDeniedError(error)) {
+                const elevated = await runSshSudoOperation(parsed.connection, 'rename', parsed.remotePath, newPath);
+                if (elevated) {
+                    showSuccess(`Item renamed to "${newName}" with sudo`);
+                    return true;
+                }
+            }
             const errMsg = getErrorMessage(error);
             console.error('Failed to rename SFTP item:', errMsg);
             showError(`Failed to rename item: ${errMsg}`);
             return false;
         }
-    }, [parseSftpPath, invokeSftp]);
+    }, [parseSftpPath, invokeSftp, runSshSudoOperation]);
 
     const copySftpItem = useCallback(async (sftpPath, targetPath, isDirectory) => {
         const sourceParsed = parseSftpPath(sftpPath);
@@ -674,7 +792,10 @@ export default function SftpProvider({ children }) {
         navigateToSftpConnection,
         disconnectSftp,
         createSftpUrl,
-        createSftpPath
+        createSftpPath,
+        executeSshCommand,
+        runSshSudoOperation,
+        startSshPty
     };
 
     return (

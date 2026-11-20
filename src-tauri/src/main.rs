@@ -11,8 +11,8 @@ mod state;
 use crate::commands::{
     command_exec_commands, file_system_operation_commands, hash_commands, meta_data_commands,
     permission_commands, preview_commands, search_engine_commands, settings_commands,
-    sftp_file_system_operation_commands, system_integration_commands, template_commands,
-    volume_operations_commands, watcher_commands,
+    sftp_file_system_operation_commands, ssh_commands, system_integration_commands,
+    template_commands, volume_operations_commands, watcher_commands,
 };
 use std::path::{Component, Path, PathBuf};
 use tauri::ipc::Invoke;
@@ -94,6 +94,15 @@ fn all_commands() -> fn(Invoke) -> bool {
         sftp_file_system_operation_commands::remove_sftp_credentials,
         sftp_file_system_operation_commands::has_sftp_credentials,
         sftp_file_system_operation_commands::trust_sftp_host_key,
+        sftp_file_system_operation_commands::store_ssh_profile,
+        // SSH terminal, sudo, and compression commands
+        ssh_commands::ssh_execute_command,
+        ssh_commands::ssh_sudo_exec,
+        ssh_commands::ssh_probe_zstd,
+        ssh_commands::ssh_start_pty,
+        ssh_commands::ssh_write_pty,
+        ssh_commands::ssh_resize_pty,
+        ssh_commands::ssh_close_pty,
         // Permission commands
         permission_commands::request_full_disk_access,
         permission_commands::check_directory_access,

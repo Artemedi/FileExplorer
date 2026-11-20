@@ -249,3 +249,139 @@ export const showConfirm = (message, title = 'Confirm') => {
         confirmBtn.focus();
     });
 };
+
+// Masked password prompt dialog (used for per-operation sudo elevation)
+export const showPasswordPrompt = (message, title = 'Authentication Required') => {
+    return new Promise((resolve) => {
+        const modal = document.createElement('div');
+        modal.className = 'confirm-dialog-overlay';
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+        modal.style.cssText = `
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 10001;
+        `;
+
+        const dialog = document.createElement('div');
+        dialog.style.cssText = `
+            background: var(--surface, #ffffff);
+            color: var(--text-primary, #1a1c1e);
+            border: 1px solid var(--border, #e0e4e8);
+            border-radius: 8px;
+            padding: 24px;
+            max-width: 420px;
+            width: 90%;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+        `;
+
+        const titleEl = document.createElement('h3');
+        titleEl.textContent = title;
+        titleEl.style.cssText = 'margin: 0 0 12px 0; font-size: 16px; font-weight: 600;';
+
+        const messageEl = document.createElement('p');
+        messageEl.textContent = message;
+        messageEl.style.cssText = 'margin: 0 0 14px 0; font-size: 14px; line-height: 1.5; white-space: pre-line;';
+
+        const inputEl = document.createElement('input');
+        inputEl.type = 'password';
+        inputEl.placeholder = 'Enter sudo password';
+        inputEl.style.cssText = `
+            width: 100%;
+            box-sizing: border-box;
+            padding: 8px 10px;
+            margin-bottom: 18px;
+            border: 1px solid var(--border, #e0e4e8);
+            border-radius: 6px;
+            background: var(--background, #ffffff);
+            color: var(--text-primary, #1a1c1e);
+        `;
+
+        const buttonContainer = document.createElement('div');
+        buttonContainer.style.cssText = 'display: flex; gap: 12px; justify-content: flex-end;';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.style.cssText = `
+            padding: 8px 16px;
+            border: 1px solid var(--border, #e0e4e8);
+            background: transparent;
+            color: var(--text-primary, #1a1c1e);
+            border-radius: 6px;
+            cursor: pointer;
+        `;
+
+        const submitBtn = document.createElement('button');
+        submitBtn.textContent = 'Run with sudo';
+        submitBtn.style.cssText = `
+            padding: 8px 16px;
+            border: none;
+            background: var(--accent, #0672ef);
+            color: white;
+            border-radius: 6px;
+            cursor: pointer;
+        `;
+
+        const cleanup = () => {
+            document.removeEventListener('keydown', handleKeyDown, { capture: true });
+            if (modal.parentNode) {
+                modal.parentNode.removeChild(modal);
+            }
+        };
+
+        const handleKeyDown = (e) => {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation?.();
+                cleanup();
+                resolve(null);
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation?.();
+                const val = inputEl.value;
+                cleanup();
+                resolve(val || null);
+            }
+        };
+
+        cancelBtn.addEventListener('click', () => {
+            cleanup();
+            resolve(null);
+        });
+
+        submitBtn.addEventListener('click', () => {
+            const val = inputEl.value;
+            cleanup();
+            resolve(val || null);
+        });
+
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                cleanup();
+                resolve(null);
+            }
+        });
+
+        document.addEventListener('keydown', handleKeyDown, { capture: true });
+
+        buttonContainer.appendChild(cancelBtn);
+        buttonContainer.appendChild(submitBtn);
+        dialog.appendChild(titleEl);
+        dialog.appendChild(messageEl);
+        dialog.appendChild(inputEl);
+        dialog.appendChild(buttonContainer);
+        modal.appendChild(dialog);
+        document.body.appendChild(modal);
+
+        inputEl.focus();
+    });
+};

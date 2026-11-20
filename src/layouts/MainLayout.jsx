@@ -910,7 +910,12 @@ const MainLayout = () => {
         };
 
         document.addEventListener('keydown', handleKeyDown);
-        return () => document.removeEventListener('keydown', handleKeyDown);
+        const handleOpenSshTerminal = () => setIsTerminalOpen(true);
+        window.addEventListener('open-ssh-terminal', handleOpenSshTerminal);
+        return () => {
+            document.removeEventListener('keydown', handleKeyDown);
+            window.removeEventListener('open-ssh-terminal', handleOpenSshTerminal);
+        };
     }, [handleGoUp, getSortedData, selectMultiple, clearSelection, copyToClipboard, cutToClipboard, pasteFromClipboard, deleteItems, loadDirectory, loadVolumes, goBack, goForward]);
 
     /**

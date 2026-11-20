@@ -1,7 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useHistory } from '../../providers/HistoryProvider';
 import { useSettings } from '../../providers/SettingsProvider';
+import { useSftp } from '../../providers/SftpProvider';
 import Icon from '../common/Icon';
 import { joinPath } from '../../utils/pathUtils';
 import './terminal.css';
@@ -164,6 +166,82 @@ const Terminal = ({ isOpen, onToggle }) => {
     const terminalRef = useRef(null);
     const { currentPath, navigateTo } = useHistory();
     const { settings } = useSettings();
+    const { isSftpPath, parseSftpPath, executeSshCommand, startSshPty } = useSftp();
+    const [manualSshConnection, setManualSshConnection] = useState(null);
+    const [sshDisabledForPath, setSshDisabledForPath] = useState(false);
+    const [sshWorkingDir, setSshWorkingDir] = useState('.');
+    const [ptySessionId, setPtySessionId] = useState(null);
+    const ptySessionIdRef = useRef(null);
+    ptySessionIdRef.current = ptySessionId;
+
+    const parsedSftp = isSftpPath(currentPath) ? parseSftpPath(currentPath) : null;
+    const activeSshConnection = manualSshConnection || (!sshDisabledForPath ? parsedSftp?.connection : null);
+
+    useEffect(() => {
+        let unlistenOut = null;
+        let unlistenExit = null;
+        let active = true;
+
+        (async () => {
+            try {
+                unlistenOut = await listen('ssh-pty-output', (event) => {
+                    const payload = event?.payload;
+                    if (!active || !payload || payload.session_id !== ptySessionIdRef.current) return;
+                    setCommandHistory(prev => [
+                        ...prev,
+                        { type: 'output', content: payload.data, timestamp: new Date().toLocaleTimeString() },
+                    ]);
+                });
+                unlistenExit = await listen('ssh-pty-exit', (event) => {
+                    const payload = event?.payload;
+                    if (!active || !payload || payload.session_id !== ptySessionIdRef.current) return;
+                    setPtySessionId(null);
+                    setCommandHistory(prev => [
+                        ...prev,
+                        { type: 'system', content: `[SSH PTY exited: ${payload.reason}]`, timestamp: new Date().toLocaleTimeString() },
+                    ]);
+                });
+            } catch {
+                // Non-Tauri test environments may not mock event listeners
+            }
+        })();
+
+        return () => {
+            active = false;
+            if (typeof unlistenOut === 'function') unlistenOut();
+            if (typeof unlistenExit === 'function') unlistenExit();
+            if (ptySessionIdRef.current) {
+                invoke('ssh_close_pty', { sessionId: ptySessionIdRef.current }).catch(() => {});
+            }
+        };
+    }, []);
+
+    useEffect(() => {
+        const handleOpenSsh = (e) => {
+            const conn = e?.detail?.connection;
+            if (!conn?.host) return;
+            setManualSshConnection(conn);
+            setSshDisabledForPath(false);
+            setSshWorkingDir('.');
+            setCommandHistory(prev => [
+                ...prev,
+                {
+                    type: 'system',
+                    content: `[SSH] Connected terminal context to ${conn.username || 'guest'}@${conn.host}:${conn.port || 22}`,
+                    timestamp: new Date().toLocaleTimeString(),
+                },
+            ]);
+        };
+        window.addEventListener('open-ssh-terminal', handleOpenSsh);
+        return () => window.removeEventListener('open-ssh-terminal', handleOpenSsh);
+    }, []);
+
+    useEffect(() => {
+        if (parsedSftp?.connection) {
+            setSshWorkingDir(parsedSftp.remotePath || '.');
+            setSshDisabledForPath(false);
+        }
+    }, [currentPath, parsedSftp?.connection, parsedSftp?.remotePath]);
 
     /**
      * Get terminal height from settings with fallback to default value
@@ -282,6 +360,37 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
         setIsExecuting(true);
 
         try {
+            if (ptySessionIdRef.current) {
+                await invoke('ssh_write_pty', {
+                    sessionId: ptySessionIdRef.current,
+                    data: `${command}\n`,
+                });
+                return null;
+            }
+            if (activeSshConnection) {
+                const trimmedCmd = command.trim();
+                if (trimmedCmd === 'cd' || trimmedCmd.startsWith('cd ')) {
+                    const targetDir = trimmedCmd === 'cd' ? '~' : trimmedCmd.slice(3).trim();
+                    const quoted = `'${targetDir.replace(/'/g, `'\\''`)}'`;
+                    const cdCmd = targetDir === '~' ? 'cd ~ && pwd' : `cd ${quoted} && pwd`;
+                    const res = await executeSshCommand(activeSshConnection, cdCmd, sshWorkingDir);
+                    if (res.exit_code === 0 && res.stdout?.trim()) {
+                        const newRemoteDir = res.stdout.trim().split('\n').pop().trim();
+                        setSshWorkingDir(newRemoteDir);
+                        return { type: 'system', content: `[SSH] Directory: ${newRemoteDir}` };
+                    }
+                    return { type: 'error', content: res.stderr?.trim() || 'cd failed' };
+                }
+
+                const res = await executeSshCommand(activeSshConnection, command, sshWorkingDir);
+                const combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
+                return {
+                    type: res.exit_code === 0 ? 'output' : 'error',
+                    content: combined || (res.exit_code === 0 ? '' : `Exit code ${res.exit_code}`),
+                    originalCommand: command,
+                };
+            }
+
             // Determine if this is a potentially long-running command
             const longRunningCommands = ['ping', 'traceroute', 'curl', 'wget', 'tail -f', 'watch'];
             const isLongRunning = longRunningCommands.some(cmd => command.toLowerCase().startsWith(cmd));
@@ -1230,8 +1339,56 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
             <div className="terminal-header">
                 <div className="terminal-title">
                     <span>Terminal</span>
+                    {activeSshConnection && (
+                        <span
+                            className="terminal-ssh-badge"
+                            style={{ marginLeft: '8px', fontSize: '12px', opacity: 0.85 }}
+                        >
+                            [SSH: {activeSshConnection.username || 'guest'}@{activeSshConnection.host}:{sshWorkingDir}]
+                        </span>
+                    )}
                 </div>
                 <div className="terminal-controls">
+                    {activeSshConnection && (
+                        <button
+                            className="terminal-control"
+                            onClick={async () => {
+                                if (ptySessionId) {
+                                    await invoke('ssh_close_pty', { sessionId: ptySessionId }).catch(() => {});
+                                    setPtySessionId(null);
+                                } else {
+                                    try {
+                                        const sid = await startSshPty(activeSshConnection, sshWorkingDir);
+                                        setPtySessionId(sid);
+                                    } catch (e) {
+                                        setCommandHistory(prev => [
+                                            ...prev,
+                                            { type: 'error', content: `Failed to start SSH PTY: ${e}`, timestamp: new Date().toLocaleTimeString() },
+                                        ]);
+                                    }
+                                }
+                            }}
+                            title={ptySessionId ? 'Stop interactive SSH PTY' : 'Start interactive SSH PTY'}
+                        >
+                            {ptySessionId ? 'Stop PTY' : 'PTY'}
+                        </button>
+                    )}
+                    {activeSshConnection && (
+                        <button
+                            className="terminal-control"
+                            onClick={async () => {
+                                if (ptySessionId) {
+                                    await invoke('ssh_close_pty', { sessionId: ptySessionId }).catch(() => {});
+                                    setPtySessionId(null);
+                                }
+                                setManualSshConnection(null);
+                                setSshDisabledForPath(true);
+                            }}
+                            title="Switch back to local terminal"
+                        >
+                            Local
+                        </button>
+                    )}
                     <button 
                         className="terminal-control terminal-clear"
                         onClick={handleClearTerminal}

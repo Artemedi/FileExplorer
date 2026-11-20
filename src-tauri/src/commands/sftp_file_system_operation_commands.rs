@@ -1,5 +1,6 @@
 use crate::commands::preview_commands::PreviewPayload;
 use crate::constants::get_app_base_dir;
+use crate::log_info;
 use crate::models::SFTPDirectory;
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -22,8 +23,11 @@ const MAX_PREVIEW_HEAD_BYTES: usize = 256 * 1024; // 256 KiB head for MIME & tex
 const MAX_COPY_DIR_DEPTH: usize = 64;
 const SFTP_TEMP_RETENTION_TTL: Duration = Duration::from_secs(60 * 60); // 1 hour
 
-static SFTP_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+const SFTP_TEMP_COUNTER_INIT: u64 = 1;
+const KEYRING_SERVICE: &str = "explr-sftp";
+static SFTP_TEMP_COUNTER: AtomicU64 = AtomicU64::new(SFTP_TEMP_COUNTER_INIT);
 static SFTP_CREDENTIALS: OnceLock<RwLock<HashMap<String, ZeroizingString>>> = OnceLock::new();
+static SSH_PROFILES: OnceLock<RwLock<HashMap<String, SshAuthOptions>>> = OnceLock::new();
 static KNOWN_HOSTS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Wrapper around a sensitive string that overwrites its UTF-8 buffer with zeros on drop.
@@ -62,12 +66,87 @@ fn credential_store() -> &'static RwLock<HashMap<String, ZeroizingString>> {
     SFTP_CREDENTIALS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+fn profile_store() -> &'static RwLock<HashMap<String, SshAuthOptions>> {
+    SSH_PROFILES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub(crate) fn resolve_ssh_profile(
+    host: &str,
+    port: u16,
+    username: &str,
+    overrides: SshAuthOptions,
+) -> SshAuthOptions {
+    let key = format_sftp_connection_key(username, host, port);
+    let stored = profile_store()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+
+    SshAuthOptions {
+        auth_type: overrides.auth_type.or(stored.auth_type),
+        private_key_path: overrides.private_key_path.or(stored.private_key_path),
+        certificate_path: overrides.certificate_path.or(stored.certificate_path),
+        compression_mode: overrides.compression_mode.or(stored.compression_mode),
+    }
+}
+
+#[tauri::command]
+pub fn store_ssh_profile(
+    connection_key: String,
+    auth_type: Option<String>,
+    private_key_path: Option<String>,
+    certificate_path: Option<String>,
+    compression_mode: Option<String>,
+) -> Result<(), String> {
+    let trimmed_key = connection_key.trim();
+    if trimmed_key.is_empty() {
+        return Err("SSH connection key cannot be empty".to_string());
+    }
+    let options = SshAuthOptions {
+        auth_type,
+        private_key_path,
+        certificate_path,
+        compression_mode,
+    };
+    let mut store = profile_store().write().unwrap_or_else(|e| e.into_inner());
+    store.insert(trimmed_key.to_string(), options);
+    Ok(())
+}
+
 fn known_hosts_mutex() -> &'static Mutex<()> {
     KNOWN_HOSTS_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 pub fn format_sftp_connection_key(username: &str, host: &str, port: u16) -> String {
     format!("{}@{}:{}", username.trim(), host.trim(), port)
+}
+
+fn keyring_set_password(connection_key: &str, password: &str) {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, connection_key) {
+        if let Err(err) = entry.set_password(password) {
+            log_info!(
+                "Keyring unavailable for storing credentials ({}): {}",
+                connection_key,
+                err
+            );
+        }
+    }
+}
+
+fn keyring_get_password(connection_key: &str) -> Option<ZeroizingString> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, connection_key).ok()?;
+    match entry.get_password() {
+        Ok(pw) if !pw.is_empty() => Some(ZeroizingString::new(pw)),
+        _ => None,
+    }
+}
+
+fn keyring_delete_password(connection_key: &str) {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, connection_key) {
+        let _ = entry.delete_credential();
+    }
 }
 
 #[tauri::command]
@@ -80,6 +159,7 @@ pub fn store_sftp_credentials(connection_key: String, password: String) -> Resul
     if secret.is_empty() {
         return Err("SFTP password cannot be empty".to_string());
     }
+    keyring_set_password(trimmed_key, secret.as_str());
     let mut store = credential_store()
         .write()
         .unwrap_or_else(|e| e.into_inner());
@@ -93,6 +173,11 @@ pub fn remove_sftp_credentials(connection_key: String) -> Result<(), String> {
     if trimmed_key.is_empty() {
         return Err("SFTP connection key cannot be empty".to_string());
     }
+    keyring_delete_password(trimmed_key);
+    profile_store()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(trimmed_key);
     let mut store = credential_store()
         .write()
         .unwrap_or_else(|e| e.into_inner());
@@ -106,14 +191,20 @@ pub fn has_sftp_credentials(connection_key: String) -> Result<bool, String> {
     if trimmed_key.is_empty() {
         return Ok(false);
     }
-    let store = credential_store().read().unwrap_or_else(|e| e.into_inner());
-    Ok(store
-        .get(trimmed_key)
-        .map(|s| !s.is_empty())
-        .unwrap_or(false))
+    let in_ram = {
+        let store = credential_store().read().unwrap_or_else(|e| e.into_inner());
+        store
+            .get(trimmed_key)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    };
+    if in_ram {
+        return Ok(true);
+    }
+    Ok(keyring_get_password(trimmed_key).is_some())
 }
 
-fn resolve_sftp_password(
+pub(crate) fn resolve_sftp_password(
     host: &str,
     port: u16,
     username: &str,
@@ -124,18 +215,30 @@ fn resolve_sftp_password(
         return Ok(provided);
     }
 
-    let store = credential_store().read().unwrap_or_else(|e| e.into_inner());
     let primary_key = format_sftp_connection_key(username, host, port);
-    if let Some(secret) = store.get(&primary_key) {
-        if !secret.is_empty() {
-            return Ok(secret.clone());
+    let host_port_key = format!("{}:{}", host.trim(), port);
+
+    {
+        let store = credential_store().read().unwrap_or_else(|e| e.into_inner());
+        if let Some(secret) = store.get(&primary_key) {
+            if !secret.is_empty() {
+                return Ok(secret.clone());
+            }
+        }
+        if let Some(secret) = store.get(&host_port_key) {
+            if !secret.is_empty() {
+                return Ok(secret.clone());
+            }
         }
     }
 
-    let host_port_key = format!("{}:{}", host.trim(), port);
-    if let Some(secret) = store.get(&host_port_key) {
-        if !secret.is_empty() {
-            return Ok(secret.clone());
+    for key in [&primary_key, &host_port_key] {
+        if let Some(secret) = keyring_get_password(key) {
+            let mut store = credential_store()
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            store.insert(key.clone(), secret.clone());
+            return Ok(secret);
         }
     }
 
@@ -341,21 +444,49 @@ pub fn persist_trusted_host_key_to_path(
 }
 
 fn connect_ssh_session(host: &str, port: u16) -> Result<(Session, String), String> {
+    connect_ssh_session_with_compression(host, port, false)
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SshAuthOptions {
+    pub auth_type: Option<String>,
+    pub private_key_path: Option<String>,
+    pub certificate_path: Option<String>,
+    pub compression_mode: Option<String>,
+}
+
+impl SshAuthOptions {
+    pub(crate) fn should_compress_transport(&self) -> bool {
+        matches!(
+            self.compression_mode
+                .as_deref()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("always") | Some("auto")
+        )
+    }
+}
+
+fn connect_ssh_session_with_compression(
+    host: &str,
+    port: u16,
+    compress: bool,
+) -> Result<(Session, String), String> {
     let trimmed_host = host.trim();
     if trimmed_host.is_empty() {
-        return Err("SFTP host cannot be empty".to_string());
+        return Err("Host cannot be empty".to_string());
     }
     if port == 0 {
-        return Err("SFTP port must be greater than 0".to_string());
+        return Err("Port must be between 1 and 65535".to_string());
     }
 
     let addrs: Vec<_> = (trimmed_host, port)
         .to_socket_addrs()
-        .map_err(|e| format!("Failed to resolve SFTP host '{trimmed_host}:{port}': {e}"))?
+        .map_err(|e| format!("Failed to resolve host '{trimmed_host}:{port}': {e}"))?
         .collect();
     if addrs.is_empty() {
         return Err(format!(
-            "Could not resolve any socket address for '{trimmed_host}:{port}'"
+            "Failed to resolve host '{trimmed_host}:{port}': no addresses returned"
         ));
     }
 
@@ -386,6 +517,9 @@ fn connect_ssh_session(host: &str, port: u16) -> Result<(Session, String), Strin
     let mut session = Session::new().map_err(|_| "Could not initialize SSH session".to_string())?;
     session.set_tcp_stream(tcp);
     session.set_timeout(SFTP_SSH_SESSION_TIMEOUT_MS);
+    if compress {
+        session.set_compress(true);
+    }
     session.handshake().map_err(|e| e.to_string())?;
 
     let (host_key_bytes, _key_type) = session
@@ -429,32 +563,59 @@ pub async fn trust_sftp_host_key(
         .map_err(|e| format!("SFTP task join error: {e}"))?
 }
 
-fn connect_to_sftp_via_password(
-    host: String,
+pub(crate) fn connect_authenticated_ssh_session(
+    host: &str,
     port: u16,
-    username: String,
+    username: &str,
     password: String,
-) -> Result<Sftp, String> {
+    options: &SshAuthOptions,
+) -> Result<Session, String> {
     let trimmed_user = username.trim();
-    let is_guest_user = trimmed_user.is_empty()
+    let auth_mode = options
+        .auth_type
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            if trimmed_user.is_empty() {
+                "guest".to_string()
+            } else {
+                "password".to_string()
+            }
+        });
+
+    let is_guest_user = auth_mode == "guest"
+        || trimmed_user.is_empty()
         || trimmed_user.eq_ignore_ascii_case("anonymous")
         || trimmed_user.eq_ignore_ascii_case("guest");
 
-    let secret_password = if trimmed_user.is_empty() {
-        ZeroizingString::new(password)
-    } else {
-        match resolve_sftp_password(&host, port, trimmed_user, password) {
-            Ok(secret) => secret,
-            Err(_) if is_guest_user => ZeroizingString::new(String::new()),
-            Err(e) => return Err(e),
+    let secret_password = match auth_mode.as_str() {
+        "key" | "certificate" | "agent" | "guest" => {
+            if password.is_empty() && !trimmed_user.is_empty() {
+                resolve_sftp_password(host, port, trimmed_user, password)
+                    .unwrap_or_else(|_| ZeroizingString::new(String::new()))
+            } else {
+                ZeroizingString::new(password)
+            }
+        }
+        _ => {
+            if trimmed_user.is_empty() {
+                ZeroizingString::new(password)
+            } else {
+                match resolve_sftp_password(host, port, trimmed_user, password) {
+                    Ok(secret) => secret,
+                    Err(_) if is_guest_user => ZeroizingString::new(String::new()),
+                    Err(e) => return Err(e),
+                }
+            }
         }
     };
 
-    let (session, live_fingerprint) = connect_ssh_session(&host, port)?;
+    let (session, live_fingerprint) =
+        connect_ssh_session_with_compression(host, port, options.should_compress_transport())?;
 
     // Verify SSH host key BEFORE sending credentials to prevent MITM credential interception
     let known_contents = load_known_hosts_contents();
-    match verify_host_key_against_contents(&host, port, &live_fingerprint, &known_contents) {
+    match verify_host_key_against_contents(host, port, &live_fingerprint, &known_contents) {
         HostKeyVerification::Trusted => {}
         HostKeyVerification::Untrusted { fingerprint } => {
             return Err(format!("HOST_KEY_UNTRUSTED:{fingerprint}"));
@@ -466,37 +627,116 @@ fn connect_to_sftp_via_password(
         }
     }
 
-    if trimmed_user.is_empty() {
-        for guest_user in ["anonymous", "guest"] {
-            let _ = session.auth_methods(guest_user);
-            if session.authenticated() {
-                break;
+    match auth_mode.as_str() {
+        "key" | "certificate" => {
+            let effective_user = if trimmed_user.is_empty() {
+                "root"
+            } else {
+                trimmed_user
+            };
+            let key_path_str = options
+                .private_key_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    "Private key path is required for key/certificate auth".to_string()
+                })?;
+            let key_path = Path::new(key_path_str);
+            if !key_path.exists() {
+                return Err(format!("Private key file not found: {key_path_str}"));
             }
-            if session
-                .userauth_password(guest_user, secret_password.as_str())
-                .is_ok()
-                && session.authenticated()
-            {
-                break;
+            let cert_path = options
+                .certificate_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(Path::new);
+            if let Some(cp) = cert_path {
+                if !cp.exists() {
+                    return Err(format!("Certificate file not found: {}", cp.display()));
+                }
             }
-            if secret_password.is_empty()
-                && session.userauth_agent(guest_user).is_ok()
-                && session.authenticated()
-            {
-                break;
+            let passphrase = if secret_password.is_empty() {
+                None
+            } else {
+                Some(secret_password.as_str())
+            };
+            session
+                .userauth_pubkey_file(effective_user, cert_path, key_path, passphrase)
+                .map_err(|e| format!("SSH key/certificate authentication failed: {e}"))?;
+        }
+        "agent" => {
+            let effective_user = if trimmed_user.is_empty() {
+                "root"
+            } else {
+                trimmed_user
+            };
+            session
+                .userauth_agent(effective_user)
+                .map_err(|e| format!("SSH agent authentication failed: {e}"))?;
+        }
+        "guest" => {
+            let candidates: Vec<&str> = if trimmed_user.is_empty() {
+                vec!["anonymous", "guest"]
+            } else {
+                vec![trimmed_user]
+            };
+            for guest_user in candidates {
+                let _ = session.auth_methods(guest_user);
+                if session.authenticated() {
+                    break;
+                }
+                if session
+                    .userauth_password(guest_user, secret_password.as_str())
+                    .is_ok()
+                    && session.authenticated()
+                {
+                    break;
+                }
+                if secret_password.is_empty()
+                    && session.userauth_agent(guest_user).is_ok()
+                    && session.authenticated()
+                {
+                    break;
+                }
             }
         }
-    } else {
-        if is_guest_user && secret_password.is_empty() {
-            let _ = session.auth_methods(trimmed_user);
-        }
-        if !session.authenticated() {
-            let auth_res = session.userauth_password(trimmed_user, secret_password.as_str());
-            if !session.authenticated() && secret_password.is_empty() {
-                let _ = session.userauth_agent(trimmed_user);
-            }
-            if !session.authenticated() {
-                auth_res.map_err(|e| e.to_string())?;
+        _ => {
+            if trimmed_user.is_empty() {
+                for guest_user in ["anonymous", "guest"] {
+                    let _ = session.auth_methods(guest_user);
+                    if session.authenticated() {
+                        break;
+                    }
+                    if session
+                        .userauth_password(guest_user, secret_password.as_str())
+                        .is_ok()
+                        && session.authenticated()
+                    {
+                        break;
+                    }
+                    if secret_password.is_empty()
+                        && session.userauth_agent(guest_user).is_ok()
+                        && session.authenticated()
+                    {
+                        break;
+                    }
+                }
+            } else {
+                if is_guest_user && secret_password.is_empty() {
+                    let _ = session.auth_methods(trimmed_user);
+                }
+                if !session.authenticated() {
+                    let auth_res =
+                        session.userauth_password(trimmed_user, secret_password.as_str());
+                    if !session.authenticated() && secret_password.is_empty() {
+                        let _ = session.userauth_agent(trimmed_user);
+                    }
+                    if !session.authenticated() {
+                        auth_res.map_err(|e| e.to_string())?;
+                    }
+                }
             }
         }
     }
@@ -505,7 +745,28 @@ fn connect_to_sftp_via_password(
         return Err("Authentication failed".to_string());
     }
 
+    Ok(session)
+}
+
+pub(crate) fn connect_to_sftp_with_options(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    options: &SshAuthOptions,
+) -> Result<Sftp, String> {
+    let session = connect_authenticated_ssh_session(&host, port, &username, password, options)?;
     session.sftp().map_err(|e| e.to_string())
+}
+
+fn connect_to_sftp_via_password(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+) -> Result<Sftp, String> {
+    let options = resolve_ssh_profile(&host, port, &username, SshAuthOptions::default());
+    connect_to_sftp_with_options(host, port, username, password, &options)
 }
 
 #[allow(dead_code)]
@@ -540,8 +801,10 @@ fn load_dir_impl(
     username: String,
     password: String,
     directory: String,
+    overrides: SshAuthOptions,
 ) -> Result<String, String> {
-    let sftp = connect_to_sftp_via_password(host, port, username, password)?;
+    let options = resolve_ssh_profile(&host, port, &username, overrides);
+    let sftp = connect_to_sftp_with_options(host, port, username, password, &options)?;
     let entries = sftp
         .readdir(Path::new(&directory))
         .map_err(|e| e.to_string())?;
@@ -575,6 +838,7 @@ fn load_dir_impl(
     serde_json::to_string(&sftp_directory).map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn load_dir(
     host: String,
@@ -582,10 +846,22 @@ pub async fn load_dir(
     username: String,
     password: String,
     directory: String,
+    auth_type: Option<String>,
+    private_key_path: Option<String>,
+    certificate_path: Option<String>,
+    compression_mode: Option<String>,
 ) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || load_dir_impl(host, port, username, password, directory))
-        .await
-        .map_err(|e| format!("SFTP task join error: {e}"))?
+    let overrides = SshAuthOptions {
+        auth_type,
+        private_key_path,
+        certificate_path,
+        compression_mode,
+    };
+    tokio::task::spawn_blocking(move || {
+        load_dir_impl(host, port, username, password, directory, overrides)
+    })
+    .await
+    .map_err(|e| format!("SFTP task join error: {e}"))?
 }
 
 fn open_file_sftp_impl(

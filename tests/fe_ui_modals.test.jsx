@@ -364,12 +364,12 @@ describe('Wave 4 UI & Modals (TP-FE-UI-01, TP-FE-UI-03, TP-FE-UI-14..16)', () =>
                 connectionKey: 'alice@example.com:2222',
                 password: 'secret123'
             });
-            expect(onAdd).toHaveBeenCalledWith({
+            expect(onAdd).toHaveBeenCalledWith(expect.objectContaining({
                 name: 'prod',
                 host: 'example.com',
                 port: 2222,
                 username: 'alice'
-            });
+            }));
         });
 
         mockHistoryState.currentPath = '\\\\server\\share\\docs';
@@ -417,12 +417,12 @@ describe('Wave 4 UI & Modals (TP-FE-UI-01, TP-FE-UI-03, TP-FE-UI-14..16)', () =>
 
         fireEvent.click(addBtn);
         await waitFor(() => {
-            expect(onAdd).toHaveBeenCalledWith({
+            expect(onAdd).toHaveBeenCalledWith(expect.objectContaining({
                 name: 'guest-nas',
                 host: '192.168.1.50',
                 port: 22,
                 username: ''
-            });
+            }));
         });
         expect(mockInvoke).not.toHaveBeenCalledWith('store_sftp_credentials', expect.anything());
     });

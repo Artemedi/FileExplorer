@@ -1,6 +1,7 @@
 
 import React, { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import Modal from '../common/Modal';
 import Button from '../common/Button';
 
@@ -28,12 +29,41 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 	const [name, setName] = useState('');
 	const [host, setHost] = useState('localhost');
 	const [port, setPort] = useState('22');
+	const [authType, setAuthType] = useState('password');
 	const [username, setUsername] = useState('');
 	const [password, setPassword] = useState('');
+	const [privateKeyPath, setPrivateKeyPath] = useState('');
+	const [certificatePath, setCertificatePath] = useState('');
+	const [compressionMode, setCompressionMode] = useState('auto');
 	const [testing, setTesting] = useState(false);
 	const [saving, setSaving] = useState(false);
 	const [testResult, setTestResult] = useState(null);
 	const [error, setError] = useState(null);
+
+	const pickFilePath = async (setter) => {
+		try {
+			const selected = await openDialog({ multiple: false, directory: false });
+			if (typeof selected === 'string' && selected.trim()) {
+				setter(selected);
+			}
+		} catch (e) {
+			setError(e?.toString() || 'Failed to open file picker');
+		}
+	};
+
+	const resetForm = () => {
+		setName('');
+		setHost('localhost');
+		setPort('22');
+		setAuthType('password');
+		setUsername('');
+		setPassword('');
+		setPrivateKeyPath('');
+		setCertificatePath('');
+		setCompressionMode('auto');
+		setTestResult(null);
+		setError(null);
+	};
 
 	const handleTestConnection = async () => {
 		const portNum = parseValidPort(port);
@@ -41,16 +71,25 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 			setError('Port must be a number between 1 and 65535');
 			return;
 		}
+		if ((authType === 'key' || authType === 'certificate') && !privateKeyPath.trim()) {
+			setError('Private key path is required for key/certificate authentication');
+			return;
+		}
 		setTesting(true);
 		setTestResult(null);
 		setError(null);
 		try {
+			const effectiveUsername = authType === 'guest' ? '' : username.trim();
 			await invoke('load_dir', {
 				host: host.trim(),
 				port: portNum,
-				username: username.trim(),
+				username: effectiveUsername,
 				password,
-				directory: "."
+				directory: ".",
+				authType,
+				privateKeyPath: privateKeyPath.trim() || null,
+				certificatePath: certificatePath.trim() || null,
+				compressionMode
 			});
 			setTestResult('Connection successful!');
 		} catch (e) {
@@ -64,7 +103,7 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 	const handleAdd = async () => {
 		const trimmedName = name.trim();
 		const trimmedHost = host.trim();
-		const trimmedUsername = username.trim();
+		const trimmedUsername = authType === 'guest' ? '' : username.trim();
 		const portNum = parseValidPort(port);
 
 		if (!trimmedName || !trimmedHost) {
@@ -94,11 +133,24 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 			return;
 		}
 
+		if ((authType === 'key' || authType === 'certificate') && !privateKeyPath.trim()) {
+			setError('Private key path is required for key/certificate authentication');
+			return;
+		}
+
 		setSaving(true);
 		setError(null);
 		try {
+			const connectionKey = `${trimmedUsername}@${trimmedHost}:${portNum}`;
+			await invoke('store_ssh_profile', {
+				connectionKey,
+				authType,
+				privateKeyPath: privateKeyPath.trim() || null,
+				certificatePath: certificatePath.trim() || null,
+				compressionMode
+			}).catch(() => {});
+
 			if (password.length > 0) {
-				const connectionKey = `${trimmedUsername}@${trimmedHost}:${portNum}`;
 				await invoke('store_sftp_credentials', { connectionKey, password });
 			}
 
@@ -106,15 +158,13 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 				name: trimmedName,
 				host: trimmedHost,
 				port: portNum,
-				username: trimmedUsername
+				username: trimmedUsername,
+				authType,
+				...(privateKeyPath.trim() ? { privateKeyPath: privateKeyPath.trim() } : {}),
+				...(certificatePath.trim() ? { certificatePath: certificatePath.trim() } : {}),
+				compressionMode
 			});
-			setName('');
-			setHost('localhost');
-			setPort('22');
-			setUsername('');
-			setPassword('');
-			setTestResult(null);
-			setError(null);
+			resetForm();
 		} catch (e) {
 			setError(e?.toString() || 'Failed to store SFTP credentials');
 		} finally {
@@ -123,13 +173,7 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 	};
 
 	const handleClose = () => {
-		setName('');
-		setHost('localhost');
-		setPort('22');
-		setUsername('');
-		setPassword('');
-		setTestResult(null);
-		setError(null);
+		resetForm();
 		onClose();
 	};
 
@@ -196,26 +240,96 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 					/>
 				</div>
 				<div className="form-group">
-					<label htmlFor="sftp-username">Username</label>
-					<input
-						type="text"
-						id="sftp-username"
+					<label htmlFor="sftp-auth-type">Authentication</label>
+					<select
+						id="sftp-auth-type"
 						className="input"
-						value={username}
-						onChange={e => setUsername(e.target.value)}
-						placeholder="Username (leave blank for guest)"
-					/>
+						value={authType}
+						onChange={e => setAuthType(e.target.value)}
+					>
+						<option value="password">Password</option>
+						<option value="key">SSH Private Key</option>
+						<option value="certificate">SSH Key + Certificate</option>
+						<option value="agent">SSH Agent</option>
+						<option value="guest">Guest / Anonymous</option>
+					</select>
 				</div>
+				{authType !== 'guest' && (
+					<div className="form-group">
+						<label htmlFor="sftp-username">Username</label>
+						<input
+							type="text"
+							id="sftp-username"
+							className="input"
+							value={username}
+							onChange={e => setUsername(e.target.value)}
+							placeholder="Username (leave blank for guest)"
+						/>
+					</div>
+				)}
+				{(authType === 'key' || authType === 'certificate') && (
+					<div className="form-group">
+						<label htmlFor="sftp-private-key">Private Key Path</label>
+						<div style={{ display: 'flex', gap: '8px' }}>
+							<input
+								type="text"
+								id="sftp-private-key"
+								className="input"
+								value={privateKeyPath}
+								onChange={e => setPrivateKeyPath(e.target.value)}
+								placeholder="~/.ssh/id_ed25519"
+							/>
+							<Button type="button" variant="secondary" onClick={() => pickFilePath(setPrivateKeyPath)}>
+								Browse
+							</Button>
+						</div>
+					</div>
+				)}
+				{authType === 'certificate' && (
+					<div className="form-group">
+						<label htmlFor="sftp-certificate">Certificate Path</label>
+						<div style={{ display: 'flex', gap: '8px' }}>
+							<input
+								type="text"
+								id="sftp-certificate"
+								className="input"
+								value={certificatePath}
+								onChange={e => setCertificatePath(e.target.value)}
+								placeholder="~/.ssh/id_ed25519-cert.pub"
+							/>
+							<Button type="button" variant="secondary" onClick={() => pickFilePath(setCertificatePath)}>
+								Browse
+							</Button>
+						</div>
+					</div>
+				)}
+				{(authType === 'password' || authType === 'key' || authType === 'certificate') && (
+					<div className="form-group">
+						<label htmlFor="sftp-password">
+							{authType === 'password' ? 'Password' : 'Key Passphrase (optional)'}
+						</label>
+						<input
+							type="password"
+							id="sftp-password"
+							className="input"
+							value={password}
+							onChange={e => setPassword(e.target.value)}
+							placeholder={authType === 'password' ? 'Password (stored in OS keyring)' : 'Passphrase'}
+						/>
+					</div>
+				)}
 				<div className="form-group">
-					<label htmlFor="sftp-password">Password</label>
-					<input
-						type="password"
-						id="sftp-password"
+					<label htmlFor="sftp-compression">Transfer Compression</label>
+					<select
+						id="sftp-compression"
 						className="input"
-						value={password}
-						onChange={e => setPassword(e.target.value)}
-						placeholder="Password"
-					/>
+						value={compressionMode}
+						onChange={e => setCompressionMode(e.target.value)}
+					>
+						<option value="auto">Auto (recommended)</option>
+						<option value="always">Always</option>
+						<option value="off">Off</option>
+					</select>
 				</div>
 				{testResult && <div className="input-hint" style={{ color: 'var(--success)' }}>{testResult}</div>}
 				{error && <div className="input-hint" style={{ color: 'var(--error, #e53e3e)' }}>{error}</div>}
