@@ -66,6 +66,11 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 	};
 
 	const handleTestConnection = async () => {
+		const trimmedHost = host.trim();
+		if (trimmedHost.startsWith('\\\\') || trimmedHost.startsWith('//')) {
+			setError('UNC network paths (\\\\server\\share) use SMB, not SFTP. Use "Add Network Share (SMB / UNC)" in Network View.');
+			return;
+		}
 		const portNum = parseValidPort(port);
 		if (!portNum) {
 			setError('Port must be a number between 1 and 65535');
@@ -108,6 +113,10 @@ const AddSftpConnectionView = ({ isOpen, onClose, onAdd, existingConnections }) 
 
 		if (!trimmedName || !trimmedHost) {
 			setError('Name and host are required');
+			return;
+		}
+		if (trimmedHost.startsWith('\\\\') || trimmedHost.startsWith('//')) {
+			setError('UNC network paths (\\\\server\\share) use SMB, not SFTP. Use "Add Network Share (SMB / UNC)" in Network View.');
 			return;
 		}
 		if (trimmedName.includes(':')) {

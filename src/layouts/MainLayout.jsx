@@ -912,9 +912,25 @@ const MainLayout = () => {
         document.addEventListener('keydown', handleKeyDown);
         const handleOpenSshTerminal = () => setIsTerminalOpen(true);
         window.addEventListener('open-ssh-terminal', handleOpenSshTerminal);
+
+        // Suppress the native WebView context menu ("Save as...", "Print...", etc.) everywhere
+        // except editable fields, where Copy/Paste are still useful. App-specific menus are
+        // opened by React onContextMenu handlers, which still run (preventDefault only cancels
+        // the browser default).
+        const suppressNativeContextMenu = (e) => {
+            const target = e.target;
+            const editable = target && target.closest
+                && target.closest('input, textarea, [contenteditable="true"]');
+            if (!editable) {
+                e.preventDefault();
+            }
+        };
+        document.addEventListener('contextmenu', suppressNativeContextMenu);
+
         return () => {
             document.removeEventListener('keydown', handleKeyDown);
             window.removeEventListener('open-ssh-terminal', handleOpenSshTerminal);
+            document.removeEventListener('contextmenu', suppressNativeContextMenu);
         };
     }, [handleGoUp, getSortedData, selectMultiple, clearSelection, copyToClipboard, cutToClipboard, pasteFromClipboard, deleteItems, loadDirectory, loadVolumes, goBack, goForward]);
 

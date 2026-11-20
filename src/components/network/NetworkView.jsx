@@ -5,7 +5,11 @@ import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
 import { showSuccess, showError, showConfirm } from '../../utils/NotificationSystem';
 import AddSftpConnectionView from '../sidebar/AddSftpConnectionView';
+import Modal from '../common/Modal';
+import Button from '../common/Button';
 import './networkView.css';
+
+const NETWORK_SHARES_STORAGE_KEY = 'fileExplorerNetworkShares';
 
 /**
  * NetworkView component that displays available network connections
@@ -17,6 +21,22 @@ const NetworkView = () => {
     const { navigateTo } = useHistory();
     const [isAddSftpModalOpen, setIsAddSftpModalOpen] = useState(false);
     const [localSftpConnections, setLocalSftpConnections] = useState([]);
+    const [networkShares, setNetworkShares] = useState(() => {
+        try {
+            const saved = JSON.parse(localStorage.getItem(NETWORK_SHARES_STORAGE_KEY) || '[]');
+            return Array.isArray(saved) ? saved : [];
+        } catch {
+            return [];
+        }
+    });
+    const [isAddShareModalOpen, setIsAddShareModalOpen] = useState(false);
+    const [shareName, setShareName] = useState('');
+    const [sharePath, setSharePath] = useState('');
+    const [shareUsername, setShareUsername] = useState('');
+    const [sharePassword, setSharePassword] = useState('');
+    const [shareRemember, setShareRemember] = useState(true);
+    const [shareConnecting, setShareConnecting] = useState(false);
+    const [shareError, setShareError] = useState(null);
 
     // Load SFTP connections
     useEffect(() => {
@@ -119,11 +139,167 @@ const NetworkView = () => {
         }
     };
 
+    const saveNetworkShares = (nextShares) => {
+        setNetworkShares(nextShares);
+        try {
+            localStorage.setItem(NETWORK_SHARES_STORAGE_KEY, JSON.stringify(nextShares));
+        } catch {
+            // ignore storage quota errors
+        }
+    };
+
+    const handleOpenNetworkShare = async (share) => {
+        try {
+            if (share.username) {
+                await invoke('connect_network_share', {
+                    uncPath: share.path,
+                    username: share.username,
+                    password: '',
+                    remember: false
+                });
+            }
+            window.dispatchEvent(new CustomEvent('force-explorer-view'));
+            const ok = await loadDirectory(share.path);
+            if (ok) {
+                navigateTo(share.path);
+                showSuccess(`Opened ${share.name || share.path}`);
+            }
+        } catch (error) {
+            showError(`Failed to open "${share.path}": ${error?.message || error}`);
+        }
+    };
+
+    const handleAddNetworkShare = async () => {
+        const trimmedPath = sharePath.trim().replace(/\//g, '\\');
+        if (!trimmedPath.startsWith('\\\\')) {
+            setShareError('Enter a UNC network path like \\\\server\\share');
+            return;
+        }
+        const derivedName = shareName.trim() || trimmedPath.replace(/^\\+/, '').split('\\').filter(Boolean).slice(0, 2).join('\\') || trimmedPath;
+
+        setShareConnecting(true);
+        setShareError(null);
+        try {
+            if (shareUsername.trim()) {
+                await invoke('connect_network_share', {
+                    uncPath: trimmedPath,
+                    username: shareUsername.trim(),
+                    password: sharePassword,
+                    remember: shareRemember
+                });
+            }
+            await invoke('open_directory', { path: trimmedPath });
+
+            const nextShares = [
+                ...networkShares.filter(s => s.path !== trimmedPath),
+                {
+                    name: derivedName,
+                    path: trimmedPath,
+                    ...(shareUsername.trim() ? { username: shareUsername.trim() } : {})
+                }
+            ];
+            saveNetworkShares(nextShares);
+            setIsAddShareModalOpen(false);
+            setShareName('');
+            setSharePath('');
+            setShareUsername('');
+            setSharePassword('');
+
+            window.dispatchEvent(new CustomEvent('force-explorer-view'));
+            const ok = await loadDirectory(trimmedPath);
+            if (ok) {
+                navigateTo(trimmedPath);
+            }
+            showSuccess(`Connected to "${derivedName}"`);
+        } catch (err) {
+            setShareError(typeof err === 'string' ? err : (err?.message || 'Failed to access network share'));
+        } finally {
+            setShareConnecting(false);
+        }
+    };
+
+    const handleRemoveNetworkShare = async (share) => {
+        const confirmed = await showConfirm(`Remove network share "${share.name}" from saved list?`);
+        if (!confirmed) return;
+        saveNetworkShares(networkShares.filter(s => s.path !== share.path));
+    };
+
     return (
         <div className="network-view">
             <div className="network-view-header">
                 <h2 className="network-view-title">Network</h2>
-                <p className="network-view-subtitle">Manage and connect to remote servers</p>
+                <p className="network-view-subtitle">Manage and connect to remote servers and SMB/UNC shares</p>
+            </div>
+
+            <div className="network-connections-section">
+                <div className="section-header">
+                    <h3 className="section-title">Network Shares (SMB / UNC)</h3>
+                    <button
+                        className="add-connection-button"
+                        onClick={() => {
+                            setShareError(null);
+                            setIsAddShareModalOpen(true);
+                        }}
+                        title="Add SMB / UNC Network Share"
+                    >
+                        <span className="icon icon-plus"></span>
+                        <span>Add Network Share</span>
+                    </button>
+                </div>
+
+                <div className="connections-grid">
+                    {networkShares.length === 0 ? (
+                        <div className="empty-connections">
+                            <div className="empty-connections-icon">
+                                <span className="icon icon-folder"></span>
+                            </div>
+                            <h4>No saved network shares</h4>
+                            <p>Open local network or domain paths like \\server\share directly</p>
+                            <button
+                                className="add-first-connection-button"
+                                onClick={() => {
+                                    setShareError(null);
+                                    setIsAddShareModalOpen(true);
+                                }}
+                            >
+                                Add Network Share
+                            </button>
+                        </div>
+                    ) : (
+                        networkShares.map((share) => (
+                            <div key={share.path} className="connection-card">
+                                <div className="connection-icon">
+                                    <span className="icon icon-folder"></span>
+                                </div>
+                                <div className="connection-details">
+                                    <h4 className="connection-name">{share.name}</h4>
+                                    <p className="connection-address">
+                                        {share.path}
+                                        {share.username ? ` · ${share.username}` : ''}
+                                    </p>
+                                </div>
+                                <div className="connection-actions">
+                                    <button
+                                        className="connect-button"
+                                        onClick={() => handleOpenNetworkShare(share)}
+                                        title="Open network share"
+                                    >
+                                        <span className="icon icon-play"></span>
+                                        Open
+                                    </button>
+                                    <button
+                                        className="remove-connection-button"
+                                        onClick={() => handleRemoveNetworkShare(share)}
+                                        title="Remove network share"
+                                        aria-label={`Remove ${share.name}`}
+                                    >
+                                        <span className="icon icon-x"></span>
+                                    </button>
+                                </div>
+                            </div>
+                        ))
+                    )}
+                </div>
             </div>
 
             <div className="network-connections-section">
@@ -240,6 +416,88 @@ const NetworkView = () => {
                 onAdd={addSftpConnection}
                 existingConnections={localSftpConnections}
             />
+
+            <Modal
+                isOpen={isAddShareModalOpen}
+                onClose={() => setIsAddShareModalOpen(false)}
+                title="Add Network Share (SMB / UNC)"
+                size="sm"
+                footer={
+                    <>
+                        <Button variant="ghost" onClick={() => setIsAddShareModalOpen(false)}>Cancel</Button>
+                        <Button
+                            variant="primary"
+                            onClick={handleAddNetworkShare}
+                            disabled={shareConnecting || !sharePath.trim()}
+                        >
+                            {shareConnecting ? 'Connecting...' : 'Open & Save'}
+                        </Button>
+                    </>
+                }
+            >
+                <form onSubmit={e => { e.preventDefault(); handleAddNetworkShare(); }}>
+                    <div className="form-group">
+                        <label htmlFor="share-path">Network Path (UNC)</label>
+                        <input
+                            type="text"
+                            id="share-path"
+                            className="input"
+                            value={sharePath}
+                            onChange={e => setSharePath(e.target.value)}
+                            placeholder="\\server\share\folder"
+                            autoFocus
+                        />
+                    </div>
+                    <div className="form-group">
+                        <label htmlFor="share-name">Name (optional)</label>
+                        <input
+                            type="text"
+                            id="share-name"
+                            className="input"
+                            value={shareName}
+                            onChange={e => setShareName(e.target.value)}
+                            placeholder="Share name"
+                        />
+                    </div>
+                    <div className="form-group">
+                        <label htmlFor="share-username">Username (optional for domain / guest)</label>
+                        <input
+                            type="text"
+                            id="share-username"
+                            className="input"
+                            value={shareUsername}
+                            onChange={e => setShareUsername(e.target.value)}
+                            placeholder="DOMAIN\user or leave blank"
+                        />
+                    </div>
+                    {shareUsername.trim() && (
+                        <>
+                            <div className="form-group">
+                                <label htmlFor="share-password">Password</label>
+                                <input
+                                    type="password"
+                                    id="share-password"
+                                    className="input"
+                                    value={sharePassword}
+                                    onChange={e => setSharePassword(e.target.value)}
+                                    placeholder="Password (stored in OS keyring)"
+                                />
+                            </div>
+                            <div className="form-group">
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={shareRemember}
+                                        onChange={e => setShareRemember(e.target.checked)}
+                                    />
+                                    <span>Save password securely in OS keyring</span>
+                                </label>
+                            </div>
+                        </>
+                    )}
+                    {shareError && <div className="input-hint" style={{ color: 'var(--error, #e53e3e)' }}>{shareError}</div>}
+                </form>
+            </Modal>
         </div>
     );
 };

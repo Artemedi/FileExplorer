@@ -42,6 +42,8 @@ fn all_commands() -> fn(Invoke) -> bool {
         volume_operations_commands::get_system_volumes_information_as_json,
         volume_operations_commands::get_system_volumes_information,
         volume_operations_commands::eject_volume,
+        volume_operations_commands::connect_network_share,
+        volume_operations_commands::get_physical_disks_info,
         // Settings commands
         settings_commands::get_settings_as_json,
         settings_commands::update_settings_field,

@@ -123,7 +123,7 @@ pub fn format_sftp_connection_key(username: &str, host: &str, port: u16) -> Stri
     format!("{}@{}:{}", username.trim(), host.trim(), port)
 }
 
-fn keyring_set_password(connection_key: &str, password: &str) {
+pub(crate) fn keyring_set_password(connection_key: &str, password: &str) {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, connection_key) {
         if let Err(err) = entry.set_password(password) {
             log_info!(
@@ -135,7 +135,7 @@ fn keyring_set_password(connection_key: &str, password: &str) {
     }
 }
 
-fn keyring_get_password(connection_key: &str) -> Option<ZeroizingString> {
+pub(crate) fn keyring_get_password(connection_key: &str) -> Option<ZeroizingString> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, connection_key).ok()?;
     match entry.get_password() {
         Ok(pw) if !pw.is_empty() => Some(ZeroizingString::new(pw)),
