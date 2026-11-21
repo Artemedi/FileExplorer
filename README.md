@@ -19,14 +19,22 @@
   - Fast fuzzy search with ART (Adaptive Radix Tree) implementation
   - LRU caching for optimal performance
   - Multiple search algorithms for different use cases
-- **📁 Comprehensive File Operations**: Copy, move, delete, rename with robust error handling
-- **🌐 SFTP Support**: Full remote file system operations including browsing, uploading, and downloading
+- **📁 Comprehensive File Operations**: Copy, move, delete, rename with interactive conflict resolution (Replace / Insert Duplicate / Rename Original / Skip) and robust error handling
+- **⚖️ Dual-Pane & Directory Compare**: Side-by-side browsing with case-insensitive diffing (`size` + `last_modified`), `Diff Only` filter, and `F5`/`Shift+F6` transfers
+- **🌐 SFTP, SSH & SMB/UNC Network Shares**:
+  - Full SFTP support with `Password`, `SSH Key`, `Key + Certificate`, `SSH Agent`, and `Guest` authentication stored securely in OS `keyring`
+  - Per-operation `sudo` elevation and adaptive `zstd` / `zlib` transfer compression
+  - Native Windows SMB / UNC network share mounting (`\\server\share`) with live TCP latency/reachability monitoring and `0-9 · A-Z · А-Я` grouping
+- **💻 Multi-Tab Embedded Terminal (`xterm.js` + WebGL)**: Per-context tabs (`Local` / `SSH`), auto-launched interactive SSH PTY (`mc`, `btop`, `htop`, `sudo`), fullscreen mode, directory sync with the explorer, and one-click `Ext SSH` native terminal launch
+- **💾 Disk & Partition Manager**: Physical disk/partition layout inspection (`GPT`/`MBR`), formatting (`NTFS`, `exFAT`, `FAT32`, `ReFS`, `ext4`, `xfs`, `btrfs`, `f2fs`, `swap`), partition create/resize/delete, raw `.img` / Zstd `.img.zst` imaging (local, UNC, SFTP), and cloning with system-disk safety guards
 - **🔐 Advanced Permissions**: File and directory permission management
 - **📊 File Metadata**: Comprehensive metadata viewing and management
 - **🔨 File Hashing**: MD5, SHA2, and CRC32 hash generation for file integrity
 - **📄 File Templates**: Template system for creating new files
 - **👁️ File Preview**: Built-in preview system for various file types (spotlight-like)
-- **💾 Volume Operations**: Drive management and volume operations
+- **💾 Volume Operations**: Drive management, safe eject, and volume operations
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list of changes and fixes in `v0.2.16`.
 - **⚙️ Customizable Settings**: Extensive configuration options
 - **🎨 Modern UI**: React-based interface with context menus and responsive design
 - **⚡ Real-Time File Watching**: Automatic live directory updates powered by the Rust `notify` engine
