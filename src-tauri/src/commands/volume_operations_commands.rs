@@ -1881,6 +1881,110 @@ pub async fn check_network_endpoints(
     Ok(results)
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct UserDirectoryInfo {
+    pub name: String,
+    pub path: String,
+    pub icon: String,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_xdg_user_dirs_content(content: &str, home_dir: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let trimmed_home = home_dir.trim_end_matches('/');
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw_val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = raw_val.trim().trim_matches('"');
+        if val.is_empty() {
+            continue;
+        }
+        let resolved = val.replace("$HOME", trimmed_home);
+        out.push((key.to_string(), resolved));
+    }
+    out
+}
+
+/// Returns existing standard/XDG user directories without logging errors for missing optional folders.
+#[tauri::command]
+pub fn get_user_directories() -> Vec<UserDirectoryInfo> {
+    let Some(home) = dirs_home() else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+
+    #[cfg(target_os = "linux")]
+    {
+        let user_dirs_file = home.join(".config/user-dirs.dirs");
+        if let Ok(content) = std::fs::read_to_string(user_dirs_file) {
+            let parsed = parse_xdg_user_dirs_content(&content, &home.to_string_lossy());
+            let map: std::collections::HashMap<String, String> = parsed.into_iter().collect();
+            let specs = [
+                ("XDG_DESKTOP_DIR", "Desktop", "desktop"),
+                ("XDG_DOCUMENTS_DIR", "Documents", "documents"),
+                ("XDG_DOWNLOAD_DIR", "Downloads", "downloads"),
+                ("XDG_PICTURES_DIR", "Pictures", "pictures"),
+                ("XDG_MUSIC_DIR", "Music", "music"),
+                ("XDG_VIDEOS_DIR", "Videos", "videos"),
+            ];
+            for (xdg_key, label, icon) in specs {
+                if let Some(p) = map.get(xdg_key) {
+                    let path_buf = std::path::PathBuf::from(p);
+                    if path_buf != home && path_buf.is_dir() && seen_paths.insert(p.clone()) {
+                        results.push(UserDirectoryInfo {
+                            name: label.to_string(),
+                            path: p.clone(),
+                            icon: icon.to_string(),
+                        });
+                    }
+                }
+            }
+            if !results.is_empty() {
+                return results;
+            }
+        }
+    }
+
+    let fallback_specs: [(&str, &[&str], &str); 6] = [
+        ("Desktop", &["Desktop"], "desktop"),
+        ("Documents", &["Documents"], "documents"),
+        ("Downloads", &["Downloads"], "downloads"),
+        ("Pictures", &["Pictures"], "pictures"),
+        ("Music", &["Music"], "music"),
+        ("Videos", &["Videos", "Movies"], "videos"),
+    ];
+
+    for (label, candidates, icon) in fallback_specs {
+        for sub in candidates {
+            let p = home.join(sub);
+            if p.is_dir() {
+                let path_str = p.to_string_lossy().into_owned();
+                if seen_paths.insert(path_str.clone()) {
+                    results.push(UserDirectoryInfo {
+                        name: label.to_string(),
+                        path: path_str,
+                        icon: icon.to_string(),
+                    });
+                }
+                break;
+            }
+        }
+    }
+
+    results
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    home::home_dir()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2076,5 +2180,29 @@ mod tests {
             Some("filesrv.corp.local")
         );
         assert_eq!(extract_unc_host("C:\\local\\path"), None);
+    }
+
+    #[test]
+    fn test_parse_xdg_user_dirs() {
+        let sample = r#"
+# Comment
+XDG_DESKTOP_DIR="$HOME/Рабочий стол"
+XDG_DOWNLOAD_DIR="$HOME/Загрузки"
+XDG_VIDEOS_DIR=""
+"#;
+        let parsed = parse_xdg_user_dirs_content(sample, "/home/Trintos");
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "XDG_DESKTOP_DIR".to_string(),
+                    "/home/Trintos/Рабочий стол".to_string()
+                ),
+                (
+                    "XDG_DOWNLOAD_DIR".to_string(),
+                    "/home/Trintos/Загрузки".to_string()
+                ),
+            ]
+        );
     }
 }

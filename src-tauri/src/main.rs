@@ -54,6 +54,7 @@ fn all_commands() -> fn(Invoke) -> bool {
         volume_operations_commands::create_disk_image,
         volume_operations_commands::clone_or_restore_disk,
         volume_operations_commands::check_network_endpoints,
+        volume_operations_commands::get_user_directories,
         // Settings commands
         settings_commands::get_settings_as_json,
         settings_commands::update_settings_field,
@@ -209,8 +210,72 @@ pub fn extract_startup_target_path(args: &[String]) -> Option<String> {
     extract_startup_target_path_with_cwd(args, cwd.as_deref())
 }
 
+fn compute_linux_graphics_env_overrides(
+    is_wayland: bool,
+    has_nvidia: bool,
+    has_gdk_backend: bool,
+    has_dmabuf_disable: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let mut overrides = Vec::new();
+    if has_nvidia {
+        if !has_dmabuf_disable {
+            overrides.push(("WEBKIT_DISABLE_DMABUF_RENDERER", "1"));
+        }
+        if is_wayland && !has_gdk_backend {
+            overrides.push(("GDK_BACKEND", "x11"));
+        }
+    }
+    overrides
+}
+
+#[cfg(target_os = "linux")]
+fn detect_nvidia_gpu_linux() -> bool {
+    if Path::new("/proc/driver/nvidia/version").exists() || Path::new("/dev/nvidia0").exists() {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+        for entry in entries.flatten() {
+            let vendor_path = entry.path().join("device/vendor");
+            if let Ok(vendor) = std::fs::read_to_string(vendor_path) {
+                if vendor.trim().eq_ignore_ascii_case("0x10de") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_graphics_environment() {
+    let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|v| v.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false);
+    let has_nvidia = detect_nvidia_gpu_linux();
+    let has_gdk_backend = std::env::var_os("GDK_BACKEND").is_some();
+    let has_dmabuf_disable = std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some();
+
+    let overrides = compute_linux_graphics_env_overrides(
+        is_wayland,
+        has_nvidia,
+        has_gdk_backend,
+        has_dmabuf_disable,
+    );
+    for (key, val) in overrides {
+        // SAFETY: Called in main() before spawning threads or initializing GTK/WebKit.
+        unsafe {
+            std::env::set_var(key, val);
+        }
+        eprintln!("[explr] NVIDIA/Wayland WebKitGTK workaround: {key}={val}");
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    #[cfg(target_os = "linux")]
+    configure_linux_graphics_environment();
+
     // Parse startup CLI arguments (e.g. explr.exe "C:\Path")
     let raw_args: Vec<String> = std::env::args().collect();
     if let Some(target) = extract_startup_target_path(&raw_args) {
@@ -313,5 +378,23 @@ mod tests {
         let extracted = extract_startup_target_path(&args)
             .expect("C:\" should normalize and resolve to C:\\ on Windows");
         assert_eq!(extracted, "C:\\");
+    }
+
+    #[test]
+    fn test_linux_graphics_env_overrides() {
+        assert_eq!(
+            compute_linux_graphics_env_overrides(true, true, false, false),
+            vec![
+                ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
+                ("GDK_BACKEND", "x11")
+            ]
+        );
+        // Respect explicit user overrides
+        assert_eq!(
+            compute_linux_graphics_env_overrides(true, true, true, false),
+            vec![("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+        // Non-NVIDIA Wayland keeps native Wayland
+        assert!(compute_linux_graphics_env_overrides(true, false, false, false).is_empty());
     }
 }

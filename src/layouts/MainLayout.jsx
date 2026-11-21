@@ -379,6 +379,12 @@ const MainLayout = () => {
                     console.log('MainLayout: Has no indexed files:', hasNoIndexedFiles);
 
                     if (hasNoIndexedFiles) {
+                        const lastAutoIdx = Number(localStorage.getItem('explr_home_auto_indexed_at') || 0);
+                        const oneDayMs = 24 * 60 * 60 * 1000;
+                        if (lastAutoIdx > 0 && Date.now() - lastAutoIdx < oneDayMs) {
+                            console.log('MainLayout: Skipping home auto-indexing (recently indexed)');
+                            return;
+                        }
                         console.log('MainLayout: Starting auto-indexing of home directory...');
                         
                         // Get system info to get the proper home directory
@@ -396,6 +402,11 @@ const MainLayout = () => {
                         const result = await invoke('add_paths_recursive_async', {
                             folder: metaData.user_home_dir
                         });
+                        try {
+                            localStorage.setItem('explr_home_auto_indexed_at', String(Date.now()));
+                        } catch {
+                            // ignore storage errors
+                        }
                         
                         console.log('MainLayout: Auto-indexing initiated:', result);
                     } else {

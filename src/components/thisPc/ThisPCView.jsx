@@ -92,8 +92,15 @@ const ThisPCView = () => {
     const loadUserFolders = async () => {
         if (!systemInfo) return;
 
-        console.log('Loading user folders for OS:', systemInfo.current_running_os);
-        console.log('User home directory:', systemInfo.user_home_dir);
+        try {
+            const xdgFolders = await invoke('get_user_directories');
+            if (Array.isArray(xdgFolders)) {
+                setUserFolders(xdgFolders);
+                return;
+            }
+        } catch {
+            // Fallback below if command is unavailable in mocked test environments
+        }
 
         const folders = [];
 
