@@ -34,7 +34,6 @@
 - **👁️ File Preview**: Built-in preview system for various file types (spotlight-like)
 - **💾 Volume Operations**: Drive management, safe eject, and volume operations
 
-See [CHANGELOG.md](CHANGELOG.md) for the full list of changes and fixes in `v0.2.16`.
 - **⚙️ Customizable Settings**: Extensive configuration options
 - **🎨 Modern UI**: React-based interface with context menus and responsive design
 - **⚡ Real-Time File Watching**: Automatic live directory updates powered by the Rust `notify` engine
