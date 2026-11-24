@@ -8,6 +8,15 @@ import { useSftp } from '../../providers/SftpProvider';
 import Icon from '../common/Icon';
 import XtermSshView from './XtermSshView';
 import { joinPath } from '../../utils/pathUtils';
+import {
+    buildShellIntegrationCommand,
+    consumeOscChunk,
+    extractOscDirectory,
+    extractOscPromptState,
+    getParentRemoteDirs,
+    isElevationCommand,
+    normalizeRemotePosixPath,
+} from '../../utils/terminalOsc';
 import './terminal.css';
 
 const isLocalDirectory = (path) => typeof path === 'string' && path.length > 0 && !path.startsWith('sftp:');
@@ -104,33 +113,6 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
 const getSshTabId = (conn) =>
     `ssh:${conn.username || 'guest'}@${conn.host}:${conn.port || 22}`;
 
-const extractOscDirectory = (chunk) => {
-    if (!chunk || typeof chunk !== 'string') return null;
-    // OSC 7: \x1b]7;file://host/path\x07 or ST
-    const osc7 = chunk.match(/\x1b\]7;file:\/\/[^/\x07\x1b]*([^\x07\x1b]+)(?:\x07|\x1b\\)/g);
-    if (osc7 && osc7.length > 0) {
-        const last = osc7[osc7.length - 1];
-        const m = last.match(/\x1b\]7;file:\/\/[^/\x07\x1b]*([^\x07\x1b]+)/);
-        if (m?.[1]) {
-            try {
-                return decodeURIComponent(m[1]);
-            } catch {
-                return m[1];
-            }
-        }
-    }
-    // OSC 0 / 2 title: \x1b]0;user@host:/path\x07 (common on RHEL/CentOS/Ubuntu bashrc)
-    const oscTitle = chunk.match(/\x1b\][02];[^:\x07\x1b]+:(\/[^\x07\x1b]*|~[^\x07\x1b]*)(?:\x07|\x1b\\)/g);
-    if (oscTitle && oscTitle.length > 0) {
-        const last = oscTitle[oscTitle.length - 1];
-        const m = last.match(/\x1b\][02];[^:\x07\x1b]+:(\/[^\x07\x1b]*|~[^\x07\x1b]*)/);
-        if (m?.[1] && m[1].startsWith('/')) {
-            return m[1];
-        }
-    }
-    return null;
-};
-
 const parsePrompt = (promptStr = '') => {
     const atIdx = promptStr.indexOf('@');
     const colonIdx = promptStr.indexOf(':', atIdx + 1);
@@ -212,6 +194,27 @@ const Terminal = ({ isOpen, onToggle }) => {
     const xtermControllersRef = useRef({});
     const autoPtyAttemptedRef = useRef(new Set());
     const syncingFromTerminalRef = useRef(false);
+    const oscBufferRef = useRef(new Map());
+    const shellIdleRef = useRef(new Map());
+    const shellHookSeenRef = useRef(new Map());
+    const ptyInputLineRef = useRef(new Map());
+    const sshHomeDirRef = useRef(new Map());
+    const lastFailedSyncDirRef = useRef(new Map());
+    const pendingElevationReinjectRef = useRef(new Map());
+    const elevationTimerRef = useRef(new Map());
+    const syncTimerRef = useRef(null);
+    const forceSyncNextOscRef = useRef(new Set());
+
+    const loadDirectoryRef = useRef(loadDirectory);
+    loadDirectoryRef.current = loadDirectory;
+    const navigateToRef = useRef(navigateTo);
+    navigateToRef.current = navigateTo;
+    const isSftpPathRef = useRef(isSftpPath);
+    isSftpPathRef.current = isSftpPath;
+    const parseSftpPathRef = useRef(parseSftpPath);
+    parseSftpPathRef.current = parseSftpPath;
+    const createSftpUrlRef = useRef(createSftpUrl);
+    createSftpUrlRef.current = createSftpUrl;
 
     const [terminalTabs, setTerminalTabs] = useState(() => ([
         {
@@ -275,6 +278,123 @@ const Terminal = ({ isOpen, onToggle }) => {
     const ptySessionIdRef = useRef(null);
     ptySessionIdRef.current = ptySessionId;
 
+    const cleanupSessionTracking = (sessionId) => {
+        if (!sessionId) return;
+        oscBufferRef.current.delete(sessionId);
+        shellIdleRef.current.delete(sessionId);
+        shellHookSeenRef.current.delete(sessionId);
+        ptyInputLineRef.current.delete(sessionId);
+        pendingElevationReinjectRef.current.delete(sessionId);
+        const timer = elevationTimerRef.current.get(sessionId);
+        if (timer) {
+            clearTimeout(timer);
+            elevationTimerRef.current.delete(sessionId);
+        }
+    };
+
+    const injectShellIntegration = (sessionId) => {
+        if (!sessionId) return;
+        invoke('ssh_write_pty', {
+            sessionId,
+            data: buildShellIntegrationCommand(),
+        }).catch(() => {});
+    };
+
+    const fetchHomeDirForTab = async (tabId, conn) => {
+        if (!tabId || !conn?.host || sshHomeDirRef.current.has(tabId)) return;
+        try {
+            const res = await executeSshCommand(conn, 'printf %s "$HOME"', '.');
+            const home = res?.stdout?.trim();
+            if (res?.exit_code === 0 && home && home.startsWith('/')) {
+                sshHomeDirRef.current.set(tabId, normalizeRemotePosixPath(home));
+            }
+        } catch {
+            // Ignore $HOME probe failures
+        }
+    };
+
+    const setupPtySessionHooks = (tabId, conn, sessionId) => {
+        if (!sessionId) return;
+        fetchHomeDirForTab(tabId, conn);
+        setTimeout(() => {
+            injectShellIntegration(sessionId);
+        }, 350);
+    };
+
+    const syncExplorerToRemoteDir = async (ownerTab, targetDir, forceRetry = false) => {
+        if (!ownerTab?.sshConnection || !targetDir) return;
+        const normalizedTarget = normalizeRemotePosixPath(targetDir);
+        const cur = currentPathRef.current;
+        if (!isSftpPathRef.current(cur)) return;
+        const parsedCur = parseSftpPathRef.current(cur);
+        if (!parsedCur?.connection || getSshTabId(parsedCur.connection) !== ownerTab.id) return;
+
+        const curRemotePath = normalizeRemotePosixPath(parsedCur.remotePath || '/');
+        if (
+            !forceRetry &&
+            normalizedTarget === curRemotePath &&
+            lastFailedSyncDirRef.current.get(ownerTab.id) !== normalizedTarget
+        ) {
+            return;
+        }
+
+        const nextSftpUrl = createSftpUrlRef.current(ownerTab.sshConnection, normalizedTarget);
+        if (syncTimerRef.current) {
+            clearTimeout(syncTimerRef.current);
+        }
+        syncingFromTerminalRef.current = true;
+        try {
+            const ok = await loadDirectoryRef.current(nextSftpUrl);
+            if (ok) {
+                lastFailedSyncDirRef.current.delete(ownerTab.id);
+                navigateToRef.current(nextSftpUrl);
+            } else {
+                lastFailedSyncDirRef.current.set(ownerTab.id, normalizedTarget);
+                const parents = getParentRemoteDirs(normalizedTarget, 3);
+                for (const parentDir of parents) {
+                    if (parentDir === curRemotePath) break;
+                    const parentUrl = createSftpUrlRef.current(ownerTab.sshConnection, parentDir);
+                    const parentOk = await loadDirectoryRef.current(parentUrl, {
+                        silent: true,
+                        silentError: true,
+                    });
+                    if (parentOk) {
+                        navigateToRef.current(parentUrl);
+                        break;
+                    }
+                }
+            }
+        } catch {
+            // Ignore directory sync navigation errors
+        } finally {
+            syncTimerRef.current = setTimeout(() => {
+                syncingFromTerminalRef.current = false;
+            }, 150);
+        }
+    };
+    const syncExplorerToRemoteDirRef = useRef(syncExplorerToRemoteDir);
+    syncExplorerToRemoteDirRef.current = syncExplorerToRemoteDir;
+
+    const trackPtyUserInput = (sessionId, data) => {
+        if (!sessionId || !data) return;
+        let line = ptyInputLineRef.current.get(sessionId) || '';
+        for (const ch of data) {
+            if (ch === '\r' || ch === '\n') {
+                if (isElevationCommand(line)) {
+                    pendingElevationReinjectRef.current.set(sessionId, true);
+                }
+                line = '';
+            } else if (ch === '\x7f' || ch === '\b') {
+                line = line.slice(0, -1);
+            } else if (ch === '\x03' || ch === '\x15') {
+                line = '';
+            } else if (ch >= ' ') {
+                line += ch;
+            }
+        }
+        ptyInputLineRef.current.set(sessionId, line.slice(-256));
+    };
+
     useEffect(() => {
         let unlistenOut = null;
         let unlistenExit = null;
@@ -309,36 +429,63 @@ const Terminal = ({ isOpen, onToggle }) => {
                         }
                     }
 
-                    // Follow directory changes emitted by remote shell (OSC 7 / OSC 0/2)
-                    const detectedDir = extractOscDirectory(payload.data);
-                    if (detectedDir && detectedDir.startsWith('/')) {
-                        const ownerTab = terminalTabsRef.current.find((t) => t.ptySessionId === payload.session_id);
-                        if (ownerTab && ownerTab.sshConnection && ownerTab.sshWorkingDir !== detectedDir) {
-                            updateTab(ownerTab.id, { sshWorkingDir: detectedDir });
-                            const cur = currentPathRef.current;
-                            if (isSftpPath(cur)) {
-                                const parsedCur = parseSftpPath(cur);
-                                if (parsedCur && getSshTabId(parsedCur.connection) === ownerTab.id) {
-                                    const nextSftpUrl = createSftpUrl(ownerTab.sshConnection, detectedDir);
-                                    if (nextSftpUrl !== cur) {
-                                        syncingFromTerminalRef.current = true;
-                                        loadDirectory(nextSftpUrl)
-                                            .then((ok) => {
-                                                if (ok) navigateTo(nextSftpUrl);
-                                            })
-                                            .catch(() => {})
-                                            .finally(() => {
-                                                setTimeout(() => { syncingFromTerminalRef.current = false; }, 100);
-                                            });
+                    // Buffer partial OSC / ESC sequences across PTY output chunks
+                    const prevOscBuf = oscBufferRef.current.get(payload.session_id) || '';
+                    const { completed: oscChunk, remainingBuffer } = consumeOscChunk(prevOscBuf, payload.data);
+                    oscBufferRef.current.set(payload.session_id, remainingBuffer);
+
+                    const promptState = extractOscPromptState(oscChunk);
+                    if (promptState) {
+                        shellHookSeenRef.current.set(payload.session_id, true);
+                        shellIdleRef.current.set(payload.session_id, promptState === 'idle');
+                        if (promptState === 'idle') {
+                            pendingElevationReinjectRef.current.delete(payload.session_id);
+                        }
+                    }
+
+                    // Re-inject shell hook after sudo -i / su reaches the elevated shell prompt
+                    if (pendingElevationReinjectRef.current.get(payload.session_id)) {
+                        const plainChunk = stripAnsiCodes(payload.data);
+                        if (!/password|пароль|passphrase|try again/i.test(plainChunk) &&
+                            /(?:^|\n)[^\r\n]*(?:#|\$|>|%)\s*$/.test(plainChunk)
+                        ) {
+                            const prevTimer = elevationTimerRef.current.get(payload.session_id);
+                            if (prevTimer) clearTimeout(prevTimer);
+                            const sidToReinject = payload.session_id;
+                            elevationTimerRef.current.set(
+                                sidToReinject,
+                                setTimeout(() => {
+                                    elevationTimerRef.current.delete(sidToReinject);
+                                    if (pendingElevationReinjectRef.current.get(sidToReinject)) {
+                                        pendingElevationReinjectRef.current.delete(sidToReinject);
+                                        injectShellIntegration(sidToReinject);
                                     }
-                                }
+                                }, 180)
+                            );
+                        }
+                    }
+
+                    // Follow directory changes emitted by remote shell (OSC 7 / OSC 0/2)
+                    const ownerTab = terminalTabsRef.current.find((t) => t.ptySessionId === payload.session_id);
+                    const homeDir = ownerTab ? sshHomeDirRef.current.get(ownerTab.id) : null;
+                    const detectedDir = extractOscDirectory(oscChunk, homeDir);
+                    if (detectedDir && detectedDir.startsWith('/') && ownerTab && ownerTab.sshConnection) {
+                        const forceSync = forceSyncNextOscRef.current.has(ownerTab.id);
+                        if (forceSync) {
+                            forceSyncNextOscRef.current.delete(ownerTab.id);
+                        }
+                        if (ownerTab.sshWorkingDir !== detectedDir || forceSync) {
+                            if (ownerTab.sshWorkingDir !== detectedDir) {
+                                updateTab(ownerTab.id, { sshWorkingDir: detectedDir });
                             }
+                            syncExplorerToRemoteDirRef.current(ownerTab, detectedDir, forceSync);
                         }
                     }
                 });
                 unlistenExit = await listen('ssh-pty-exit', (event) => {
                     const payload = event?.payload;
                     if (!active || !payload?.session_id) return;
+                    cleanupSessionTracking(payload.session_id);
                     setTerminalTabs((prev) =>
                         prev.map((tab) =>
                             tab.ptySessionId === payload.session_id
@@ -363,8 +510,10 @@ const Terminal = ({ isOpen, onToggle }) => {
             active = false;
             if (typeof unlistenOut === 'function') unlistenOut();
             if (typeof unlistenExit === 'function') unlistenExit();
+            if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
             for (const tab of terminalTabsRef.current) {
                 if (tab.ptySessionId) {
+                    cleanupSessionTracking(tab.ptySessionId);
                     invoke('ssh_close_pty', { sessionId: tab.ptySessionId }).catch(() => {});
                 }
             }
@@ -444,6 +593,7 @@ const Terminal = ({ isOpen, onToggle }) => {
             .then((sid) => {
                 if (sid) {
                     setPtySessionId(sid, targetTabId);
+                    setupPtySessionHooks(targetTabId, conn, sid);
                 }
             })
             .catch((e) => {
@@ -581,6 +731,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                     if (res.exit_code === 0 && res.stdout?.trim()) {
                         const newRemoteDir = res.stdout.trim().split('\n').pop().trim();
                         setSshWorkingDir(newRemoteDir);
+                        await syncExplorerToRemoteDir(activeTab, newRemoteDir);
                         return { type: 'system', content: `[SSH] Directory: ${newRemoteDir}` };
                     }
                     return { type: 'error', content: res.stderr?.trim() || 'cd failed' };
@@ -1667,6 +1818,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                                         updateTab(tabId, { ptyDisabledManually: false });
                                         const sid = await startSshPty(activeSshConnection, sshWorkingDir, 100, 30);
                                         setPtySessionId(sid, tabId);
+                                        setupPtySessionHooks(tabId, activeSshConnection, sid);
                                     } catch (e) {
                                         setCommandHistory(prev => [
                                             ...prev,
@@ -1678,6 +1830,20 @@ const Terminal = ({ isOpen, onToggle }) => {
                             title={ptySessionId ? 'Stop interactive SSH PTY' : 'Start interactive SSH PTY'}
                         >
                             {ptySessionId ? 'Stop PTY' : 'PTY'}
+                        </button>
+                    )}
+                    {activeSshConnection && ptySessionId && (
+                        <button
+                            type="button"
+                            className="terminal-control"
+                            onClick={() => {
+                                lastFailedSyncDirRef.current.delete(activeTab.id);
+                                forceSyncNextOscRef.current.add(activeTab.id);
+                                injectShellIntegration(ptySessionId);
+                            }}
+                            title="Re-enable directory sync hook in current shell (useful after sudo/su)"
+                        >
+                            Sync
                         </button>
                     )}
                     {activeSshConnection && (
@@ -1758,6 +1924,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                         isVisible={isOpen && tab.id === activeTab?.id}
                         isFullscreen={isFullscreen}
                         onData={(data) => {
+                            trackPtyUserInput(tab.ptySessionId, data);
                             invoke('ssh_write_pty', { sessionId: tab.ptySessionId, data }).catch(() => {});
                         }}
                         onResize={(cols, rows) => {

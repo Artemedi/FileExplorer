@@ -104,7 +104,7 @@ export default function FileSystemProvider({ children }) {
             // Check if it's an SFTP path
             if (isSftpPath(path)) {
                 console.log(`Loading SFTP directory: ${path}`);
-                const sftpData = await loadSftpDirectory(path);
+                const sftpData = await loadSftpDirectory(path, options);
                 if (requestId !== loadRequestIdRef.current) {
                     return false;
                 }

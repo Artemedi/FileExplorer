@@ -343,8 +343,13 @@ export default function SftpProvider({ children }) {
         return `sftp:${connection.name}:${remotePath}`;
     }, []);
 
+    const isPermissionDeniedError = useCallback((err) => {
+        const msg = getErrorMessage(err).toLowerCase();
+        return msg.includes('permission denied') || msg.includes('eacces') || msg.includes('operation not permitted');
+    }, []);
+
     // Navigate to an SFTP connection
-    const navigateToSftpConnection = useCallback(async (connection, remotePath = '.') => {
+    const navigateToSftpConnection = useCallback(async (connection, remotePath = '.', options = {}) => {
         if (!connection) {
             console.error('No connection provided to navigateToSftpConnection');
             return null;
@@ -414,35 +419,40 @@ export default function SftpProvider({ children }) {
         } catch (error) {
             const errMsg = getErrorMessage(error);
             console.error('Failed to load SFTP directory:', errMsg);
-            showError(`Failed to connect to ${connection.name}: ${errMsg}`);
+            if (!options?.silentError) {
+                if (isPermissionDeniedError(error)) {
+                    showError(`Permission denied for "${remotePath}" (user ${connection.username || 'unknown'})`);
+                } else {
+                    showError(`Failed to load "${remotePath}": ${errMsg}`);
+                }
+            }
             return null;
         }
-    }, [createSftpUrl, invokeSftp]);
+    }, [createSftpUrl, invokeSftp, isPermissionDeniedError]);
 
     // Load SFTP directory
-    const loadSftpDirectory = useCallback(async (sftpPath) => {
+    const loadSftpDirectory = useCallback(async (sftpPath, options = {}) => {
         const parsed = parseSftpPath(sftpPath);
 
         if (!parsed || !parsed.connection) {
             console.error('Invalid SFTP path or connection not found');
-            showError('Invalid SFTP path or connection not found');
+            if (!options?.silentError) {
+                showError('Invalid SFTP path or connection not found');
+            }
             return null;
         }
 
         try {
-            return await navigateToSftpConnection(parsed.connection, parsed.remotePath);
+            return await navigateToSftpConnection(parsed.connection, parsed.remotePath, options);
         } catch (error) {
             const errMsg = getErrorMessage(error);
             console.error('Error in loadSftpDirectory:', errMsg);
-            showError(`Failed to load SFTP directory: ${errMsg}`);
+            if (!options?.silentError) {
+                showError(`Failed to load SFTP directory: ${errMsg}`);
+            }
             return null;
         }
     }, [parseSftpPath, navigateToSftpConnection]);
-
-    const isPermissionDeniedError = (err) => {
-        const msg = getErrorMessage(err).toLowerCase();
-        return msg.includes('permission denied') || msg.includes('eacces') || msg.includes('operation not permitted');
-    };
 
     const runSshSudoOperation = useCallback(async (connection, operation, remotePath, targetPath = null, content = null) => {
         if (!connection?.host) return false;
