@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SystemClipboardFiles {
     pub paths: Vec<String>,
@@ -8,6 +9,7 @@ pub struct SystemClipboardFiles {
 
 /// Builds a Win32 `DROPFILES` clipboard payload (20-byte header with `pFiles = 20`,
 /// `fWide = 1`, followed by UTF-16LE NUL-terminated paths and a trailing NUL).
+#[cfg(any(windows, test))]
 pub fn build_dropfiles_buffer(paths: &[String]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(20 + paths.len() * 32 + 2);
     // DROPFILES header: pFiles (u32), pt.x (i32), pt.y (i32), fNC (i32), fWide (i32)
