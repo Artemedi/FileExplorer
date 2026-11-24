@@ -744,6 +744,7 @@ fn validate_confirm_token(expected: &str, provided: &str) -> Result<(), String> 
     Ok(())
 }
 
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
 fn validate_filesystem_name(fs: &str, is_windows: bool) -> Result<String, String> {
     let normalized = fs.trim().to_ascii_lowercase();
     if is_windows {

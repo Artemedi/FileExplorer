@@ -214,6 +214,7 @@ pub fn extract_startup_target_path(args: &[String]) -> Option<String> {
     extract_startup_target_path_with_cwd(args, cwd.as_deref())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn compute_linux_graphics_env_overrides(
     is_wayland: bool,
     has_nvidia: bool,

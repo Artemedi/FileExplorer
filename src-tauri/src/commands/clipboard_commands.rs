@@ -18,7 +18,12 @@ pub fn build_dropfiles_buffer(paths: &[String]) -> Vec<u8> {
     buf.extend_from_slice(&1i32.to_le_bytes());
 
     for path in paths {
-        for unit in path.chars().filter(|&c| c != '\0').collect::<String>().encode_utf16() {
+        for unit in path
+            .chars()
+            .filter(|&c| c != '\0')
+            .collect::<String>()
+            .encode_utf16()
+        {
             buf.extend_from_slice(&unit.to_le_bytes());
         }
         buf.extend_from_slice(&0u16.to_le_bytes());
@@ -131,7 +136,11 @@ mod win_clipboard {
         }
 
         let dropfiles_buf = build_dropfiles_buffer(&normalized);
-        let drop_effect_val = if cut { DROPEFFECT_MOVE } else { DROPEFFECT_COPY };
+        let drop_effect_val = if cut {
+            DROPEFFECT_MOVE
+        } else {
+            DROPEFFECT_COPY
+        };
         let drop_effect_buf = drop_effect_val.to_le_bytes();
         let text_payload: Vec<u8> = normalized
             .join("\r\n")
@@ -274,8 +283,10 @@ mod tests {
 
         // Decode UTF-16LE payload after 20-byte header
         let u16_units: Vec<u16> = buf[20..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
             .collect();
 
         // Must end with two NUL code units (path terminator + list terminator)
