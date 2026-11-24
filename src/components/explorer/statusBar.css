@@ -1,0 +1,56 @@
+.explorer-status-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+    height: var(--footer-height);
+    min-height: var(--footer-height);
+    flex-shrink: 0;
+    padding: 0 var(--space-md);
+    background-color: var(--background-secondary);
+    border-top: 1px solid var(--border);
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    user-select: none;
+}
+
+.status-bar-details {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+}
+
+.status-bar-name {
+    color: var(--text-primary);
+    font-weight: var(--font-weight-medium);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.status-bar-selected {
+    color: var(--text-primary);
+    font-weight: var(--font-weight-medium);
+    white-space: nowrap;
+}
+
+.status-bar-sep {
+    color: var(--text-tertiary);
+    flex-shrink: 0;
+}
+
+.status-bar-meta {
+    color: var(--text-secondary);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.status-bar-count {
+    color: var(--text-tertiary);
+    white-space: nowrap;
+    flex-shrink: 0;
+}

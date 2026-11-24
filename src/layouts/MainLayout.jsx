@@ -15,6 +15,7 @@ import Sidebar from '../components/sidebar/Sidebar';
 import PathBreadcrumb from '../components/explorer/PathBreadcrumb';
 import NavigationButtons from '../components/explorer/NavigationButtons';
 import FileList from '../components/explorer/FileList';
+import StatusBar from '../components/explorer/StatusBar';
 import DetailsPanel from '../components/explorer/DetailsPanel';
 import ContextMenu from '../components/contextMenu/ContextMenu';
 import ViewModes from '../components/explorer/ViewModes';
@@ -1269,15 +1270,21 @@ const MainLayout = () => {
                                 }}
                             />
                         ) : (
-                            <FileList
-                                data={displayData}
-                                isLoading={isLoading}
-                                viewMode={viewMode}
-                                isSearching={!!searchValue}
-                                searchTerm={searchValue}
-                                disableArrowKeys={isPreviewOpen}
-                                onColumnsChange={setColumnsPerRow}
-                            />
+                            <>
+                                <FileList
+                                    data={displayData}
+                                    isLoading={isLoading}
+                                    viewMode={viewMode}
+                                    isSearching={!!searchValue}
+                                    searchTerm={searchValue}
+                                    disableArrowKeys={isPreviewOpen}
+                                    onColumnsChange={setColumnsPerRow}
+                                />
+                                <StatusBar
+                                    data={displayData}
+                                    selectedItems={activeSelectedItems}
+                                />
+                            </>
                         )}
                     </div>
                 );

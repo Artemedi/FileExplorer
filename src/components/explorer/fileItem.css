@@ -67,16 +67,23 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: var(--space-md);
+    padding: 0;
     min-width: 100px;
+    height: calc(64px + var(--space-sm) + 2 * var(--space-md) + 2.75 * var(--font-size-sm));
     text-align: center;
+    overflow: visible;
 }
 
 .file-item-grid {
+    position: relative;
     display: flex;
     flex-direction: column;
     align-items: center;
     width: 100%;
+    height: 100%;
+    padding: var(--space-md);
+    border-radius: var(--radius-md);
+    border: 1px solid transparent;
 }
 
 .file-item.view-mode-grid .file-icon-container {
@@ -85,12 +92,72 @@
     align-items: center;
     width: 64px;
     height: 64px;
+    flex-shrink: 0;
     margin-bottom: var(--space-sm);
 }
 
 .file-item.view-mode-grid .file-name {
     max-width: 100%;
+    width: 100%;
     font-size: var(--font-size-sm);
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+}
+
+.file-item.view-mode-grid.selected,
+.file-item.view-mode-grid.focused {
+    z-index: var(--z-index-dropdown);
+}
+
+.file-item.view-mode-grid.focused {
+    z-index: calc(var(--z-index-dropdown) + 1);
+}
+
+.file-item.view-mode-grid.selected .file-item-grid,
+.file-item.view-mode-grid.focused .file-item-grid {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: auto;
+    min-height: 100%;
+    box-shadow: var(--shadow-md);
+}
+
+.file-item.view-mode-grid.focused:not(.selected) .file-item-grid {
+    background: linear-gradient(var(--surface-hover), var(--surface-hover)), var(--background);
+    border-color: var(--border);
+}
+
+.file-item.view-mode-grid.selected .file-item-grid {
+    background: linear-gradient(var(--accent-surface), var(--accent-surface)), var(--background);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.file-item.view-mode-grid.selected .file-name,
+.file-item.view-mode-grid.focused .file-name {
+    display: block;
+    -webkit-line-clamp: unset;
+    overflow: visible;
+    white-space: normal;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+}
+
+.file-item.view-mode-grid.cut {
+    opacity: 1;
+    filter: none;
+}
+
+.file-item.view-mode-grid.cut .file-icon-container,
+.file-item.view-mode-grid.cut .file-name {
+    opacity: 0.6;
+    filter: grayscale(50%);
 }
 
 /* List view */
@@ -265,6 +332,11 @@
 @media (max-width: 768px) {
     .file-item.view-mode-grid {
         min-width: 80px;
+        padding: 0;
+        height: calc(48px + var(--space-sm) + 2 * var(--space-sm) + 2.75 * var(--font-size-sm));
+    }
+
+    .file-item.view-mode-grid .file-item-grid {
         padding: var(--space-sm);
     }
 

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import FileIcon from './FileIcon';
 import { formatFileSize, formatDate, getFileType } from '../../utils/formatters';
+import { middleEllipsis } from '../../utils/middleEllipsis';
 import { joinPath, normalizePath, getDirectoryPath } from '../../utils/pathUtils';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileSystem } from '../../providers/FileSystemProvider';
@@ -58,6 +59,10 @@ const FileItem = ({
         const lastDot = item.name.lastIndexOf('.');
         return lastDot > 0 ? item.name.slice(0, lastDot) : item.name;
     })();
+    const isExpandedInGrid = viewMode === 'grid' && (isSelected || isFocused);
+    const gridDisplayName = isExpandedInGrid
+        ? displayName
+        : middleEllipsis(displayName, 26, { isDirectory });
     const fileType = isDirectory ? 'Folder' : getFileType(item.name);
     const rawSize = item.size_in_bytes ?? item.size ?? 0;
     const size = isDirectory
@@ -234,8 +239,8 @@ const FileItem = ({
                             <FileIcon filename={item.name} isDirectory={isDirectory} />
                         </div>
 
-                        <div className="file-name truncate" title={item.name}>
-                            {displayName}
+                        <div className="file-name" title={item.name}>
+                            {gridDisplayName}
                         </div>
                     </div>
                 )}

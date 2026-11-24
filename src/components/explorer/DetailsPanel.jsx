@@ -78,7 +78,7 @@ const DetailsPanel = ({ item, isMultipleSelection = false }) => {
                         />
                     </div>
 
-                    <div className="details-name truncate" title={item.name}>
+                    <div className="details-name" title={item.name}>
                         {item.name}
                     </div>
 
