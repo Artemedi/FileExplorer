@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.18] - 2026-11-24
+
+### Fixed & Improved
+- **Cross-Platform CI & Release Pipeline (Green CI First):**
+  - Fixed `rustfmt` formatting and `cargo clippy --all-targets -- -D warnings` issues across Windows, Linux, and macOS (`compute_linux_graphics_env_overrides`, `validate_filesystem_name`, `build_dropfiles_buffer`, `initialize_disk` fallback, and `as_chunks` in clipboard tests).
+  - Hardened `.github/workflows/release.yml` to run pre-release frontend and 3-OS Rust checks (`ubuntu-latest`, `windows-latest`, `macos-latest`) before building and publishing release artifacts.
+  - Includes all `0.2.17` fixes and features (StatusBar, Grid middle-ellipsis + expanded selected names, Windows `CF_HDROP` clipboard for Explorer/RDP, SSH terminal OSC/shell-integration sync, optional explorer→terminal `cd` sync, and SFTP `sudo` directory listing with session password cache).
+
 ## [0.2.17] - 2026-11-24
 
 ### Added
