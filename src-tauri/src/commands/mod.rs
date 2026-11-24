@@ -1,3 +1,4 @@
+pub mod clipboard_commands;
 pub mod command_exec_commands;
 pub mod file_system_operation_commands;
 pub mod hash_commands;

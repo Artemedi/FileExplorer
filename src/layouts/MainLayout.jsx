@@ -65,6 +65,7 @@ const MainLayout = () => {
         items, 
         closeContextMenu, 
         clipboard,
+        systemClipboardHasFiles,
         copyToClipboard,
         cutToClipboard,
         pasteFromClipboard,
@@ -124,6 +125,9 @@ const MainLayout = () => {
 
     const clipboardRef = useRef(clipboard);
     clipboardRef.current = clipboard;
+
+    const systemClipboardHasFilesRef = useRef(systemClipboardHasFiles);
+    systemClipboardHasFilesRef.current = systemClipboardHasFiles;
 
     const currentViewRef = useRef(currentView);
     currentViewRef.current = currentView;
@@ -872,7 +876,7 @@ const MainLayout = () => {
 
             // Paste: Ctrl+V
             if ((e.ctrlKey || e.metaKey) && matchesKey(e, 'KeyV', 'v')) {
-                if (clipboardRef.current?.items?.length > 0) {
+                if (clipboardRef.current?.items?.length > 0 || systemClipboardHasFilesRef.current) {
                     e.preventDefault();
                     pasteFromClipboard();
                 }
@@ -1083,9 +1087,9 @@ const MainLayout = () => {
     }, [activeSelectedItems, copyToClipboard]);
 
     const handlePaste = useCallback(() => {
-        if (!clipboard.items || clipboard.items.length === 0) return;
+        if ((!clipboard.items || clipboard.items.length === 0) && !systemClipboardHasFiles) return;
         pasteFromClipboard();
-    }, [clipboard.items, pasteFromClipboard]);
+    }, [clipboard.items, systemClipboardHasFiles, pasteFromClipboard]);
 
     const handleRenameToolbar = useCallback(() => {
         if (activeSelectedItems.length !== 1) return;
@@ -1169,7 +1173,7 @@ const MainLayout = () => {
                                 <button
                                     className="icon-button"
                                     onClick={handlePaste}
-                                    disabled={!clipboard.items || clipboard.items.length === 0}
+                                    disabled={(!clipboard.items || clipboard.items.length === 0) && !systemClipboardHasFiles}
                                     title={t('toolbar.paste')}
                                     aria-label="Paste items"
                                 >

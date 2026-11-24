@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
+import React, { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileSystem } from './FileSystemProvider';
 import { useHistory } from './HistoryProvider';
@@ -27,7 +27,9 @@ export default function ContextMenuProvider({ children }) {
     const [target, setTarget] = useState(null);
     const [items, setItems] = useState([]);
     const [clipboard, setClipboard] = useState({ items: [], operation: null });
+    const [systemClipboardHasFiles, setSystemClipboardHasFiles] = useState(false);
     const [isProcessing, setIsProcessing] = useState(false);
+    const lastOurSequenceRef = useRef(null);
 
     const { selectedItems, loadDirectory, clearSelection, moveToTrash, currentDirData } = useFileSystem();
     const { currentPath } = useHistory();
@@ -181,28 +183,76 @@ export default function ContextMenuProvider({ children }) {
         }
     }, [isSftpPath, downloadAndOpenSftpFile]);
 
-    // Copy items to clipboard
-    const copyToClipboard = useCallback(async (items) => {
-        setClipboard({ items, operation: 'copy' });
-        // Copy paths to system clipboard as well
-        const paths = items.map(item => item.path).join('\n');
+    const refreshSystemClipboard = useCallback(async () => {
         try {
-            await navigator.clipboard.writeText(paths);
-        } catch (err) {
-            console.warn('Failed to copy to system clipboard:', err);
+            const [seq, sysFiles] = await Promise.all([
+                invoke('clipboard_sequence_number').catch(() => null),
+                invoke('clipboard_get_files').catch(() => null),
+            ]);
+            const hasFiles = Boolean(sysFiles && Array.isArray(sysFiles.paths) && sysFiles.paths.length > 0);
+            setSystemClipboardHasFiles(hasFiles);
+            return { seq, sysFiles, hasFiles };
+        } catch {
+            setSystemClipboardHasFiles(false);
+            return { seq: null, sysFiles: null, hasFiles: false };
         }
     }, []);
 
-    // Cut items to clipboard
-    const cutToClipboard = useCallback(async (items) => {
-        setClipboard({ items, operation: 'cut' });
-        const paths = items.map(item => item.path).join('\n');
+    useEffect(() => {
+        refreshSystemClipboard();
+        const handleFocus = () => {
+            refreshSystemClipboard();
+        };
+        const handleVisibility = () => {
+            if (document.visibilityState === 'visible') {
+                refreshSystemClipboard();
+            }
+        };
+        window.addEventListener('focus', handleFocus);
+        document.addEventListener('visibilitychange', handleVisibility);
+        return () => {
+            window.removeEventListener('focus', handleFocus);
+            document.removeEventListener('visibilitychange', handleVisibility);
+        };
+    }, [refreshSystemClipboard]);
+
+    const writeClipboardItems = useCallback(async (items, isCut) => {
+        const operation = isCut ? 'cut' : 'copy';
+        setClipboard({ items, operation });
+        const itemPaths = (items || []).map(item => item.path).filter(Boolean);
+        if (itemPaths.length === 0) return;
+
+        const allLocal = itemPaths.every(p => !isSftpPath(p));
+        if (allLocal) {
+            try {
+                const seq = await invoke('clipboard_set_files', { paths: itemPaths, cut: isCut });
+                lastOurSequenceRef.current = typeof seq === 'number' ? seq : null;
+                setSystemClipboardHasFiles(true);
+                return;
+            } catch (err) {
+                console.warn('Native clipboard_set_files failed, falling back to text:', err);
+            }
+        }
+
+        lastOurSequenceRef.current = null;
         try {
-            await navigator.clipboard.writeText(paths);
+            await navigator.clipboard.writeText(itemPaths.join('\n'));
         } catch (err) {
             console.warn('Failed to copy to system clipboard:', err);
         }
-    }, []);
+    }, [isSftpPath]);
+
+    // Copy items to clipboard
+    const copyToClipboard = useCallback(
+        (items) => writeClipboardItems(items, false),
+        [writeClipboardItems]
+    );
+
+    // Cut items to clipboard
+    const cutToClipboard = useCallback(
+        (items) => writeClipboardItems(items, true),
+        [writeClipboardItems]
+    );
 
     // Helper function to generate unique destination path
     const generateUniqueDestPath = useCallback(async (basePath, fileName) => {
@@ -257,14 +307,39 @@ export default function ContextMenuProvider({ children }) {
     // Paste items from clipboard - enhanced with SFTP support and target directory support
     const pasteFromClipboard = useCallback(async (targetDirectory = null) => {
         const destRoot = (typeof targetDirectory === 'string' && targetDirectory) ? targetDirectory : currentPath;
-        if (!clipboard.items.length || !destRoot) return;
+        if (!destRoot) return;
+
+        let activeItems = clipboard.items || [];
+        let activeOperation = clipboard.operation;
+        let usingSystemClipboard = false;
+
+        try {
+            const seq = await invoke('clipboard_sequence_number').catch(() => null);
+            const hasNewExternalSeq =
+                typeof seq === 'number' && seq !== lastOurSequenceRef.current;
+            if (hasNewExternalSeq || activeItems.length === 0) {
+                const sysFiles = await invoke('clipboard_get_files').catch(() => null);
+                if (sysFiles && Array.isArray(sysFiles.paths) && sysFiles.paths.length > 0) {
+                    activeItems = sysFiles.paths.map((p) => ({
+                        path: p,
+                        name: getFileName(p),
+                    }));
+                    activeOperation = sysFiles.cut ? 'cut' : 'copy';
+                    usingSystemClipboard = true;
+                }
+            }
+        } catch {
+            // Fall back to internal clipboard when system clipboard query is unavailable
+        }
+
+        if (!activeItems.length) return;
 
         setIsProcessing(true);
         const remainingCutItems = [];
         let anySucceeded = false;
 
         try {
-            for (const item of clipboard.items) {
+            for (const item of activeItems) {
                 const fileName = item.name || getFileName(item.path);
                 const sourcePath = item.path;
 
@@ -272,7 +347,7 @@ export default function ContextMenuProvider({ children }) {
                 const sourceIsSftp = isSftpPath(sourcePath);
                 const destIsSftp = isSftpPath(destRoot);
 
-                if (clipboard.operation === 'cut') {
+                if (activeOperation === 'cut') {
                     // For move operations, use original filename (no duplicates)
                     const destPath = joinPath(destRoot, fileName);
 
@@ -370,8 +445,8 @@ export default function ContextMenuProvider({ children }) {
                 }
             }
 
-            // For cut operations, only remove items that were actually moved
-            if (clipboard.operation === 'cut') {
+            // For internal cut operations, only remove items that were actually moved
+            if (activeOperation === 'cut' && !usingSystemClipboard) {
                 if (remainingCutItems.length === 0) {
                     setClipboard({ items: [], operation: null });
                 } else {
@@ -849,10 +924,11 @@ export default function ContextMenuProvider({ children }) {
     }, [getCurrentFolderMetadata]);
 
     // Generate menu items
-    const getMenuItemsForContext = useCallback((contextTarget, overrideSelectedItems = null) => {
+    const getMenuItemsForContext = useCallback((contextTarget, overrideSelectedItems = null, overrideSysHasFiles = null) => {
         const isDirectory = contextTarget && (contextTarget.isDirectory || ('sub_file_count' in contextTarget));
         const isFile = contextTarget && !isDirectory;
-        const hasClipboard = clipboard.items.length > 0;
+        const effectiveSysHasFiles = overrideSysHasFiles !== null ? overrideSysHasFiles : systemClipboardHasFiles;
+        const hasClipboard = clipboard.items.length > 0 || effectiveSysHasFiles;
         const isZipFile = Boolean(contextTarget && !isDirectory && contextTarget.name?.toLowerCase().endsWith('.zip'));
         const effectiveSelectedItems = Array.isArray(overrideSelectedItems) ? overrideSelectedItems : selectedItems;
         const selectionCount = contextTarget ? (effectiveSelectedItems.length || 1) : 0;
@@ -1095,7 +1171,7 @@ export default function ContextMenuProvider({ children }) {
         );
 
         return menuItems;
-    }, [selectedItems, clipboard, isProcessing, currentPath, copyToClipboard, cutToClipboard, pasteFromClipboard, deleteItems, renameItem, loadDirectory, showProperties, addToFavorites, removeFromFavorites, updateNavigationHistory, zipItems, unzipItem, isInFavorites, getCurrentFolderMetadata, generateHash, generateHashToFile, compareHash, copyPath, addAsTemplate, isSftpPath, downloadAndOpenSftpFile, parseSftpPath]);
+    }, [selectedItems, clipboard, systemClipboardHasFiles, isProcessing, currentPath, copyToClipboard, cutToClipboard, pasteFromClipboard, deleteItems, renameItem, loadDirectory, showProperties, addToFavorites, removeFromFavorites, updateNavigationHistory, zipItems, unzipItem, isInFavorites, getCurrentFolderMetadata, generateHash, generateHashToFile, compareHash, copyPath, addAsTemplate, isSftpPath, downloadAndOpenSftpFile, parseSftpPath]);
 
     // Open context menu
     const openContextMenu = useCallback((e, contextTarget = null, overrideSelectedItems = null) => {
@@ -1109,7 +1185,11 @@ export default function ContextMenuProvider({ children }) {
         setTarget(contextTarget);
         setItems(menuItems);
         setIsOpen(true);
-    }, [getMenuItemsForContext]);
+
+        refreshSystemClipboard().then(({ hasFiles }) => {
+            setItems(getMenuItemsForContext(contextTarget, overrideSelectedItems, hasFiles));
+        }).catch(() => {});
+    }, [getMenuItemsForContext, refreshSystemClipboard]);
 
     // Close context menu
     const closeContextMenu = useCallback(() => {
@@ -1122,6 +1202,7 @@ export default function ContextMenuProvider({ children }) {
         target,
         items,
         clipboard,
+        systemClipboardHasFiles,
         isProcessing,
         openContextMenu,
         closeContextMenu,

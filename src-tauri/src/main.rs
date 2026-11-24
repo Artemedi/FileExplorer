@@ -9,10 +9,10 @@ mod search_engine;
 mod state;
 
 use crate::commands::{
-    command_exec_commands, file_system_operation_commands, hash_commands, meta_data_commands,
-    permission_commands, preview_commands, search_engine_commands, settings_commands,
-    sftp_file_system_operation_commands, ssh_commands, system_integration_commands,
-    template_commands, volume_operations_commands, watcher_commands,
+    clipboard_commands, command_exec_commands, file_system_operation_commands, hash_commands,
+    meta_data_commands, permission_commands, preview_commands, search_engine_commands,
+    settings_commands, sftp_file_system_operation_commands, ssh_commands,
+    system_integration_commands, template_commands, volume_operations_commands, watcher_commands,
 };
 use std::path::{Component, Path, PathBuf};
 use tauri::ipc::Invoke;
@@ -129,6 +129,10 @@ fn all_commands() -> fn(Invoke) -> bool {
         system_integration_commands::set_default_file_manager,
         system_integration_commands::is_context_menu_enabled,
         system_integration_commands::set_context_menu_enabled,
+        // System clipboard commands
+        clipboard_commands::clipboard_set_files,
+        clipboard_commands::clipboard_get_files,
+        clipboard_commands::clipboard_sequence_number,
     ]
 }
 
