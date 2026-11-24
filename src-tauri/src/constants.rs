@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-pub static VERSION: &str = "0.2.16";
+pub static VERSION: &str = "0.2.17";
 
 /// Returns the base directory for application data (config, logs, templates).
 /// On Windows: %APPDATA%\Explr

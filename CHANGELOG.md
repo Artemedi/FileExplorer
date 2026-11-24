@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.17] - 2026-11-24
+
+### Added
+- **Explorer Status Bar & Full Filename Visibility:**
+  - Added `StatusBar` showing item count or full metadata (full filename, detected file type + extension, size, modified date) for selected local and SFTP items, plus a `sudo` badge for elevated directory listings.
+  - Added `middleEllipsis` truncation in Grid View preserving file extensions (`alloy-1.16.1-1…x86_64.rpm`), and expanded selected/focused grid items smoothly over neighbors without shifting grid rows.
+- **Windows System Clipboard (`CF_HDROP`) for Explorer & RDP:**
+  - Added `clipboard_set_files`, `clipboard_get_files`, and `clipboard_sequence_number` Win32 FFI commands putting local files on the Windows clipboard with `CF_HDROP`, `Preferred DropEffect`, and `CF_UNICODETEXT` so Copy/Cut/Paste work across Windows Explorer and RDP sessions (`rdpclip.exe`), including pasting external files into Explr.
+- **SFTP `sudo` Directory Listing & Session Password Cache:**
+  - Added `list_dir` operation in `ssh_sudo_exec` and automatic fallback in `SftpProvider` when opening restricted directories returns `permission denied`, with an in-memory session-scoped `sudo` password cache and fallback `read_file` support.
+- **Optional Explorer → SSH Terminal `cd` Sync:**
+  - Added `terminal_sync_explorer_to_terminal` setting (Settings → Advanced) to optionally send `cd` commands to an idle SSH PTY (`OSC 133;A`) when navigating in SFTP.
+
+### Fixed
+- **SSH Terminal → Explorer Directory Sync & Permission Errors:**
+  - Fixed OSC title parsing for Ubuntu/Debian (`user@host: /path`), RHEL `~`/`~/...` paths via remote `$HOME`, Midnight Commander (`mc`) titles, and split escape sequences buffered across PTY chunks.
+  - Added POSIX/bash/zsh shell integration (`OSC 7` + `OSC 133;A/C`) with automatic re-injection after `sudo -i`/`su`, a manual `Sync` button in the terminal header, non-PTY `cd` sync, accurate permission-denied notifications, and nearest accessible parent fallback.
+
 ## [0.2.16] - 2026-11-20
 
 ### Added
