@@ -1406,7 +1406,7 @@ pub async fn initialize_disk(
 
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
-            let _ = sudo_password;
+            let _ = (style, sudo_password);
             Err("Disk initialization is only supported on Windows and Linux.".to_string())
         }
     })
