@@ -92,6 +92,7 @@ export interface Settings {
     double_click: string;
     show_file_extensions: boolean;
     terminal_height: number;
+    terminal_sync_explorer_to_terminal: boolean;
     enable_animations_and_transitions: boolean;
     enable_virtual_scroll_for_large_directories: boolean;
     abs_file_path_buf: string;

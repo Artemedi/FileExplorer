@@ -11,6 +11,7 @@ import { joinPath } from '../../utils/pathUtils';
 import {
     buildShellIntegrationCommand,
     consumeOscChunk,
+    escapePosixSingleQuote,
     extractOscDirectory,
     extractOscPromptState,
     getParentRemoteDirs,
@@ -194,6 +195,8 @@ const Terminal = ({ isOpen, onToggle }) => {
     const xtermControllersRef = useRef({});
     const autoPtyAttemptedRef = useRef(new Set());
     const syncingFromTerminalRef = useRef(false);
+    const syncingFromExplorerRef = useRef(false);
+    const syncFromExplorerTimerRef = useRef(null);
     const oscBufferRef = useRef(new Map());
     const shellIdleRef = useRef(new Map());
     const shellHookSeenRef = useRef(new Map());
@@ -478,6 +481,17 @@ const Terminal = ({ isOpen, onToggle }) => {
                             if (ownerTab.sshWorkingDir !== detectedDir) {
                                 updateTab(ownerTab.id, { sshWorkingDir: detectedDir });
                             }
+                            if (syncingFromExplorerRef.current) {
+                                const cur = currentPathRef.current;
+                                const parsedCur = isSftpPathRef.current(cur) ? parseSftpPathRef.current(cur) : null;
+                                const curRemote = parsedCur?.remotePath
+                                    ? normalizeRemotePosixPath(parsedCur.remotePath)
+                                    : null;
+                                if (curRemote === normalizeRemotePosixPath(detectedDir)) {
+                                    syncingFromExplorerRef.current = false;
+                                    return;
+                                }
+                            }
                             syncExplorerToRemoteDirRef.current(ownerTab, detectedDir, forceSync);
                         }
                     }
@@ -511,6 +525,7 @@ const Terminal = ({ isOpen, onToggle }) => {
             if (typeof unlistenOut === 'function') unlistenOut();
             if (typeof unlistenExit === 'function') unlistenExit();
             if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+            if (syncFromExplorerTimerRef.current) clearTimeout(syncFromExplorerTimerRef.current);
             for (const tab of terminalTabsRef.current) {
                 if (tab.ptySessionId) {
                     cleanupSessionTracking(tab.ptySessionId);
@@ -528,7 +543,11 @@ const Terminal = ({ isOpen, onToggle }) => {
             if (exists) {
                 return prev.map((t) =>
                     t.id === tabId
-                        ? { ...t, sshConnection: conn, sshWorkingDir: remoteDir || t.sshWorkingDir }
+                        ? {
+                            ...t,
+                            sshConnection: conn,
+                            sshWorkingDir: t.ptySessionId ? t.sshWorkingDir : (remoteDir || t.sshWorkingDir),
+                        }
                         : t
                 );
             }
@@ -569,11 +588,40 @@ const Terminal = ({ isOpen, onToggle }) => {
     useEffect(() => {
         if (syncingFromTerminalRef.current) return;
         if (parsedSftp?.connection) {
+            const tabId = getSshTabId(parsedSftp.connection);
+            const existingTab = terminalTabsRef.current.find((t) => t.id === tabId);
             ensureAndSelectSshTab(parsedSftp.connection, parsedSftp.remotePath || '.');
+
+            const rawTarget = parsedSftp.remotePath;
+            const sid = existingTab?.ptySessionId;
+            if (
+                settings?.terminal_sync_explorer_to_terminal === true &&
+                sid &&
+                rawTarget &&
+                rawTarget !== '.' &&
+                shellHookSeenRef.current.get(sid) === true &&
+                shellIdleRef.current.get(sid) === true
+            ) {
+                const normalizedTarget = normalizeRemotePosixPath(rawTarget);
+                const currentPtyDir = existingTab.sshWorkingDir && existingTab.sshWorkingDir !== '.'
+                    ? normalizeRemotePosixPath(existingTab.sshWorkingDir)
+                    : null;
+                if (normalizedTarget !== currentPtyDir) {
+                    if (syncFromExplorerTimerRef.current) {
+                        clearTimeout(syncFromExplorerTimerRef.current);
+                    }
+                    syncingFromExplorerRef.current = true;
+                    const cmd = ` cd -- ${escapePosixSingleQuote(normalizedTarget)}\n`;
+                    invoke('ssh_write_pty', { sessionId: sid, data: cmd }).catch(() => {});
+                    syncFromExplorerTimerRef.current = setTimeout(() => {
+                        syncingFromExplorerRef.current = false;
+                    }, 350);
+                }
+            }
         } else if (activeTabIdRef.current.startsWith('ssh:')) {
             setActiveTabId('local');
         }
-    }, [currentPath, parsedSftp?.connection?.host, parsedSftp?.connection?.username, parsedSftp?.connection?.port, parsedSftp?.remotePath]);
+    }, [currentPath, parsedSftp?.connection?.host, parsedSftp?.connection?.username, parsedSftp?.connection?.port, parsedSftp?.remotePath, settings?.terminal_sync_explorer_to_terminal]);
 
     // Auto-start full interactive PTY by default whenever an SSH tab is active and terminal is open
     useEffect(() => {

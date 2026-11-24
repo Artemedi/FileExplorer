@@ -26,6 +26,7 @@ const defaultSettings = {
 
     // Interface settings
     terminal_height: 240,
+    terminal_sync_explorer_to_terminal: false,
     enable_animations_and_transitions: true,
     enable_virtual_scroll_for_large_directories: false,
 

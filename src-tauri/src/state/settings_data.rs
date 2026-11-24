@@ -99,6 +99,9 @@ pub struct Settings {
     pub show_file_extensions: bool,
     /// Height of the terminal panel in pixels
     pub terminal_height: u32,
+    /// Whether explorer SFTP navigation sends `cd` to an idle SSH PTY
+    #[serde(default)]
+    pub terminal_sync_explorer_to_terminal: bool,
     /// Whether to enable UI animations and transitions
     pub enable_animations_and_transitions: bool,
     /// Whether to use virtual scrolling for large directories
@@ -137,6 +140,7 @@ impl Default for Settings {
             double_click: DoubleClick::OpenFilesAndFolders,
             show_file_extensions: true,
             terminal_height: 240,
+            terminal_sync_explorer_to_terminal: false,
             enable_animations_and_transitions: true,
             enable_virtual_scroll_for_large_directories: false,
             enable_suggestions: true, //implement?
@@ -1273,5 +1277,18 @@ mod tests_settings {
             .expect("New default settings file should be valid JSON");
         assert!(!on_disk.darkmode);
         assert_eq!(on_disk.abs_file_path_buf, settings_path);
+    }
+
+    #[test]
+    fn test_terminal_sync_explorer_to_terminal_setting() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let settings_path = temp_dir.path().join("settings.json");
+        let state = SettingsState::load_or_init_with_path(settings_path);
+        assert!(!state.0.lock().unwrap().terminal_sync_explorer_to_terminal);
+
+        let updated = state
+            .update_setting_field("terminal_sync_explorer_to_terminal", json!(true))
+            .expect("Updating terminal_sync_explorer_to_terminal should succeed");
+        assert!(updated.terminal_sync_explorer_to_terminal);
     }
 }

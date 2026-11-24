@@ -585,6 +585,15 @@ const SettingsPanel = ({ isOpen, onClose }) => {
                 <label className="checkbox-option">
                     <input
                         type="checkbox"
+                        checked={settings.terminal_sync_explorer_to_terminal || false}
+                        onChange={(e) => updateSetting('terminal_sync_explorer_to_terminal', e.target.checked)}
+                    />
+                    <span>Sync explorer navigation to SSH terminal (cd)</span>
+                </label>
+
+                <label className="checkbox-option">
+                    <input
+                        type="checkbox"
                         checked={settings.enable_animations_and_transitions !== false}
                         onChange={(e) => updateSetting('enable_animations_and_transitions', e.target.checked)}
                     />
