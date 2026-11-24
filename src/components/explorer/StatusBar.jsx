@@ -17,15 +17,24 @@ const getFileExtension = (name) => {
  * Explorer status bar displaying directory item counts and full metadata
  * (full name, detected type + extension, size, modified date) for selected items.
  */
-const StatusBar = ({ data, selectedItems = [] }) => {
+const StatusBar = ({ data, selectedItems = [], isElevated = false }) => {
     const { t } = useTranslation();
     const totalItems = (data?.directories?.length || 0) + (data?.files?.length || 0);
     const itemsLabel = t('common.itemsPlural', { count: totalItems }, `${totalItems} items`);
+    const sudoBadge = isElevated ? (
+        <span
+            className="status-bar-sudo-badge"
+            title="Elevated directory listing via sudo"
+        >
+            sudo
+        </span>
+    ) : null;
 
     if (!selectedItems || selectedItems.length === 0) {
         return (
             <div className="explorer-status-bar" role="status" aria-live="polite">
                 <span className="status-bar-count">{itemsLabel}</span>
+                {sudoBadge && <div className="status-bar-right">{sudoBadge}</div>}
             </div>
         );
     }
@@ -81,7 +90,10 @@ const StatusBar = ({ data, selectedItems = [] }) => {
                         </>
                     )}
                 </div>
-                <span className="status-bar-count">{itemsLabel}</span>
+                <div className="status-bar-right">
+                    {sudoBadge}
+                    <span className="status-bar-count">{itemsLabel}</span>
+                </div>
             </div>
         );
     }
@@ -105,7 +117,10 @@ const StatusBar = ({ data, selectedItems = [] }) => {
                     </>
                 )}
             </div>
-            <span className="status-bar-count">{itemsLabel}</span>
+            <div className="status-bar-right">
+                {sudoBadge}
+                <span className="status-bar-count">{itemsLabel}</span>
+            </div>
         </div>
     );
 };

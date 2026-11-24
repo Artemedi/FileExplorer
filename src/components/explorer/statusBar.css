@@ -54,3 +54,25 @@
     white-space: nowrap;
     flex-shrink: 0;
 }
+
+.status-bar-right {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    flex-shrink: 0;
+}
+
+.status-bar-sudo-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    border-radius: var(--radius-sm);
+    font-size: 10px;
+    font-weight: var(--font-weight-semibold);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--warning-text);
+    background-color: var(--warning-bg);
+    border: 1px solid var(--warning-border);
+    line-height: 1.4;
+}

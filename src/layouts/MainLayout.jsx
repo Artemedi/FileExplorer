@@ -1287,6 +1287,7 @@ const MainLayout = () => {
                                 <StatusBar
                                     data={displayData}
                                     selectedItems={activeSelectedItems}
+                                    isElevated={Boolean(displayData?.elevated)}
                                 />
                             </>
                         )}

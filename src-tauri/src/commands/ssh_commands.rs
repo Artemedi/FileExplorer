@@ -114,6 +114,9 @@ pub fn build_sudo_operation_command(
         }
         "read_file" => Ok(format!("cat -- {safe_path}")),
         "write_file" => Ok(format!("tee -- {safe_path} >/dev/null")),
+        "list_dir" => Ok(format!(
+            "find -- {safe_path} -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\0'"
+        )),
         other => Err(format!("Unsupported sudo operation: {other}")),
     }
 }
@@ -651,6 +654,10 @@ mod tests {
         assert_eq!(
             build_sudo_operation_command("rename", "/tmp/a'b", Some("/tmp/c d")).unwrap(),
             "mv -- '/tmp/a'\\''b' '/tmp/c d'"
+        );
+        assert_eq!(
+            build_sudo_operation_command("list_dir", "/mnt/pg/postgresql/15/main", None).unwrap(),
+            "find -- '/mnt/pg/postgresql/15/main' -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\0'"
         );
         assert!(build_sudo_operation_command("rm_all", "/tmp", None).is_err());
         assert!(build_sudo_operation_command("mkdir", "", None).is_err());

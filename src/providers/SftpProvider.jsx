@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { showConfirm, showError, showPasswordPrompt, showSuccess } from '../utils/NotificationSystem';
+import { parseSudoFindOutput } from '../utils/sftpSudoParser';
 
 const SFTP_CONNECTIONS_STORAGE_KEY = 'fileExplorerSftpConnections';
 const HOST_KEY_UNTRUSTED_PREFIX = 'HOST_KEY_UNTRUSTED:';
@@ -26,6 +27,7 @@ const SftpContext = createContext({
     createSftpPath: () => null,
     executeSshCommand: async () => null,
     runSshSudoOperation: async () => false,
+    listDirWithSudo: async () => null,
     startSshPty: async () => null
 });
 
@@ -126,6 +128,7 @@ export default function SftpProvider({ children }) {
     const [currentSftpConnection, setCurrentSftpConnection] = useState(null);
     const [currentSftpPath, setCurrentSftpPath] = useState(null);
     const connectionCache = useRef(new Map());
+    const sudoPasswordCacheRef = useRef(new Map());
     const pendingMigrationRef = useRef(Promise.resolve());
 
     const readAndMigrateConnections = useCallback(() => {
@@ -348,6 +351,91 @@ export default function SftpProvider({ children }) {
         return msg.includes('permission denied') || msg.includes('eacces') || msg.includes('operation not permitted');
     }, []);
 
+    const isSudoAuthError = useCallback((err) => {
+        const msg = getErrorMessage(err).toLowerCase();
+        return (
+            msg.includes('incorrect password') ||
+            msg.includes('sorry, try again') ||
+            msg.includes('authentication failure') ||
+            msg.includes('a password is required') ||
+            msg.includes('wrong password')
+        );
+    }, []);
+
+    const executeWithSudoPassword = useCallback(async (connection, promptText, runner) => {
+        const cacheKey = buildSftpConnectionKey(connection);
+        let sudoPassword = sudoPasswordCacheRef.current.get(cacheKey);
+        let promptedNow = false;
+
+        if (!sudoPassword) {
+            sudoPassword = await showPasswordPrompt(promptText, 'Elevated SSH Operation (sudo)');
+            if (!sudoPassword) {
+                return { cancelled: true, result: null };
+            }
+            sudoPasswordCacheRef.current.set(cacheKey, sudoPassword);
+            promptedNow = true;
+        }
+
+        try {
+            const result = await runner(sudoPassword);
+            return { cancelled: false, result };
+        } catch (err) {
+            if (isSudoAuthError(err)) {
+                sudoPasswordCacheRef.current.delete(cacheKey);
+                if (!promptedNow) {
+                    const retryPassword = await showPasswordPrompt(
+                        `Cached sudo password failed on ${connection.host}.\nEnter sudo password:`,
+                        'Elevated SSH Operation (sudo)'
+                    );
+                    if (!retryPassword) {
+                        return { cancelled: true, result: null };
+                    }
+                    sudoPasswordCacheRef.current.set(cacheKey, retryPassword);
+                    try {
+                        const retryResult = await runner(retryPassword);
+                        return { cancelled: false, result: retryResult };
+                    } catch (retryErr) {
+                        if (isSudoAuthError(retryErr)) {
+                            sudoPasswordCacheRef.current.delete(cacheKey);
+                        }
+                        throw retryErr;
+                    }
+                }
+            }
+            throw err;
+        }
+    }, [isSudoAuthError]);
+
+    const listDirWithSudo = useCallback(async (connection, remotePath) => {
+        if (!connection?.host) return null;
+        const targetDir = remotePath || '.';
+        const outcome = await executeWithSudoPassword(
+            connection,
+            `Permission denied for "${targetDir}".\nEnter sudo password to open with sudo on ${connection.host}:`,
+            (sudoPassword) =>
+                invokeSftp('ssh_sudo_exec', connection, {
+                    sudoPassword,
+                    operation: 'list_dir',
+                    path: targetDir,
+                    targetPath: null,
+                    content: null,
+                    authType: connection.authType || null,
+                    privateKeyPath: connection.privateKeyPath || null,
+                    certificatePath: connection.certificatePath || null,
+                    compressionMode: connection.compressionMode || null,
+                })
+        );
+        if (outcome.cancelled) return null;
+
+        const parsed = parseSudoFindOutput(outcome.result, connection, targetDir, createSftpUrl);
+        return {
+            directory: createSftpUrl(connection, targetDir),
+            directories: parsed.directories,
+            files: parsed.files,
+            elevated: true,
+        };
+    }, [executeWithSudoPassword, invokeSftp, createSftpUrl]);
+
     // Navigate to an SFTP connection
     const navigateToSftpConnection = useCallback(async (connection, remotePath = '.', options = {}) => {
         if (!connection) {
@@ -419,6 +507,21 @@ export default function SftpProvider({ children }) {
         } catch (error) {
             const errMsg = getErrorMessage(error);
             console.error('Failed to load SFTP directory:', errMsg);
+            if (isPermissionDeniedError(error) && !options?.silentError) {
+                try {
+                    const elevatedData = await listDirWithSudo(connection, remotePath || '.');
+                    if (elevatedData) {
+                        setCurrentSftpConnection(connection);
+                        setCurrentSftpPath(remotePath || '.');
+                        return elevatedData;
+                    }
+                } catch (sudoErr) {
+                    showError(`sudo open failed for "${remotePath}": ${getErrorMessage(sudoErr)}`);
+                    return null;
+                }
+                showError(`Permission denied for "${remotePath}" (user ${connection.username || 'unknown'})`);
+                return null;
+            }
             if (!options?.silentError) {
                 if (isPermissionDeniedError(error)) {
                     showError(`Permission denied for "${remotePath}" (user ${connection.username || 'unknown'})`);
@@ -428,7 +531,7 @@ export default function SftpProvider({ children }) {
             }
             return null;
         }
-    }, [createSftpUrl, invokeSftp, isPermissionDeniedError]);
+    }, [createSftpUrl, invokeSftp, isPermissionDeniedError, listDirWithSudo]);
 
     // Load SFTP directory
     const loadSftpDirectory = useCallback(async (sftpPath, options = {}) => {
@@ -456,30 +559,29 @@ export default function SftpProvider({ children }) {
 
     const runSshSudoOperation = useCallback(async (connection, operation, remotePath, targetPath = null, content = null) => {
         if (!connection?.host) return false;
-        const sudoPassword = await showPasswordPrompt(
-            `Permission denied for "${remotePath}".\nEnter sudo password to run "${operation}" on ${connection.host}:`,
-            'Elevated SSH Operation (sudo)'
-        );
-        if (!sudoPassword) return false;
-
         try {
-            await invokeSftp('ssh_sudo_exec', connection, {
-                sudoPassword,
-                operation,
-                path: remotePath,
-                targetPath,
-                content,
-                authType: connection.authType || null,
-                privateKeyPath: connection.privateKeyPath || null,
-                certificatePath: connection.certificatePath || null,
-                compressionMode: connection.compressionMode || null
-            });
-            return true;
+            const outcome = await executeWithSudoPassword(
+                connection,
+                `Permission denied for "${remotePath}".\nEnter sudo password to run "${operation}" on ${connection.host}:`,
+                (sudoPassword) =>
+                    invokeSftp('ssh_sudo_exec', connection, {
+                        sudoPassword,
+                        operation,
+                        path: remotePath,
+                        targetPath,
+                        content,
+                        authType: connection.authType || null,
+                        privateKeyPath: connection.privateKeyPath || null,
+                        certificatePath: connection.certificatePath || null,
+                        compressionMode: connection.compressionMode || null
+                    })
+            );
+            return !outcome.cancelled;
         } catch (sudoErr) {
             showError(`sudo ${operation} failed: ${getErrorMessage(sudoErr)}`);
             return false;
         }
-    }, [invokeSftp]);
+    }, [executeWithSudoPassword, invokeSftp]);
 
     const executeSshCommand = useCallback(async (connection, command, workingDir = null) => {
         const raw = await invokeSftp('ssh_execute_command', connection, {
@@ -743,12 +845,38 @@ export default function SftpProvider({ children }) {
                 filePath: parsed.remotePath
             });
         } catch (error) {
+            if (isPermissionDeniedError(error)) {
+                try {
+                    const outcome = await executeWithSudoPassword(
+                        parsed.connection,
+                        `Permission denied for "${parsed.remotePath}".\nEnter sudo password to read file on ${parsed.connection.host}:`,
+                        (sudoPassword) =>
+                            invokeSftp('ssh_sudo_exec', parsed.connection, {
+                                sudoPassword,
+                                operation: 'read_file',
+                                path: parsed.remotePath,
+                                targetPath: null,
+                                content: null,
+                                authType: parsed.connection.authType || null,
+                                privateKeyPath: parsed.connection.privateKeyPath || null,
+                                certificatePath: parsed.connection.certificatePath || null,
+                                compressionMode: parsed.connection.compressionMode || null,
+                            })
+                    );
+                    if (!outcome.cancelled) {
+                        return outcome.result;
+                    }
+                } catch (sudoErr) {
+                    showError(`sudo read failed: ${getErrorMessage(sudoErr)}`);
+                    return null;
+                }
+            }
             const errMsg = getErrorMessage(error);
             console.error('Failed to open SFTP file:', errMsg);
             showError(`Failed to open file: ${errMsg}`);
             return null;
         }
-    }, [parseSftpPath, invokeSftp]);
+    }, [parseSftpPath, invokeSftp, isPermissionDeniedError, executeWithSudoPassword]);
 
     const downloadAndOpenSftpFile = useCallback(async (sftpPath, openFile = true) => {
         const parsed = parseSftpPath(sftpPath);
@@ -782,6 +910,7 @@ export default function SftpProvider({ children }) {
         setCurrentSftpConnection(null);
         setCurrentSftpPath(null);
         connectionCache.current.clear();
+        sudoPasswordCacheRef.current.clear();
     }, []);
 
     const value = {
@@ -805,6 +934,7 @@ export default function SftpProvider({ children }) {
         createSftpPath,
         executeSshCommand,
         runSshSudoOperation,
+        listDirWithSudo,
         startSshPty
     };
 
