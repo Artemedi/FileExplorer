@@ -193,7 +193,11 @@ const Terminal = ({ isOpen, onToggle }) => {
 
     const [isFullscreen, setIsFullscreen] = useState(false);
     const xtermControllersRef = useRef({});
-    const autoPtyAttemptedRef = useRef(new Set());
+    const pendingPtyStartsRef = useRef(new Map());
+    const ptyOwnersRef = useRef(new Map());
+    const earlyPtyExitRef = useRef(new Map());
+    const pendingPtyOutputRef = useRef(new Map());
+    const [ptyListenersReady, setPtyListenersReady] = useState(false);
     const syncingFromTerminalRef = useRef(false);
     const syncingFromExplorerRef = useRef(false);
     const syncFromExplorerTimerRef = useRef(null);
@@ -263,10 +267,6 @@ const Terminal = ({ isOpen, onToggle }) => {
         updateTab(activeTabIdRef.current, { sshWorkingDir: nextDir });
     };
 
-    const setPtySessionId = (nextSid, targetTabId = activeTabIdRef.current) => {
-        updateTab(targetTabId, { ptySessionId: nextSid });
-    };
-
     const [currentCommand, setCurrentCommand] = useState('');
     const [historyIndex, setHistoryIndex] = useState(-1);
     const [persistentHistory, setPersistentHistory] = useState([]);
@@ -283,6 +283,7 @@ const Terminal = ({ isOpen, onToggle }) => {
 
     const cleanupSessionTracking = (sessionId) => {
         if (!sessionId) return;
+        pendingPtyOutputRef.current.delete(sessionId);
         oscBufferRef.current.delete(sessionId);
         shellIdleRef.current.delete(sessionId);
         shellHookSeenRef.current.delete(sessionId);
@@ -320,7 +321,7 @@ const Terminal = ({ isOpen, onToggle }) => {
         if (!sessionId) return;
         fetchHomeDirForTab(tabId, conn);
         setTimeout(() => {
-            injectShellIntegration(sessionId);
+            if (ptyOwnersRef.current.get(sessionId) === tabId) injectShellIntegration(sessionId);
         }, 350);
     };
 
@@ -409,28 +410,22 @@ const Terminal = ({ isOpen, onToggle }) => {
                     const payload = event?.payload;
                     if (!active || !payload?.session_id) return;
 
-                    // Feed raw VT100 stream directly to xterm.js controller
-                    const ctrl = xtermControllersRef.current[payload.session_id];
+                    const sessionId = payload.session_id;
+                    const owner = ptyOwnersRef.current.get(sessionId);
+                    if (!owner && pendingPtyStartsRef.current.size === 0) return;
+
+                    // Preserve initial VT output until the xterm controller mounts.
+                    const ctrl = xtermControllersRef.current[sessionId];
                     if (ctrl) {
                         ctrl.write(payload.data);
                     } else {
-                        const cleaned = stripAnsiCodes(payload.data);
-                        if (cleaned) {
-                            setTerminalTabs((prev) =>
-                                prev.map((tab) =>
-                                    tab.ptySessionId === payload.session_id
-                                        ? {
-                                            ...tab,
-                                            history: [
-                                                ...tab.history,
-                                                { type: 'output', content: cleaned, timestamp: new Date().toLocaleTimeString() },
-                                            ],
-                                        }
-                                        : tab
-                                )
-                            );
+                        const previous = pendingPtyOutputRef.current.get(sessionId) || '';
+                        const limit = 256 * 1024;
+                        if (previous.length < limit) {
+                            pendingPtyOutputRef.current.set(sessionId, (previous + payload.data).slice(0, limit));
                         }
                     }
+                    if (!owner) return;
 
                     // Buffer partial OSC / ESC sequences across PTY output chunks
                     const prevOscBuf = oscBufferRef.current.get(payload.session_id) || '';
@@ -496,26 +491,41 @@ const Terminal = ({ isOpen, onToggle }) => {
                         }
                     }
                 });
+                if (!active) {
+                    if (typeof unlistenOut === 'function') unlistenOut();
+                    return;
+                }
                 unlistenExit = await listen('ssh-pty-exit', (event) => {
                     const payload = event?.payload;
                     if (!active || !payload?.session_id) return;
-                    cleanupSessionTracking(payload.session_id);
-                    setTerminalTabs((prev) =>
-                        prev.map((tab) =>
-                            tab.ptySessionId === payload.session_id
-                                ? {
-                                    ...tab,
-                                    ptySessionId: null,
-                                    history: [
-                                        ...tab.history,
-                                        { type: 'system', content: `[SSH PTY exited: ${payload.reason}]`, timestamp: new Date().toLocaleTimeString() },
-                                    ],
-                                }
-                                : tab
-                        )
-                    );
+                    const sessionId = payload.session_id;
+                    const tabId = ptyOwnersRef.current.get(sessionId);
+                    if (!tabId) {
+                        if (pendingPtyStartsRef.current.size > 0) {
+                            earlyPtyExitRef.current.set(sessionId, payload.reason);
+                        }
+                        return;
+                    }
+                    ptyOwnersRef.current.delete(sessionId);
+                    const output = xtermControllersRef.current[sessionId]?.getBufferText() ||
+                        stripAnsiCodes(pendingPtyOutputRef.current.get(sessionId) || '');
+                    cleanupSessionTracking(sessionId);
+                    updateTab(tabId, (tab) => tab.ptySessionId !== sessionId ? tab : ({
+                        ...tab,
+                        ptySessionId: null,
+                        ptyStatus: 'disconnected',
+                        history: [
+                            ...tab.history,
+                            ...(output ? [{ type: 'output', content: output, timestamp: new Date().toLocaleTimeString() }] : []),
+                            { type: 'system', content: '[SSH PTY exited: ' + payload.reason + ']', timestamp: new Date().toLocaleTimeString() },
+                        ],
+                    }));
                 });
+                if (active) setPtyListenersReady(true);
+                else if (typeof unlistenExit === 'function') unlistenExit();
             } catch {
+                if (typeof unlistenOut === 'function') unlistenOut();
+                unlistenOut = null;
                 // Non-Tauri test environments may not mock event listeners
             }
         })();
@@ -524,14 +534,18 @@ const Terminal = ({ isOpen, onToggle }) => {
             active = false;
             if (typeof unlistenOut === 'function') unlistenOut();
             if (typeof unlistenExit === 'function') unlistenExit();
+            unlistenOut = null;
+            unlistenExit = null;
             if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
             if (syncFromExplorerTimerRef.current) clearTimeout(syncFromExplorerTimerRef.current);
-            for (const tab of terminalTabsRef.current) {
-                if (tab.ptySessionId) {
-                    cleanupSessionTracking(tab.ptySessionId);
-                    invoke('ssh_close_pty', { sessionId: tab.ptySessionId }).catch(() => {});
-                }
+            pendingPtyStartsRef.current.clear();
+            earlyPtyExitRef.current.clear();
+            for (const sessionId of ptyOwnersRef.current.keys()) {
+                cleanupSessionTracking(sessionId);
+                invoke('ssh_close_pty', { sessionId }).catch(() => {});
             }
+            ptyOwnersRef.current.clear();
+            pendingPtyOutputRef.current.clear();
         };
     }, []);
 
@@ -567,6 +581,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                     sshConnection: conn,
                     sshWorkingDir: remoteDir || '.',
                     ptySessionId: null,
+                    ptyStatus: 'idle',
                     ptyDisabledManually: false,
                 },
             ];
@@ -623,37 +638,79 @@ const Terminal = ({ isOpen, onToggle }) => {
         }
     }, [currentPath, parsedSftp?.connection?.host, parsedSftp?.connection?.username, parsedSftp?.connection?.port, parsedSftp?.remotePath, settings?.terminal_sync_explorer_to_terminal]);
 
-    // Auto-start full interactive PTY by default whenever an SSH tab is active and terminal is open
-    useEffect(() => {
-        if (!isOpen || !activeTab?.sshConnection || activeTab?.ptySessionId || activeTab?.ptyDisabledManually) {
-            return;
-        }
-        if (autoPtyAttemptedRef.current.has(activeTab.id)) {
-            return;
-        }
-        autoPtyAttemptedRef.current.add(activeTab.id);
+    const startTabPty = async (tab) => {
+        if (!ptyListenersReady || !tab?.sshConnection || tab.ptySessionId ||
+            pendingPtyStartsRef.current.has(tab.id) ||
+            [...ptyOwnersRef.current.values()].includes(tab.id)) return;
 
-        const targetTabId = activeTab.id;
-        const conn = activeTab.sshConnection;
-        const dir = activeTab.sshWorkingDir || '.';
-
-        startSshPty(conn, dir, 100, 30)
-            .then((sid) => {
-                if (sid) {
-                    setPtySessionId(sid, targetTabId);
-                    setupPtySessionHooks(targetTabId, conn, sid);
-                }
-            })
-            .catch((e) => {
-                updateTab(targetTabId, (tab) => ({
-                    ...tab,
-                    history: [
-                        ...tab.history,
-                        { type: 'error', content: `Failed to auto-start SSH PTY: ${e}`, timestamp: new Date().toLocaleTimeString() },
+        const tabId = tab.id;
+        const attempt = Symbol(tabId);
+        pendingPtyStartsRef.current.set(tabId, attempt);
+        updateTab(tabId, { ptyStatus: 'connecting', ptyDisabledManually: false });
+        try {
+            const sid = await startSshPty(tab.sshConnection, tab.sshWorkingDir || '.', 100, 30);
+            if (pendingPtyStartsRef.current.get(tabId) !== attempt) {
+                if (sid) await invoke('ssh_close_pty', { sessionId: sid }).catch(() => {});
+                return;
+            }
+            if (!sid) throw new Error('SSH PTY did not return a session ID');
+            if (earlyPtyExitRef.current.has(sid)) {
+                const reason = earlyPtyExitRef.current.get(sid);
+                const output = stripAnsiCodes(pendingPtyOutputRef.current.get(sid) || '');
+                earlyPtyExitRef.current.delete(sid);
+                cleanupSessionTracking(sid);
+                updateTab(tabId, (current) => ({
+                    ...current,
+                    ptyStatus: 'disconnected',
+                    history: [...current.history,
+                        ...(output ? [{ type: 'output', content: output, timestamp: new Date().toLocaleTimeString() }] : []),
+                        { type: 'system', content: '[SSH PTY exited: ' + reason + ']', timestamp: new Date().toLocaleTimeString() },
                     ],
                 }));
-            });
-    }, [isOpen, activeTab?.id, activeTab?.ptySessionId, activeTab?.ptyDisabledManually]);
+                return;
+            }
+            ptyOwnersRef.current.set(sid, tabId);
+            updateTab(tabId, { ptySessionId: sid, ptyStatus: 'connected' });
+            setupPtySessionHooks(tabId, tab.sshConnection, sid);
+        } catch (e) {
+            if (pendingPtyStartsRef.current.get(tabId) !== attempt) return;
+            updateTab(tabId, (current) => ({
+                ...current,
+                ptyStatus: 'error',
+                history: [...current.history, {
+                    type: 'error', content: 'Failed to start SSH PTY: ' + e, timestamp: new Date().toLocaleTimeString(),
+                }],
+            }));
+        } finally {
+            if (pendingPtyStartsRef.current.get(tabId) === attempt) {
+                pendingPtyStartsRef.current.delete(tabId);
+            }
+            if (pendingPtyStartsRef.current.size === 0) {
+                earlyPtyExitRef.current.clear();
+                for (const sid of pendingPtyOutputRef.current.keys()) {
+                    if (!ptyOwnersRef.current.has(sid)) pendingPtyOutputRef.current.delete(sid);
+                }
+            }
+        }
+    };
+
+    const closeTabPty = (tabId) => {
+        pendingPtyStartsRef.current.delete(tabId);
+        for (const [sessionId, owner] of ptyOwnersRef.current) {
+            if (owner !== tabId) continue;
+            ptyOwnersRef.current.delete(sessionId);
+            cleanupSessionTracking(sessionId);
+            invoke('ssh_close_pty', { sessionId }).catch(() => {});
+        }
+    };
+
+    // Initial connection only. A disconnected/failed shell requires explicit reconnect.
+    useEffect(() => {
+        if (!isOpen || !ptyListenersReady || !activeTab?.sshConnection ||
+            activeTab.ptySessionId || activeTab.ptyDisabledManually ||
+            activeTab.ptyStatus !== 'idle') return;
+        startTabPty(activeTab);
+    }, [isOpen, ptyListenersReady, activeTab?.id, activeTab?.ptySessionId, activeTab?.ptyDisabledManually, activeTab?.ptyStatus]);
 
     /**
      * Get terminal height from settings with fallback to default value
@@ -1728,8 +1785,6 @@ const Terminal = ({ isOpen, onToggle }) => {
         }
     };
 
-    if (!isOpen) return null;
-
     /**
      * Handles clearing the terminal display
      */
@@ -1775,7 +1830,7 @@ const Terminal = ({ isOpen, onToggle }) => {
     return (
         <div
             className={`enhanced-terminal${isFullscreen ? ' terminal-fullscreen' : ''}`}
-            style={isFullscreen ? undefined : { height: `${terminalHeight}px` }}
+            style={!isOpen ? { display: 'none' } : isFullscreen ? undefined : { height: `${terminalHeight}px` }}
             onKeyDown={handleTerminalKeyDown}
         >
             <div className="terminal-header">
@@ -1806,9 +1861,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                                     <span
                                         onClick={(e) => {
                                             e.stopPropagation();
-                                            if (tab.ptySessionId) {
-                                                invoke('ssh_close_pty', { sessionId: tab.ptySessionId }).catch(() => {});
-                                            }
+                                            closeTabPty(tab.id);
                                             setTerminalTabs((prev) => {
                                                 const remaining = prev.filter((t) => t.id !== tab.id);
                                                 if (activeTabIdRef.current === tab.id && remaining.length > 0) {
@@ -1856,28 +1909,19 @@ const Terminal = ({ isOpen, onToggle }) => {
                     {activeSshConnection && (
                         <button
                             className="terminal-control"
-                            onClick={async () => {
-                                const tabId = activeTab.id;
+                            disabled={!ptyListenersReady || activeTab.ptyStatus === 'connecting'}
+                            onClick={() => {
                                 if (ptySessionId) {
-                                    await invoke('ssh_close_pty', { sessionId: ptySessionId }).catch(() => {});
-                                    updateTab(tabId, { ptySessionId: null, ptyDisabledManually: true });
+                                    closeTabPty(activeTab.id);
+                                    updateTab(activeTab.id, { ptySessionId: null, ptyStatus: 'stopped', ptyDisabledManually: true });
                                 } else {
-                                    try {
-                                        updateTab(tabId, { ptyDisabledManually: false });
-                                        const sid = await startSshPty(activeSshConnection, sshWorkingDir, 100, 30);
-                                        setPtySessionId(sid, tabId);
-                                        setupPtySessionHooks(tabId, activeSshConnection, sid);
-                                    } catch (e) {
-                                        setCommandHistory(prev => [
-                                            ...prev,
-                                            { type: 'error', content: `Failed to start SSH PTY: ${e}`, timestamp: new Date().toLocaleTimeString() },
-                                        ]);
-                                    }
+                                    startTabPty(activeTab);
                                 }
                             }}
                             title={ptySessionId ? 'Stop interactive SSH PTY' : 'Start interactive SSH PTY'}
                         >
-                            {ptySessionId ? 'Stop PTY' : 'PTY'}
+                            {ptySessionId ? 'Stop PTY' : activeTab.ptyStatus === 'connecting' ? 'Connecting…' :
+                                ['disconnected', 'error'].includes(activeTab.ptyStatus) ? 'Reconnect' : 'PTY'}
                         </button>
                     )}
                     {activeSshConnection && ptySessionId && (
@@ -1981,6 +2025,9 @@ const Terminal = ({ isOpen, onToggle }) => {
                         registerController={(sid, ctrl) => {
                             if (ctrl) {
                                 xtermControllersRef.current[sid] = ctrl;
+                                const buffered = pendingPtyOutputRef.current.get(sid);
+                                if (buffered) ctrl.write(buffered);
+                                pendingPtyOutputRef.current.delete(sid);
                             } else {
                                 delete xtermControllersRef.current[sid];
                             }

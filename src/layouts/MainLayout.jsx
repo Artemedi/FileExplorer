@@ -1377,12 +1377,10 @@ const MainLayout = () => {
                                 overflow: isTerminalOpen ? 'visible' : 'hidden'
                             }}
                         >
-                            {isTerminalOpen && (
-                                <Terminal
-                                    isOpen={isTerminalOpen}
-                                    onToggle={() => setIsTerminalOpen(!isTerminalOpen)}
-                                />
-                            )}
+                            <Terminal
+                                isOpen={isTerminalOpen}
+                                onToggle={() => setIsTerminalOpen(!isTerminalOpen)}
+                            />
                         </div>
                     </div>
                 </div>
