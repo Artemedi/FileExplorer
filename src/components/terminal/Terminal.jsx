@@ -197,6 +197,7 @@ const Terminal = ({ isOpen, onToggle }) => {
     const ptyOwnersRef = useRef(new Map());
     const earlyPtyExitRef = useRef(new Map());
     const pendingPtyOutputRef = useRef(new Map());
+    const failedPtyWritesRef = useRef(new Set());
     const [ptyListenersReady, setPtyListenersReady] = useState(false);
     const syncingFromTerminalRef = useRef(false);
     const syncingFromExplorerRef = useRef(false);
@@ -284,6 +285,7 @@ const Terminal = ({ isOpen, onToggle }) => {
     const cleanupSessionTracking = (sessionId) => {
         if (!sessionId) return;
         pendingPtyOutputRef.current.delete(sessionId);
+        failedPtyWritesRef.current.delete(sessionId);
         oscBufferRef.current.delete(sessionId);
         shellIdleRef.current.delete(sessionId);
         shellHookSeenRef.current.delete(sessionId);
@@ -296,12 +298,26 @@ const Terminal = ({ isOpen, onToggle }) => {
         }
     };
 
+    const writePty = async (sessionId, data) => {
+        const tabId = ptyOwnersRef.current.get(sessionId);
+        if (!tabId || failedPtyWritesRef.current.has(sessionId)) return false;
+        try {
+            await invoke('ssh_write_pty', { sessionId, data });
+            return true;
+        } catch (error) {
+            if (ptyOwnersRef.current.get(sessionId) !== tabId) return false;
+            failedPtyWritesRef.current.add(sessionId);
+            updateTab(tabId, (tab) => tab.ptySessionId !== sessionId ? tab : ({
+                ...tab,
+                ptyWriteError: String(error),
+            }));
+            return false;
+        }
+    };
+
     const injectShellIntegration = (sessionId) => {
         if (!sessionId) return;
-        invoke('ssh_write_pty', {
-            sessionId,
-            data: buildShellIntegrationCommand(),
-        }).catch(() => {});
+        return writePty(sessionId, buildShellIntegrationCommand());
     };
 
     const fetchHomeDirForTab = async (tabId, conn) => {
@@ -627,7 +643,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                     }
                     syncingFromExplorerRef.current = true;
                     const cmd = ` cd -- ${escapePosixSingleQuote(normalizedTarget)}\n`;
-                    invoke('ssh_write_pty', { sessionId: sid, data: cmd }).catch(() => {});
+                    writePty(sid, cmd);
                     syncFromExplorerTimerRef.current = setTimeout(() => {
                         syncingFromExplorerRef.current = false;
                     }, 350);
@@ -646,7 +662,7 @@ const Terminal = ({ isOpen, onToggle }) => {
         const tabId = tab.id;
         const attempt = Symbol(tabId);
         pendingPtyStartsRef.current.set(tabId, attempt);
-        updateTab(tabId, { ptyStatus: 'connecting', ptyDisabledManually: false });
+        updateTab(tabId, { ptyStatus: 'connecting', ptyDisabledManually: false, ptyWriteError: null });
         try {
             const sid = await startSshPty(tab.sshConnection, tab.sshWorkingDir || '.', 100, 30);
             if (pendingPtyStartsRef.current.get(tabId) !== attempt) {
@@ -820,11 +836,8 @@ const Terminal = ({ isOpen, onToggle }) => {
 
         try {
             if (ptySessionIdRef.current) {
-                await invoke('ssh_write_pty', {
-                    sessionId: ptySessionIdRef.current,
-                    data: `${command}\n`,
-                });
-                return null;
+                const accepted = await writePty(ptySessionIdRef.current, `${command}\n`);
+                return accepted ? null : { type: 'error', content: 'SSH PTY input was not accepted' };
             }
             if (activeSshConnection) {
                 const trimmedCmd = command.trim();
@@ -2007,6 +2020,15 @@ const Terminal = ({ isOpen, onToggle }) => {
                     </button>
                 </div>
             </div>
+            {ptySessionId && activeTab.ptyWriteError && (
+                <div role="alert" className="terminal-input-error">
+                    <span>SSH input paused: {activeTab.ptyWriteError}. Check the remote shell before resuming; rejected input is not replayed.</span>
+                    <button type="button" className="terminal-control" onClick={() => {
+                        failedPtyWritesRef.current.delete(ptySessionId);
+                        updateTab(activeTab.id, { ptyWriteError: null });
+                    }}>Resume input</button>
+                </div>
+            )}
             {terminalTabs
                 .filter((tab) => Boolean(tab.ptySessionId))
                 .map((tab) => (
@@ -2016,8 +2038,9 @@ const Terminal = ({ isOpen, onToggle }) => {
                         isVisible={isOpen && tab.id === activeTab?.id}
                         isFullscreen={isFullscreen}
                         onData={(data) => {
+                            if (failedPtyWritesRef.current.has(tab.ptySessionId)) return;
                             trackPtyUserInput(tab.ptySessionId, data);
-                            invoke('ssh_write_pty', { sessionId: tab.ptySessionId, data }).catch(() => {});
+                            return writePty(tab.ptySessionId, data);
                         }}
                         onResize={(cols, rows) => {
                             invoke('ssh_resize_pty', { sessionId: tab.ptySessionId, cols, rows }).catch(() => {});

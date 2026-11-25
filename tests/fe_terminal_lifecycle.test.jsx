@@ -32,12 +32,12 @@ vi.mock('../src/providers/SftpProvider', () => ({
     }),
 }));
 vi.mock('../src/components/terminal/XtermSshView', () => ({
-    default: ({ sessionId, registerController }) => {
+    default: ({ sessionId, registerController, onData }) => {
         React.useEffect(() => {
             registerController(sessionId, { write: mockWrite, getBufferText: () => '' });
             return () => registerController(sessionId, null);
         }, [sessionId]);
-        return <div data-testid={sessionId} />;
+        return <div data-testid={sessionId}><button onClick={() => onData("test input")}>Send input</button></div>;
     },
 }));
 
@@ -118,6 +118,30 @@ describe('TERM-R1 PTY lifecycle', () => {
         await act(async () => resolve('pty-fast'));
         expect(await screen.findByRole('button', { name: 'Reconnect' })).toBeEnabled();
         expect(screen.queryByTestId('pty-fast')).not.toBeInTheDocument();
+    });
+
+    test('rejected input is visible, pauses subsequent input and is never replayed', async () => {
+        mockInvoke.mockImplementation(async (command, args) => {
+            if (command === 'ssh_write_pty' && args.data === 'test input') {
+                throw new Error('queue full');
+            }
+            return null;
+        });
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const send = await screen.findByRole('button', { name: 'Send input' });
+        fireEvent.click(send);
+        expect(await screen.findByRole('alert')).toHaveTextContent('queue full');
+        fireEvent.click(send);
+        expect(mockInvoke.mock.calls.filter(([cmd, args]) =>
+            cmd === 'ssh_write_pty' && args.data === 'test input')).toHaveLength(1);
+        mockInvoke.mockResolvedValue(null);
+        fireEvent.click(screen.getByRole('button', { name: 'Resume input' }));
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(mockInvoke.mock.calls.filter(([cmd, args]) =>
+            cmd === 'ssh_write_pty' && args.data === 'test input')).toHaveLength(1);
+        fireEvent.click(send);
+        await waitFor(() => expect(mockInvoke.mock.calls.filter(([cmd, args]) =>
+            cmd === 'ssh_write_pty' && args.data === 'test input')).toHaveLength(2));
     });
 
     test('failed startup is not retried automatically and can be retried explicitly', async () => {

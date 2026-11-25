@@ -5,6 +5,7 @@ pub mod hash_commands;
 pub mod meta_data_commands;
 pub mod permission_commands;
 pub mod preview_commands;
+mod pty_io;
 pub mod search_engine_commands;
 pub mod settings_commands;
 pub mod sftp_file_system_operation_commands;

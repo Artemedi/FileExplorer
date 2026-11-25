@@ -380,3 +380,14 @@
     color: #ffffff !important;
 }
 
+
+.terminal-input-error {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 12px;
+    color: #ffb86c;
+    background: #2a2a2a;
+    overflow-wrap: anywhere;
+}
