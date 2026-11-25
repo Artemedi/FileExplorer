@@ -3,41 +3,45 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
-const { mockInvoke, mockListen, mockStart, mockWrite } = vi.hoisted(() => ({
+const { mockInvoke, mockListen, mockStart, mockWrite, mockNavigation } = vi.hoisted(() => ({
     mockInvoke: vi.fn(),
     mockListen: vi.fn(),
     mockStart: vi.fn(),
     mockWrite: vi.fn(),
+    mockNavigation: { path: "sftp:Test:/test", load: vi.fn(), navigate: vi.fn(), execute: vi.fn() },
 }));
 const connection = { name: 'Test', host: 'test.invalid', username: 'test', port: 22 };
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mockInvoke }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: mockListen }));
 vi.mock('../src/providers/HistoryProvider', () => ({
-    useHistory: () => ({ currentPath: 'sftp:Test:/test', navigateTo: vi.fn() }),
+    useHistory: () => ({ currentPath: mockNavigation.path, navigateTo: mockNavigation.navigate }),
 }));
 vi.mock('../src/providers/FileSystemProvider', () => ({
-    useFileSystem: () => ({ loadDirectory: vi.fn() }),
+    useFileSystem: () => ({ loadDirectory: mockNavigation.load }),
 }));
 vi.mock('../src/providers/SettingsProvider', () => ({
-    useSettings: () => ({ settings: { terminal_height: 240 } }),
+    useSettings: () => ({ settings: { terminal_height: 240, terminal_sync_explorer_to_terminal: true } }),
 }));
 vi.mock('../src/providers/SftpProvider', () => ({
     useSftp: () => ({
         isSftpPath: (path) => path?.startsWith('sftp:'),
-        parseSftpPath: () => ({ connection, remotePath: '/test' }),
-        createSftpUrl: () => 'sftp:Test:/test',
-        executeSshCommand: async () => ({ exit_code: 0, stdout: '/test' }),
+        parseSftpPath: (path) => {
+            const [, name, remotePath] = path.split(':');
+            return { connection: { ...connection, name }, remotePath };
+        },
+        createSftpUrl: (conn, dir) => 'sftp:' + conn.name + ':' + dir,
+        executeSshCommand: mockNavigation.execute,
         startSshPty: mockStart,
     }),
 }));
 vi.mock('../src/components/terminal/XtermSshView', () => ({
-    default: ({ sessionId, registerController, onData }) => {
+    default: ({ sessionId, isVisible, registerController, onData }) => {
         React.useEffect(() => {
-            registerController(sessionId, { write: mockWrite, getBufferText: () => '' });
+            registerController(sessionId, { write: (data) => mockWrite(data, sessionId), getBufferText: () => '' });
             return () => registerController(sessionId, null);
         }, [sessionId]);
-        return <div data-testid={sessionId}><button onClick={() => onData("test input")}>Send input</button></div>;
+        return <div data-testid={sessionId} style={{ display: isVisible ? undefined : "none" }}><button onClick={() => onData("test input")}>Send input</button></div>;
     },
 }));
 
@@ -51,7 +55,11 @@ describe('TERM-R1 PTY lifecycle', () => {
         vi.clearAllMocks();
         listeners = {};
         mockInvoke.mockResolvedValue(null);
-        mockStart.mockResolvedValue('pty-1');
+        mockStart.mockReset().mockResolvedValue('pty-1');
+        mockNavigation.path = 'sftp:Test:/test';
+        mockNavigation.load.mockReset().mockResolvedValue(true);
+        mockNavigation.navigate.mockReset();
+        mockNavigation.execute.mockReset().mockResolvedValue({ exit_code: 0, stdout: '/test' });
         mockListen.mockImplementation(async (name, handler) => {
             listeners[name] = handler;
             return () => delete listeners[name];
@@ -109,7 +117,7 @@ describe('TERM-R1 PTY lifecycle', () => {
         emit('ssh-pty-output', { session_id: 'pty-early', data: 'early text' });
         await act(async () => resolve('pty-early'));
         await screen.findByTestId('pty-early');
-        expect(mockWrite).toHaveBeenCalledWith('early text');
+        expect(mockWrite).toHaveBeenCalledWith('early text', 'pty-early');
         emit('ssh-pty-exit', { session_id: 'pty-early', reason: 'closed' });
         mockStart.mockImplementationOnce(() => new Promise((r) => { resolve = r; }));
         fireEvent.click(await screen.findByRole('button', { name: 'Reconnect' }));
@@ -151,6 +159,127 @@ describe('TERM-R1 PTY lifecycle', () => {
         expect(mockStart).toHaveBeenCalledTimes(1);
         fireEvent.click(reconnect);
         await screen.findByTestId('pty-retry');
+        expect(mockStart).toHaveBeenCalledTimes(2);
+    });
+
+    test('R2: duplicate same profile and confirmed cwd creates three isolated PTYs', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2').mockResolvedValueOnce('pty-3');
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const original = await screen.findByTestId('pty-1');
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/test\x07\x1b]133;C\x07' });
+        fireEvent.click(screen.getByRole('button', { name: 'Duplicate SSH' }));
+        const second = await screen.findByTestId('pty-2');
+        expect(second).toBeVisible();
+        expect(original).not.toBeVisible();
+        fireEvent.click(screen.getByRole('button', { name: 'Duplicate SSH' }));
+        const third = await screen.findByTestId('pty-3');
+        expect(third).toBeVisible();
+        expect(second).not.toBeVisible();
+        expect(mockStart).toHaveBeenCalledTimes(3);
+        expect(mockStart.mock.calls.map((args) => args[1])).toEqual(['/test', '/test', '/test']);
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_close_pty', expect.anything());
+        for (const id of ['pty-1', 'pty-2', 'pty-3']) {
+            emit('ssh-pty-output', { session_id: id, data: 'output:' + id });
+            expect(mockWrite).toHaveBeenCalledWith('output:' + id, id);
+        }
+        fireEvent.click(screen.getByRole('button', { name: 'Send input' }));
+        expect(mockInvoke).toHaveBeenCalledWith('ssh_write_pty', { sessionId: 'pty-3', data: 'test input' });
+        fireEvent.click(screen.getByText('SSH: Test'));
+        expect(original).toBeVisible();
+        fireEvent.click(screen.getByRole('button', { name: 'Send input' }));
+        expect(mockInvoke).toHaveBeenCalledWith('ssh_write_pty', { sessionId: 'pty-1', data: 'test input' });
+        fireEvent.click(screen.getByText('SSH: Test #2').parentElement.querySelector('[title="Close terminal tab"]'));
+        expect(mockInvoke).toHaveBeenCalledWith('ssh_close_pty', { sessionId: 'pty-2' });
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_close_pty', { sessionId: 'pty-1' });
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_close_pty', { sessionId: 'pty-3' });
+        expect(screen.getByTestId('pty-1')).toBe(original);
+        expect(screen.getByTestId('pty-3')).toBe(third);
+    });
+
+    test('R2: confirmed directory belongs to its shell; independent shell never drives explorer', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2').mockResolvedValueOnce('pty-3');
+        const { rerender } = render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/confirmed\x07' });
+        await waitFor(() => expect(mockNavigation.load).toHaveBeenCalledWith('sftp:Test:/confirmed'));
+        fireEvent.click(screen.getByRole('button', { name: 'Duplicate SSH' }));
+        await screen.findByTestId('pty-2');
+        expect(mockStart.mock.calls[1][1]).toBe('/confirmed');
+        await act(async () => { await new Promise((resolve) => setTimeout(resolve, 200)); });
+        mockNavigation.load.mockClear();
+        mockNavigation.navigate.mockClear();
+        mockInvoke.mockClear();
+        emit('ssh-pty-output', { session_id: 'pty-2', data: '\x1b]7;file://db/independent\x07\x1b]133;A\x07' });
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/background\x07\x1b]133;A\x07' });
+        expect(mockNavigation.load).not.toHaveBeenCalled();
+        expect(mockNavigation.navigate).not.toHaveBeenCalled();
+        mockNavigation.path = 'sftp:Test:/elsewhere';
+        rerender(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        expect(screen.getByTestId('pty-2')).toBeVisible();
+        expect(mockInvoke.mock.calls.filter(([cmd, args]) =>
+            cmd === 'ssh_write_pty' && args.data?.startsWith(' cd -- '))).toHaveLength(0);
+        fireEvent.click(screen.getByRole('button', { name: 'Duplicate SSH' }));
+        await screen.findByTestId('pty-3');
+        expect(mockStart.mock.calls[2][1]).toBe('/independent');
+    });
+
+    test('R2: repeated explicit SSH opens create independent sessions even in one render', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2').mockResolvedValueOnce('pty-3');
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        act(() => {
+            window.dispatchEvent(new CustomEvent('open-ssh-terminal', { detail: { connection } }));
+            window.dispatchEvent(new CustomEvent('open-ssh-terminal', { detail: { connection } }));
+        });
+        expect(await screen.findByTestId('pty-2')).not.toBeVisible();
+        expect(await screen.findByTestId('pty-3')).toBeVisible();
+        expect(mockStart).toHaveBeenCalledTimes(3);
+        expect(mockStart.mock.calls.map((args) => args[1])).toEqual(['/test', '.', '.']);
+    });
+
+    test('R2: exit and reconnect one independent tab leaves other PTYs alive', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2').mockResolvedValueOnce('pty-3');
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const original = await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name: 'Duplicate SSH' }));
+        await screen.findByTestId('pty-2');
+        emit('ssh-pty-exit', { session_id: 'pty-2', reason: 'transport lost' });
+        fireEvent.click(await screen.findByRole('button', { name: 'Reconnect' }));
+        expect(await screen.findByTestId('pty-3')).toBeVisible();
+        expect(screen.getByText('SSH: Test #2')).toBeInTheDocument();
+        emit('ssh-pty-output', { session_id: 'pty-2', data: 'stale output' });
+        emit('ssh-pty-exit', { session_id: 'pty-2', reason: 'stale exit' });
+        expect(mockWrite).not.toHaveBeenCalledWith('stale output', expect.anything());
+        expect(screen.getByTestId('pty-1')).toBe(original);
+        expect(screen.getByTestId('pty-3')).toBeVisible();
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_close_pty', { sessionId: 'pty-1' });
+    });
+
+    test('R2: reopening an explorer terminal after closing it does not reuse its logical ID', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2');
+        const { rerender } = render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByText('SSH: Test').parentElement.querySelector('[title="Close terminal tab"]'));
+        mockNavigation.path = 'sftp:Test:/new';
+        rerender(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        expect(await screen.findByTestId('pty-2')).toBeVisible();
+        expect(mockStart.mock.calls[1][1]).toBe('/new');
+        emit('ssh-pty-exit', { session_id: 'pty-1', reason: 'stale exit' });
+        expect(screen.getByTestId('pty-2')).toBeVisible();
+    });
+
+    test('R2: different saved profiles at the same endpoint have different linked shells', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2');
+        const { rerender } = render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const original = await screen.findByTestId('pty-1');
+        mockNavigation.path = 'sftp:Other:/test';
+        rerender(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        expect(await screen.findByTestId('pty-2')).toBeVisible();
+        expect(original).not.toBeVisible();
+        expect(mockStart.mock.calls.map(([conn]) => conn.name)).toEqual(['Test', 'Other']);
+        mockNavigation.path = 'sftp:Test:/test';
+        rerender(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        expect(original).toBeVisible();
         expect(mockStart).toHaveBeenCalledTimes(2);
     });
 });

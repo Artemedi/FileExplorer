@@ -111,8 +111,32 @@ Use Ctrl+R for reverse search, Ctrl+C to interrupt commands.`,
     timestamp: new Date().toLocaleTimeString(),
 });
 
-const getSshTabId = (conn) =>
-    `ssh:${conn.username || 'guest'}@${conn.host}:${conn.port || 22}`;
+const getSshConnectionKey = (conn) =>
+    JSON.stringify([conn.name || '', conn.username || 'guest', conn.host, Number(conn.port || 22)]);
+
+const buildSshTab = (id, conn, remoteDir, followsExplorer) => {
+    const label = `SSH: ${conn.name || conn.host}${followsExplorer ? '' : ' #' + id.slice(4)}`;
+    const dir = remoteDir || '.';
+    return {
+        id,
+        label,
+        history: [
+            buildWelcomeEntry(label, dir),
+            {
+                type: 'system',
+                content: `[SSH] Terminal session ready for ${conn.username || 'guest'}@${conn.host}:${conn.port || 22}`,
+                timestamp: new Date().toLocaleTimeString(),
+            },
+        ],
+        sshConnection: conn,
+        sshFollowsExplorer: followsExplorer,
+        sshWorkingDir: dir,
+        sshConfirmedDir: null,
+        ptySessionId: null,
+        ptyStatus: 'idle',
+        ptyDisabledManually: false,
+    };
+};
 
 const parsePrompt = (promptStr = '') => {
     const atIdx = promptStr.indexOf('@');
@@ -193,6 +217,8 @@ const Terminal = ({ isOpen, onToggle }) => {
 
     const [isFullscreen, setIsFullscreen] = useState(false);
     const xtermControllersRef = useRef({});
+    const nextSshTabIdRef = useRef(0);
+    const explorerSshTabsRef = useRef(new Map());
     const pendingPtyStartsRef = useRef(new Map());
     const ptyOwnersRef = useRef(new Map());
     const earlyPtyExitRef = useRef(new Map());
@@ -256,16 +282,11 @@ const Terminal = ({ isOpen, onToggle }) => {
         );
     };
 
-    const setCommandHistory = (updater) => {
-        const targetId = activeTabIdRef.current;
+    const setCommandHistory = (updater, targetId = activeTabIdRef.current) => {
         updateTab(targetId, (tab) => ({
             ...tab,
             history: typeof updater === 'function' ? updater(tab.history) : updater,
         }));
-    };
-
-    const setSshWorkingDir = (nextDir) => {
-        updateTab(activeTabIdRef.current, { sshWorkingDir: nextDir });
     };
 
     const [currentCommand, setCurrentCommand] = useState('');
@@ -325,7 +346,8 @@ const Terminal = ({ isOpen, onToggle }) => {
         try {
             const res = await executeSshCommand(conn, 'printf %s "$HOME"', '.');
             const home = res?.stdout?.trim();
-            if (res?.exit_code === 0 && home && home.startsWith('/')) {
+            if (res?.exit_code === 0 && home && home.startsWith('/') &&
+                terminalTabsRef.current.some((tab) => tab.id === tabId)) {
                 sshHomeDirRef.current.set(tabId, normalizeRemotePosixPath(home));
             }
         } catch {
@@ -342,12 +364,14 @@ const Terminal = ({ isOpen, onToggle }) => {
     };
 
     const syncExplorerToRemoteDir = async (ownerTab, targetDir, forceRetry = false) => {
-        if (!ownerTab?.sshConnection || !targetDir) return;
+        if (!ownerTab?.sshConnection || !ownerTab.sshFollowsExplorer ||
+            ownerTab.id !== activeTabIdRef.current || !targetDir) return;
         const normalizedTarget = normalizeRemotePosixPath(targetDir);
         const cur = currentPathRef.current;
         if (!isSftpPathRef.current(cur)) return;
         const parsedCur = parseSftpPathRef.current(cur);
-        if (!parsedCur?.connection || getSshTabId(parsedCur.connection) !== ownerTab.id) return;
+        if (!parsedCur?.connection ||
+            getSshConnectionKey(parsedCur.connection) !== getSshConnectionKey(ownerTab.sshConnection)) return;
 
         const curRemotePath = normalizeRemotePosixPath(parsedCur.remotePath || '/');
         if (
@@ -488,10 +512,11 @@ const Terminal = ({ isOpen, onToggle }) => {
                         if (forceSync) {
                             forceSyncNextOscRef.current.delete(ownerTab.id);
                         }
+                        if (ownerTab.sshConfirmedDir !== detectedDir || ownerTab.sshWorkingDir !== detectedDir) {
+                            updateTab(ownerTab.id, { sshWorkingDir: detectedDir, sshConfirmedDir: detectedDir });
+                        }
+                        if (!ownerTab.sshFollowsExplorer || ownerTab.id !== activeTabIdRef.current) return;
                         if (ownerTab.sshWorkingDir !== detectedDir || forceSync) {
-                            if (ownerTab.sshWorkingDir !== detectedDir) {
-                                updateTab(ownerTab.id, { sshWorkingDir: detectedDir });
-                            }
                             if (syncingFromExplorerRef.current) {
                                 const cur = currentPathRef.current;
                                 const parsedCur = isSftpPathRef.current(cur) ? parseSftpPathRef.current(cur) : null;
@@ -565,51 +590,45 @@ const Terminal = ({ isOpen, onToggle }) => {
         };
     }, []);
 
+    const newSshTabId = () => 'ssh:' + (++nextSshTabIdRef.current);
+
+    const openIndependentSshTab = (conn, remoteDir = '.') => {
+        const tab = buildSshTab(newSshTabId(), conn, remoteDir, false);
+        setTerminalTabs((prev) => [...prev, tab]);
+        setActiveTabId(tab.id);
+    };
+
     const ensureAndSelectSshTab = (conn, remoteDir = '.') => {
-        const tabId = getSshTabId(conn);
-        const label = `SSH: ${conn.name || conn.host}`;
+        const key = getSshConnectionKey(conn);
+        let tabId = explorerSshTabsRef.current.get(key);
+        if (!tabId) {
+            tabId = newSshTabId();
+            explorerSshTabsRef.current.set(key, tabId);
+        }
+        const id = tabId;
         setTerminalTabs((prev) => {
-            const exists = prev.some((t) => t.id === tabId);
-            if (exists) {
+            if (prev.some((t) => t.id === id)) {
                 return prev.map((t) =>
-                    t.id === tabId
+                    t.id === id
                         ? {
                             ...t,
                             sshConnection: conn,
-                            sshWorkingDir: t.ptySessionId ? t.sshWorkingDir : (remoteDir || t.sshWorkingDir),
+                            sshWorkingDir: t.ptySessionId || t.ptyStatus === 'connecting'
+                                ? t.sshWorkingDir : (remoteDir || t.sshWorkingDir),
                         }
                         : t
                 );
             }
-            return [
-                ...prev,
-                {
-                    id: tabId,
-                    label,
-                    history: [
-                        buildWelcomeEntry(label, remoteDir || '.'),
-                        {
-                            type: 'system',
-                            content: `[SSH] Terminal session ready for ${conn.username || 'guest'}@${conn.host}:${conn.port || 22}`,
-                            timestamp: new Date().toLocaleTimeString(),
-                        },
-                    ],
-                    sshConnection: conn,
-                    sshWorkingDir: remoteDir || '.',
-                    ptySessionId: null,
-                    ptyStatus: 'idle',
-                    ptyDisabledManually: false,
-                },
-            ];
+            return [...prev, buildSshTab(id, conn, remoteDir, true)];
         });
-        setActiveTabId(tabId);
+        setActiveTabId(id);
     };
 
     useEffect(() => {
         const handleOpenSsh = (e) => {
             const conn = e?.detail?.connection;
             if (!conn?.host) return;
-            ensureAndSelectSshTab(conn, '.');
+            openIndependentSshTab(conn, '.');
         };
         window.addEventListener('open-ssh-terminal', handleOpenSsh);
         return () => window.removeEventListener('open-ssh-terminal', handleOpenSsh);
@@ -618,8 +637,11 @@ const Terminal = ({ isOpen, onToggle }) => {
     // Automatically switch terminal tab when user switches active explorer window/path
     useEffect(() => {
         if (syncingFromTerminalRef.current) return;
+        const selected = terminalTabsRef.current.find((tab) => tab.id === activeTabIdRef.current);
+        // An explicitly opened SSH terminal is independent of explorer navigation.
+        if (selected?.sshConnection && !selected.sshFollowsExplorer) return;
         if (parsedSftp?.connection) {
-            const tabId = getSshTabId(parsedSftp.connection);
+            const tabId = explorerSshTabsRef.current.get(getSshConnectionKey(parsedSftp.connection));
             const existingTab = terminalTabsRef.current.find((t) => t.id === tabId);
             ensureAndSelectSshTab(parsedSftp.connection, parsedSftp.remotePath || '.');
 
@@ -652,7 +674,7 @@ const Terminal = ({ isOpen, onToggle }) => {
         } else if (activeTabIdRef.current.startsWith('ssh:')) {
             setActiveTabId('local');
         }
-    }, [currentPath, parsedSftp?.connection?.host, parsedSftp?.connection?.username, parsedSftp?.connection?.port, parsedSftp?.remotePath, settings?.terminal_sync_explorer_to_terminal]);
+    }, [currentPath, parsedSftp?.connection?.name, parsedSftp?.connection?.host, parsedSftp?.connection?.username, parsedSftp?.connection?.port, parsedSftp?.remotePath, settings?.terminal_sync_explorer_to_terminal]);
 
     const startTabPty = async (tab) => {
         if (!ptyListenersReady || !tab?.sshConnection || tab.ptySessionId ||
@@ -662,7 +684,7 @@ const Terminal = ({ isOpen, onToggle }) => {
         const tabId = tab.id;
         const attempt = Symbol(tabId);
         pendingPtyStartsRef.current.set(tabId, attempt);
-        updateTab(tabId, { ptyStatus: 'connecting', ptyDisabledManually: false, ptyWriteError: null });
+        updateTab(tabId, { ptyStatus: 'connecting', ptyDisabledManually: false, ptyWriteError: null, sshConfirmedDir: null });
         try {
             const sid = await startSshPty(tab.sshConnection, tab.sshWorkingDir || '.', 100, 30);
             if (pendingPtyStartsRef.current.get(tabId) !== attempt) {
@@ -720,13 +742,16 @@ const Terminal = ({ isOpen, onToggle }) => {
         }
     };
 
-    // Initial connection only. A disconnected/failed shell requires explicit reconnect.
+    // Initial connection only. Explicit SSH tabs start independently even if
+    // selection changes before their connection completes.
     useEffect(() => {
-        if (!isOpen || !ptyListenersReady || !activeTab?.sshConnection ||
-            activeTab.ptySessionId || activeTab.ptyDisabledManually ||
-            activeTab.ptyStatus !== 'idle') return;
-        startTabPty(activeTab);
-    }, [isOpen, ptyListenersReady, activeTab?.id, activeTab?.ptySessionId, activeTab?.ptyDisabledManually, activeTab?.ptyStatus]);
+        if (!isOpen || !ptyListenersReady) return;
+        for (const tab of terminalTabs) {
+            if (!tab.sshConnection || tab.ptySessionId || tab.ptyDisabledManually ||
+                tab.ptyStatus !== 'idle') continue;
+            if (tab.id === activeTab?.id || !tab.sshFollowsExplorer) startTabPty(tab);
+        }
+    }, [isOpen, ptyListenersReady, terminalTabs, activeTab?.id]);
 
     /**
      * Get terminal height from settings with fallback to default value
@@ -835,8 +860,8 @@ const Terminal = ({ isOpen, onToggle }) => {
         setIsExecuting(true);
 
         try {
-            if (ptySessionIdRef.current) {
-                const accepted = await writePty(ptySessionIdRef.current, `${command}\n`);
+            if (ptySessionId) {
+                const accepted = await writePty(ptySessionId, `${command}\n`);
                 return accepted ? null : { type: 'error', content: 'SSH PTY input was not accepted' };
             }
             if (activeSshConnection) {
@@ -848,7 +873,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                     const res = await executeSshCommand(activeSshConnection, cdCmd, sshWorkingDir);
                     if (res.exit_code === 0 && res.stdout?.trim()) {
                         const newRemoteDir = res.stdout.trim().split('\n').pop().trim();
-                        setSshWorkingDir(newRemoteDir);
+                        updateTab(activeTab.id, { sshWorkingDir: newRemoteDir, sshConfirmedDir: newRemoteDir });
                         await syncExplorerToRemoteDir(activeTab, newRemoteDir);
                         return { type: 'system', content: `[SSH] Directory: ${newRemoteDir}` };
                     }
@@ -1465,6 +1490,7 @@ const Terminal = ({ isOpen, onToggle }) => {
         const command = currentCommand.trim();
         const [cmd = '', ...args] = parseCommandArgs(command);
 
+        const commandTabId = activeTab.id;
         // Add command to history
         const commandEntry = {
             type: 'command',
@@ -1473,7 +1499,7 @@ const Terminal = ({ isOpen, onToggle }) => {
             timestamp: new Date().toLocaleTimeString(),
         };
 
-        setCommandHistory(prev => [...prev, commandEntry]);
+        setCommandHistory(prev => [...prev, commandEntry], commandTabId);
 
         // Save command to persistent history (avoid duplicates)
         setPersistentHistory(prev => {
@@ -1503,7 +1529,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                 ...response,
                 originalCommand: response.type === 'output' ? command : undefined,
                 timestamp: new Date().toLocaleTimeString(),
-            }]);
+            }], commandTabId);
         }
 
         // Reset command input
@@ -1875,6 +1901,12 @@ const Terminal = ({ isOpen, onToggle }) => {
                                         onClick={(e) => {
                                             e.stopPropagation();
                                             closeTabPty(tab.id);
+                                            if (tab.sshFollowsExplorer) {
+                                                explorerSshTabsRef.current.delete(getSshConnectionKey(tab.sshConnection));
+                                            }
+                                            sshHomeDirRef.current.delete(tab.id);
+                                            lastFailedSyncDirRef.current.delete(tab.id);
+                                            forceSyncNextOscRef.current.delete(tab.id);
                                             setTerminalTabs((prev) => {
                                                 const remaining = prev.filter((t) => t.id !== tab.id);
                                                 if (activeTabIdRef.current === tab.id && remaining.length > 0) {
@@ -1921,6 +1953,16 @@ const Terminal = ({ isOpen, onToggle }) => {
                 <div className="terminal-controls">
                     {activeSshConnection && (
                         <button
+                            type="button"
+                            className="terminal-control"
+                            onClick={() => openIndependentSshTab(activeSshConnection, activeTab.sshConfirmedDir || sshWorkingDir)}
+                            title="Duplicate SSH session (new shell at last known directory)"
+                        >
+                            Duplicate SSH
+                        </button>
+                    )}
+                    {activeSshConnection && (
+                        <button
                             className="terminal-control"
                             disabled={!ptyListenersReady || activeTab.ptyStatus === 'connecting'}
                             onClick={() => {
@@ -1942,13 +1984,17 @@ const Terminal = ({ isOpen, onToggle }) => {
                             type="button"
                             className="terminal-control"
                             onClick={() => {
-                                lastFailedSyncDirRef.current.delete(activeTab.id);
-                                forceSyncNextOscRef.current.add(activeTab.id);
+                                if (activeTab.sshFollowsExplorer) {
+                                    lastFailedSyncDirRef.current.delete(activeTab.id);
+                                    forceSyncNextOscRef.current.add(activeTab.id);
+                                }
                                 injectShellIntegration(ptySessionId);
                             }}
-                            title="Re-enable directory sync hook in current shell (useful after sudo/su)"
+                            title={activeTab.sshFollowsExplorer
+                                ? 'Re-enable directory sync hook in current shell (useful after sudo/su)'
+                                : 'Refresh working directory hook in this independent shell'}
                         >
-                            Sync
+                            {activeTab.sshFollowsExplorer ? 'Sync' : 'Refresh CWD'}
                         </button>
                     )}
                     {activeSshConnection && (
@@ -1965,7 +2011,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                                     setCommandHistory(prev => [
                                         ...prev,
                                         { type: 'error', content: `Failed to open external SSH terminal: ${e}`, timestamp: new Date().toLocaleTimeString() },
-                                    ]);
+                                    ], activeTab.id);
                                 });
                             }}
                             title="Open in native OS terminal (best for mc / btop / htop)"
