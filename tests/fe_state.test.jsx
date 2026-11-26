@@ -1,6 +1,6 @@
-import React, { StrictMode } from 'react';
+import React, { StrictMode, useContext } from 'react';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
 const mockInvoke = vi.fn();
@@ -20,6 +20,7 @@ import ContextMenuProvider, { useContextMenu } from '../src/providers/ContextMen
 import AppStateProvider, { useAppState } from '../src/providers/AppStateProvider.jsx';
 import { SettingsContext } from '../src/providers/SettingsProvider.jsx';
 import SftpProvider from '../src/providers/SftpProvider.jsx';
+import TabManager, { ExplorerTabsContext } from '../src/components/tabs/TabManager.jsx';
 import {
     getDirectoryPath,
     getFileName,
@@ -133,6 +134,56 @@ describe('TP-FE-STATE-03 / TP-FE-STATE-04 / TP-IPC-05: FileSystemProvider & Hist
         expect(screen.getByTestId('path')).toHaveTextContent('C:\\B');
         expect(screen.getByTestId('files')).toHaveTextContent('fromB.txt');
         expect(screen.getByTestId('loading')).toHaveTextContent('false');
+    });
+
+    test('R3: switching between identical Explorer paths invalidates an already running directory load', async () => {
+        const path = 'C:\\Init';
+        sessionStorage.setItem('fileExplorerHistory', JSON.stringify([path]));
+        sessionStorage.setItem('fileExplorerHistoryIndex', '0');
+        localStorage.setItem('explr_saved_tabs', JSON.stringify([
+            { id: 'A', title: 'A', path },
+            { id: 'B', title: 'B', path },
+        ]));
+        localStorage.setItem('explr_active_tab_id', 'A');
+        let resolve;
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_system_volumes_information_as_json') return '[]';
+            if (cmd === 'open_directory') {
+                if (args.path === 'C:\\Late') return new Promise((r) => { resolve = r; });
+                return JSON.stringify({ directory: path, directories: [], files: [{ name: 'initial.txt' }] });
+            }
+            return undefined;
+        });
+        let fsApi;
+        function Probe() {
+            fsApi = useFileSystem();
+            const { currentPath } = useHistory();
+            const { scope } = useContext(ExplorerTabsContext);
+            return <div>
+                <span data-testid="owner">{scope.tabId}</span>
+                <span data-testid="path">{currentPath}</span>
+                <span data-testid="files">{(fsApi.currentDirData?.files || []).map((f) => f.name).join(',')}</span>
+                <span data-testid="loading">{String(fsApi.isLoading)}</span>
+            </div>;
+        }
+        renderWithProviders(<TabManager><Probe /></TabManager>);
+        await waitFor(() => {
+            expect(screen.getByTestId('owner')).toHaveTextContent('A');
+            expect(screen.getByTestId('files')).toHaveTextContent('initial.txt');
+        });
+        let pending;
+        act(() => { pending = fsApi.loadDirectory('C:\\Late'); });
+        await waitFor(() => expect(resolve).toBeTypeOf('function'));
+        fireEvent.click(screen.getByText('B', { selector: '.tab-title' }));
+        expect(screen.getByTestId('owner')).toHaveTextContent('B');
+        expect(screen.getByTestId('path')).toHaveTextContent(path);
+        await act(async () => {
+            resolve(JSON.stringify({ directories: [], files: [{ name: 'late.txt' }] }));
+            expect(await pending).toBe(false);
+        });
+        expect(screen.getByTestId('files')).toHaveTextContent('initial.txt');
+        expect(screen.getByTestId('loading')).toHaveTextContent('false');
+        expect(screen.getByTestId('path')).toHaveTextContent(path);
     });
 
     test('TP-FE-STATE-04 & TP-IPC-05: restores sessionStorage path without overwrite and preserves watcher in StrictMode', async () => {

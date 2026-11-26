@@ -119,6 +119,34 @@ describe('SftpProvider (BUG-007, BUG-026, TP-FE-STATE-01, TP-FE-STATE-06, TP-IPC
         expect(logSpy).not.toHaveBeenCalled();
     });
 
+    test('R3: a stale SFTP response cannot replace active connection or directory', async () => {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify([
+            { name: 'A', host: 'a.invalid', port: 22, username: 'test' },
+            { name: 'B', host: 'b.invalid', port: 22, username: 'test' },
+        ]));
+        let resolve;
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'load_dir') {
+                if (args.host === 'a.invalid') return new Promise((r) => { resolve = r; });
+                return JSON.stringify({ directories: [], files: [] });
+            }
+            return null;
+        });
+        const { getApi } = renderSftpHarness();
+        let current = true;
+        let pending;
+        act(() => { pending = getApi().loadSftpDirectory('sftp:A:/old', { isCurrent: () => current }); });
+        await waitFor(() => expect(resolve).toBeTypeOf('function'));
+        current = false;
+        await act(async () => { await getApi().loadSftpDirectory('sftp:B:/new'); });
+        await act(async () => {
+            resolve(JSON.stringify({ directories: [], files: [] }));
+            expect(await pending).toBeNull();
+        });
+        expect(getApi().currentSftpConnection.name).toBe('B');
+        expect(getApi().currentSftpPath).toBe('/new');
+    });
+
     test('TP-FE-STATE-06: parseSftpPath handles @ in path, : in connection name, and numeric port in sftp:// URLs', async () => {
         const connections = [
             { name: 'conn', host: 'host.internal', port: 2222, username: 'dev' },

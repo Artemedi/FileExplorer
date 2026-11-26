@@ -445,7 +445,9 @@ export default function SftpProvider({ children }) {
 
         try {
             const sftpPath = remotePath || '.';
+            if (options?.isCurrent?.() === false) return null;
             const result = await invokeSftp('load_dir', connection, { directory: sftpPath });
+            if (options?.isCurrent?.() === false) return null;
             const dirData = JSON.parse(result);
 
             const mapEntries = (items, isDirectory) => {
@@ -499,23 +501,27 @@ export default function SftpProvider({ children }) {
                 files: mapEntries(dirData.files, false)
             };
 
-            // Update active SFTP state only after load_dir succeeds
+            // Update active SFTP state only for the current directory request.
+            if (options?.isCurrent?.() === false) return null;
             setCurrentSftpConnection(connection);
             setCurrentSftpPath(remotePath);
 
             return transformedData;
         } catch (error) {
             const errMsg = getErrorMessage(error);
+            if (options?.isCurrent?.() === false) return null;
             console.error('Failed to load SFTP directory:', errMsg);
             if (isPermissionDeniedError(error) && !options?.silentError) {
                 try {
                     const elevatedData = await listDirWithSudo(connection, remotePath || '.');
+                    if (options?.isCurrent?.() === false) return null;
                     if (elevatedData) {
                         setCurrentSftpConnection(connection);
                         setCurrentSftpPath(remotePath || '.');
                         return elevatedData;
                     }
                 } catch (sudoErr) {
+                    if (options?.isCurrent?.() === false) return null;
                     showError(`sudo open failed for "${remotePath}": ${getErrorMessage(sudoErr)}`);
                     return null;
                 }
@@ -535,6 +541,7 @@ export default function SftpProvider({ children }) {
 
     // Load SFTP directory
     const loadSftpDirectory = useCallback(async (sftpPath, options = {}) => {
+        if (options?.isCurrent?.() === false) return null;
         const parsed = parseSftpPath(sftpPath);
 
         if (!parsed || !parsed.connection) {
@@ -549,6 +556,7 @@ export default function SftpProvider({ children }) {
             return await navigateToSftpConnection(parsed.connection, parsed.remotePath, options);
         } catch (error) {
             const errMsg = getErrorMessage(error);
+            if (options?.isCurrent?.() === false) return null;
             console.error('Error in loadSftpDirectory:', errMsg);
             if (!options?.silentError) {
                 showError(`Failed to load SFTP directory: ${errMsg}`);
