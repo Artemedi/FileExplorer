@@ -184,6 +184,14 @@ describe('TP-FE-STATE-03 / TP-FE-STATE-04 / TP-IPC-05: FileSystemProvider & Hist
         expect(screen.getByTestId('files')).toHaveTextContent('initial.txt');
         expect(screen.getByTestId('loading')).toHaveTextContent('false');
         expect(screen.getByTestId('path')).toHaveTextContent(path);
+        const reopenExplorer = vi.fn();
+        document.addEventListener('force-explorer-view', reopenExplorer);
+        try {
+            fireEvent.click(screen.getByText('B', { selector: '.tab-title' }));
+            expect(reopenExplorer).toHaveBeenCalledTimes(1);
+        } finally {
+            document.removeEventListener('force-explorer-view', reopenExplorer);
+        }
     });
 
     test('TP-FE-STATE-04 & TP-IPC-05: restores sessionStorage path without overwrite and preserves watcher in StrictMode', async () => {

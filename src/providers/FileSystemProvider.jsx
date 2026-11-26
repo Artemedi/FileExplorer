@@ -83,6 +83,7 @@ export default function FileSystemProvider({ children }) {
     }, []);
 
     const getDirectoryRequestId = useCallback(() => loadRequestIdRef.current, []);
+    const getLoadedDirectoryPath = useCallback(() => lastLoadedPathRef.current, []);
     const invalidateDirectoryRequests = useCallback(() => {
         loadRequestIdRef.current += 1;
         setIsLoading(false);
@@ -675,6 +676,7 @@ export default function FileSystemProvider({ children }) {
         error,
         loadDirectory,
         getDirectoryRequestId,
+        getLoadedDirectoryPath,
         invalidateDirectoryRequests,
         openFile,
         createFile,

@@ -39,7 +39,7 @@ const TabManager = ({ children }) => {
         return null;
     });
     const { currentPath } = useHistory();
-    const { loadDirectory, invalidateDirectoryRequests, getDirectoryRequestId, currentDirData, isLoading } = useFileSystem();
+    const { loadDirectory, invalidateDirectoryRequests, getDirectoryRequestId, getLoadedDirectoryPath } = useFileSystem();
     const { isSftpPath, parseSftpPath } = useSftp();
     const { t } = useTranslation();
     const [contextMenu, setContextMenu] = useState(null);
@@ -71,9 +71,13 @@ const TabManager = ({ children }) => {
         if (!tab) return;
         const previousId = settledTabIdRef.current;
         const previousScope = scopeRef.current;
-        if (previousScope.tabId === tab.id && !previousScope.switching) return;
+        const loadedPath = getLoadedDirectoryPath?.();
         const needsLoad = Boolean(tab.path && (tab.path !== currentPathRef.current ||
-            (previousScope.tabId !== null && isLoading && !currentDirData)));
+            (previousScope.tabId !== null && loadedPath !== undefined && loadedPath !== tab.path)));
+        if (previousScope.tabId === tab.id && !previousScope.switching && !needsLoad) {
+            document.dispatchEvent(new CustomEvent(tab.path === null ? 'open-this-pc' : 'force-explorer-view'));
+            return;
+        }
         const attempt = { tabId: tab.id, revision: previousScope.revision + 1, switching: needsLoad };
         if (previousScope.tabId !== null || needsLoad) invalidateDirectoryRequests?.();
         publishScope(attempt);
@@ -100,7 +104,8 @@ const TabManager = ({ children }) => {
         }
         if (scopeRef.current !== attempt) return;
         const superseded = requestId !== undefined && getDirectoryRequestId?.() !== requestId;
-        const previous = tabsRef.current.find((item) => item.id === previousId);
+        const previous = tabsRef.current.find((item) => item.id === previousId &&
+            item.id !== tab.id && item.path === currentPathRef.current);
         // Keep the selected owner if a newer user navigation superseded the load.
         const chosen = !ok && !superseded && previous ? previous.id : tab.id;
         if (!ok && !superseded && !previous) {

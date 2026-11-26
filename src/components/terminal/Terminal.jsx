@@ -217,6 +217,9 @@ const Terminal = ({ isOpen, onToggle }) => {
     const explorerScope = explorerTabs?.scope;
     // Standalone Terminal consumers have a single implicit Explorer owner.
     const explorerTabId = explorerTabs ? explorerScope.tabId : 'legacy';
+    const explorerHome = explorerTabs?.tabs.find((tab) => tab.id === explorerTabId)?.path === null;
+    const explorerHomeRef = useRef(explorerHome);
+    explorerHomeRef.current = explorerHome;
     const explorerScopeRef = useRef(null);
     explorerScopeRef.current = explorerTabs?.getScope || (() => null);
     const directoryRequestIdRef = useRef(getDirectoryRequestId);
@@ -385,7 +388,7 @@ const Terminal = ({ isOpen, onToggle }) => {
         const ownerId = ownerTab?.id;
         if (!ownerTab?.sshConnection || !ownerTab.sshFollowsExplorer ||
             ownerTab.sshExplorerTabId !== (scope ? scope.tabId : 'legacy') ||
-            scope?.switching || ownerId !== activeTabIdRef.current || !targetDir) return;
+            scope?.switching || explorerHomeRef.current || ownerId !== activeTabIdRef.current || !targetDir) return;
         const normalizedTarget = normalizeRemotePosixPath(targetDir);
         const cur = currentPathRef.current;
         if (!isSftpPathRef.current(cur)) return;
@@ -403,7 +406,7 @@ const Terminal = ({ isOpen, onToggle }) => {
         const isCurrent = () => {
             const live = terminalTabsRef.current.find((tab) => tab.id === ownerId);
             return Boolean(terminalNavigationRef.current.get(ownerId) === token &&
-                explorerScopeRef.current() === scope &&
+                explorerScopeRef.current() === scope && !explorerHomeRef.current &&
                 terminalSelectionRevisionRef.current === selectionRevision &&
                 activeTabIdRef.current === ownerId &&
                 live?.sshFollowsExplorer &&
@@ -709,7 +712,6 @@ const Terminal = ({ isOpen, onToggle }) => {
         lastExplorerRevisionRef.current = revision;
         const selected = terminalTabsRef.current.find((tab) => tab.id === activeTabIdRef.current);
         if (!changedExplorer && selected?.sshConnection && !selected.sshFollowsExplorer) return;
-        const explorerHome = explorerTabs?.tabs.find((tab) => tab.id === explorerTabId)?.path === null;
         if (parsedSftp?.connection && !explorerHome) {
             const tabId = explorerSshTabsRef.current.get(getExplorerSshKey(explorerTabId, parsedSftp.connection));
             const existingTab = terminalTabsRef.current.find((t) => t.id === tabId);
@@ -749,7 +751,7 @@ const Terminal = ({ isOpen, onToggle }) => {
         } else if (activeTabIdRef.current.startsWith('ssh:')) {
             selectTerminalTab(terminalTabsRef.current.find((tab) => !tab.sshConnection)?.id || 'local');
         }
-    }, [currentPath, explorerTabId, explorerScope?.revision, explorerScope?.switching, parsedSftp?.connection?.name, parsedSftp?.connection?.host, parsedSftp?.connection?.username, parsedSftp?.connection?.port, parsedSftp?.remotePath, settings?.terminal_sync_explorer_to_terminal]);
+    }, [currentPath, explorerTabId, explorerHome, explorerScope?.revision, explorerScope?.switching, parsedSftp?.connection?.name, parsedSftp?.connection?.host, parsedSftp?.connection?.username, parsedSftp?.connection?.port, parsedSftp?.remotePath, settings?.terminal_sync_explorer_to_terminal]);
 
     const startTabPty = async (tab) => {
         if (!ptyListenersReady || !tab?.sshConnection || tab.ptySessionId ||
@@ -826,9 +828,9 @@ const Terminal = ({ isOpen, onToggle }) => {
             if (!tab.sshConnection || tab.ptySessionId || tab.ptyDisabledManually ||
                 tab.ptyStatus !== 'idle') continue;
             if (!tab.sshFollowsExplorer || (tab.id === activeTab?.id &&
-                tab.sshExplorerTabId === explorerTabId && !explorerScope?.switching)) startTabPty(tab);
+                tab.sshExplorerTabId === explorerTabId && !explorerHome && !explorerScope?.switching)) startTabPty(tab);
         }
-    }, [isOpen, ptyListenersReady, terminalTabs, activeTab?.id, explorerTabId, explorerScope?.switching]);
+    }, [isOpen, ptyListenersReady, terminalTabs, activeTab?.id, explorerTabId, explorerHome, explorerScope?.switching]);
 
     /**
      * Get terminal height from settings with fallback to default value
