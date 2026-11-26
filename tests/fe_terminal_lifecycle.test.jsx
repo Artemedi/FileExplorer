@@ -46,6 +46,7 @@ vi.mock('../src/components/terminal/XtermSshView', () => ({
 }));
 
 import Terminal from '../src/components/terminal/Terminal';
+import { ExplorerTabsContext } from '../src/components/tabs/TabManager';
 
 describe('TERM-R1 PTY lifecycle', () => {
     let listeners;
@@ -201,7 +202,7 @@ describe('TERM-R1 PTY lifecycle', () => {
         const { rerender } = render(<Terminal isOpen={true} onToggle={vi.fn()} />);
         await screen.findByTestId('pty-1');
         emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/confirmed\x07' });
-        await waitFor(() => expect(mockNavigation.load).toHaveBeenCalledWith('sftp:Test:/confirmed'));
+        await waitFor(() => expect(mockNavigation.load).toHaveBeenCalledWith('sftp:Test:/confirmed', expect.objectContaining({ isCurrent: expect.any(Function) })));
         fireEvent.click(screen.getByRole('button', { name: 'Duplicate SSH' }));
         await screen.findByTestId('pty-2');
         expect(mockStart.mock.calls[1][1]).toBe('/confirmed');
@@ -281,5 +282,69 @@ describe('TERM-R1 PTY lifecycle', () => {
         rerender(<Terminal isOpen={true} onToggle={vi.fn()} />);
         expect(original).toBeVisible();
         expect(mockStart).toHaveBeenCalledTimes(2);
+    });
+
+    test('R3: same path in two Explorer tabs selects independent linked PTYs; closing one unlinks it', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2');
+        let scope = { tabId: 'A', revision: 1, switching: false };
+        let tabs = [{ id: 'A', path: mockNavigation.path }, { id: 'B', path: mockNavigation.path }];
+        const tree = () => (
+            <ExplorerTabsContext.Provider value={{ scope, getScope: () => scope, tabs }}>
+                <Terminal isOpen={true} onToggle={vi.fn()} />
+            </ExplorerTabsContext.Provider>
+        );
+        const { rerender } = render(tree());
+        const first = await screen.findByTestId('pty-1');
+        scope = { tabId: 'B', revision: 2, switching: false };
+        rerender(tree());
+        const second = await screen.findByTestId('pty-2');
+        expect(second).toBeVisible();
+        expect(first).not.toBeVisible();
+        expect(mockStart.mock.calls.map((args) => args[1])).toEqual(['/test', '/test']);
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/background\x07' });
+        expect(mockNavigation.load).not.toHaveBeenCalled();
+        tabs = tabs.filter((tab) => tab.id !== 'A');
+        rerender(tree());
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_close_pty', { sessionId: 'pty-1' });
+        expect(screen.getByTestId('pty-1')).toBe(first);
+        expect(screen.getByTestId('pty-2')).toBe(second);
+        fireEvent.click(screen.getByText('SSH: Test #1'));
+        expect(first).toBeVisible();
+        expect(screen.getByRole('button', { name: 'Refresh CWD' })).toBeVisible();
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/unlinked\x07' });
+        expect(mockNavigation.load).not.toHaveBeenCalled();
+    });
+
+    test('R3: A to B to A rejects late navigation even when the path and owner match again', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2');
+        let scope = { tabId: 'A', revision: 1, switching: false };
+        const tabs = [{ id: 'A', path: mockNavigation.path }, { id: 'B', path: mockNavigation.path }];
+        let resolve;
+        mockNavigation.load.mockImplementationOnce(() => new Promise((r) => { resolve = r; }));
+        const tree = () => (
+            <ExplorerTabsContext.Provider value={{ scope, getScope: () => scope, tabs }}>
+                <Terminal isOpen={true} onToggle={vi.fn()} />
+            </ExplorerTabsContext.Provider>
+        );
+        const { rerender } = render(tree());
+        const first = await screen.findByTestId('pty-1');
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/old/child\x07' });
+        await waitFor(() => expect(mockNavigation.load).toHaveBeenCalledTimes(1));
+        const guard = mockNavigation.load.mock.calls[0][1].isCurrent;
+        expect(guard()).toBe(true);
+        scope = { tabId: 'B', revision: 2, switching: true };
+        rerender(tree());
+        expect(guard()).toBe(false);
+        expect(mockStart).toHaveBeenCalledTimes(1);
+        scope = { ...scope, switching: false };
+        rerender(tree());
+        await screen.findByTestId('pty-2');
+        scope = { tabId: 'A', revision: 3, switching: false };
+        rerender(tree());
+        expect(first).toBeVisible();
+        expect(guard()).toBe(false);
+        await act(async () => resolve(false));
+        expect(mockNavigation.load).toHaveBeenCalledTimes(1);
+        expect(mockNavigation.navigate).not.toHaveBeenCalled();
     });
 });
