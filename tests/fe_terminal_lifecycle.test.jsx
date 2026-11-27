@@ -315,6 +315,37 @@ describe('TERM-R1 PTY lifecycle', () => {
         expect(mockNavigation.load).not.toHaveBeenCalled();
     });
 
+    test('R3.1: late non-PTY cd cannot navigate after A to B to A', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2');
+        let scope = { tabId: 'A', revision: 1, switching: false };
+        const tabs = [{ id: 'A', path: mockNavigation.path }, { id: 'B', path: mockNavigation.path }];
+        let resolve;
+        mockNavigation.execute.mockImplementation((conn, command) => {
+            if (command.includes('cd ')) return new Promise((r) => { resolve = r; });
+            return Promise.resolve({ exit_code: 0, stdout: '/test' });
+        });
+        const tree = () => (
+            <ExplorerTabsContext.Provider value={{ scope, getScope: () => scope, tabs }}>
+                <Terminal isOpen={true} onToggle={vi.fn()} />
+            </ExplorerTabsContext.Provider>
+        );
+        const { rerender } = render(tree());
+        await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name: 'Stop PTY' }));
+        const input = screen.getByRole('textbox');
+        fireEvent.change(input, { target: { value: 'cd /late' } });
+        fireEvent.submit(input.closest('form'));
+        await waitFor(() => expect(resolve).toBeTypeOf('function'));
+        scope = { tabId: 'B', revision: 2, switching: false };
+        rerender(tree());
+        await screen.findByTestId('pty-2');
+        scope = { tabId: 'A', revision: 3, switching: false };
+        rerender(tree());
+        await act(async () => resolve({ exit_code: 0, stdout: '/late' }));
+        expect(mockNavigation.load).not.toHaveBeenCalled();
+        expect(screen.getByText('[SSH] Directory: /late')).toBeInTheDocument();
+    });
+
     test('R3: A to B to A rejects late navigation even when the path and owner match again', async () => {
         mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2');
         let scope = { tabId: 'A', revision: 1, switching: false };

@@ -67,7 +67,7 @@ const TabManager = ({ children }) => {
 
     // Invalidate even when two tabs point to the same directory: the old
     // request belongs to a different Explorer owner, not to that path.
-    const activateTab = async (tab) => {
+    const activateTab = async (tab, restoring = false) => {
         if (!tab) return;
         const previousId = settledTabIdRef.current;
         const previousScope = scopeRef.current;
@@ -87,7 +87,7 @@ const TabManager = ({ children }) => {
             document.dispatchEvent(new CustomEvent('open-this-pc'));
             return;
         }
-        document.dispatchEvent(new CustomEvent('force-explorer-view'));
+        if (!restoring) document.dispatchEvent(new CustomEvent('force-explorer-view'));
         if (!needsLoad) {
             settledTabIdRef.current = tab.id;
             return;
@@ -160,7 +160,7 @@ const TabManager = ({ children }) => {
     // Restore active tab on mount
     useEffect(() => {
         if (tabs.length > 0) {
-            activateTab(tabs.find(t => t.id === activeTabId) || tabs[0]);
+            activateTab(tabs.find(t => t.id === activeTabId) || tabs[0], true);
         }
     }, []);
 
@@ -176,7 +176,7 @@ const TabManager = ({ children }) => {
                 isActive: true
             };
             replaceTabs([initialTab]);
-            activateTab(initialTab);
+            activateTab(initialTab, true);
         }
     }, [currentPath, tabs.length]);
 

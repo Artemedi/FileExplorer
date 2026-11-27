@@ -949,11 +949,18 @@ const Terminal = ({ isOpen, onToggle }) => {
                     const targetDir = trimmedCmd === 'cd' ? '~' : trimmedCmd.slice(3).trim();
                     const quoted = `'${targetDir.replace(/'/g, `'\\''`)}'`;
                     const cdCmd = targetDir === '~' ? 'cd ~ && pwd' : `cd ${quoted} && pwd`;
+                    const commandScope = explorerScopeRef.current();
+                    const commandSelection = terminalSelectionRevisionRef.current;
+                    const commandRequest = directoryRequestIdRef.current?.();
                     const res = await executeSshCommand(activeSshConnection, cdCmd, sshWorkingDir);
                     if (res.exit_code === 0 && res.stdout?.trim()) {
                         const newRemoteDir = res.stdout.trim().split('\n').pop().trim();
                         updateTab(activeTab.id, { sshWorkingDir: newRemoteDir, sshConfirmedDir: newRemoteDir });
-                        await syncExplorerToRemoteDir(activeTab, newRemoteDir);
+                        if (explorerScopeRef.current() === commandScope &&
+                            terminalSelectionRevisionRef.current === commandSelection &&
+                            directoryRequestIdRef.current?.() === commandRequest) {
+                            await syncExplorerToRemoteDir(activeTab, newRemoteDir);
+                        }
                         return { type: 'system', content: `[SSH] Directory: ${newRemoteDir}` };
                     }
                     return { type: 'error', content: res.stderr?.trim() || 'cd failed' };

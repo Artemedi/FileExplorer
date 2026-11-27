@@ -102,7 +102,9 @@ describe('Wave 4 UI & Tools Regression Tests (TP-FE-UI-09..12)', () => {
             );
 
             fireEvent.click(screen.getByText('TabB'));
-            expect(mockLoadDirectory).toHaveBeenCalledWith('D:\\TabB');
+            expect(mockLoadDirectory).toHaveBeenCalledWith('D:\\TabB', expect.objectContaining({ isCurrent: expect.any(Function) }));
+            const guard = mockLoadDirectory.mock.calls[0][1].isCurrent;
+            expect(guard()).toBe(true);
 
             // Before loadDirectory resolves, saved tabs must still retain D:\TabB
             const storedBefore = JSON.parse(localStorage.getItem('explr_saved_tabs'));
@@ -112,6 +114,8 @@ describe('Wave 4 UI & Tools Regression Tests (TP-FE-UI-09..12)', () => {
             await act(async () => {
                 resolveLoad(false);
             });
+            expect(guard()).toBe(false);
+            expect(localStorage.getItem('explr_active_tab_id')).toBe('tab-1');
             const storedAfter = JSON.parse(localStorage.getItem('explr_saved_tabs'));
             expect(storedAfter.find(t => t.id === 'tab-2').path).toBe('D:\\TabB');
         });
@@ -135,6 +139,7 @@ describe('Wave 4 UI & Tools Regression Tests (TP-FE-UI-09..12)', () => {
                 </TabManager>
             );
 
+            expect(forceExplorerListener).not.toHaveBeenCalled();
             fireEvent.click(screen.getByText('Home'));
             expect(openThisPcListener).toHaveBeenCalledTimes(1);
             expect(mockLoadDirectory).not.toHaveBeenCalledWith(null);
