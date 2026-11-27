@@ -41,7 +41,7 @@ vi.mock('../src/components/terminal/XtermSshView', () => ({
             registerController(sessionId, { write: (data) => mockWrite(data, sessionId), getBufferText: () => '' });
             return () => registerController(sessionId, null);
         }, [sessionId]);
-        return <div data-testid={sessionId} style={{ display: isVisible ? undefined : "none" }}><button onClick={() => onData("test input")}>Send input</button></div>;
+        return <div data-testid={sessionId} style={{ display: isVisible ? undefined : "none" }}><button onClick={() => onData("test input")}>Send input</button><button onClick={() => onData("界".repeat(350000))}>Send oversized input</button></div>;
     },
 }));
 
@@ -151,6 +151,72 @@ describe('TERM-R1 PTY lifecycle', () => {
         fireEvent.click(send);
         await waitFor(() => expect(mockInvoke.mock.calls.filter(([cmd, args]) =>
             cmd === 'ssh_write_pty' && args.data === 'test input')).toHaveLength(2));
+    });
+
+    test('R3.4: pending user input is serialized and discarded on IPC failure', async () => {
+        let rejectFirst;
+        mockInvoke.mockImplementation(async (command, args) => {
+            if (command === 'ssh_write_pty' && args.data === 'test input') {
+                return new Promise((_, reject) => { rejectFirst = reject; });
+            }
+            return null;
+        });
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const send = await screen.findByRole('button', { name: 'Send input' });
+        const writes = () => mockInvoke.mock.calls.filter(([cmd, args]) =>
+            cmd === 'ssh_write_pty' && args.data === 'test input');
+        fireEvent.click(send);
+        fireEvent.click(send);
+        fireEvent.click(send);
+        expect(writes()).toHaveLength(1);
+        await act(async () => rejectFirst(new Error('queue full')));
+        expect(await screen.findByRole('alert')).toHaveTextContent('queue full');
+        fireEvent.click(send);
+        mockInvoke.mockResolvedValue(null);
+        fireEvent.click(screen.getByRole('button', { name: 'Resume input' }));
+        expect(writes()).toHaveLength(1);
+        fireEvent.click(send);
+        await waitFor(() => expect(writes()).toHaveLength(2));
+    });
+
+    test('R3.4: item limit includes in-flight write and Resume never replays dropped items', async () => {
+        let finishFirst;
+        let writes = 0;
+        mockInvoke.mockImplementation(async (command, args) => {
+            if (command === 'ssh_write_pty' && args.data === 'test input') {
+                if (++writes === 1) return new Promise(resolve => { finishFirst = resolve; });
+            }
+            return null;
+        });
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const send = await screen.findByRole('button', { name: 'Send input' });
+        act(() => {
+            for (let i = 0; i < 1024; i++) fireEvent.click(send);
+        });
+        expect(writes).toBe(1);
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        fireEvent.click(send);
+        expect(await screen.findByRole('alert')).toHaveTextContent('queue is full');
+        fireEvent.click(send);
+        fireEvent.click(screen.getByRole('button', { name: 'Resume input' }));
+        fireEvent.click(send);
+        expect(writes).toBe(1);
+        await act(async () => finishFirst(null));
+        await waitFor(() => expect(writes).toBe(2));
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    test('R3.4: UTF-8 byte limit rejects an oversized paste before IPC', async () => {
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        fireEvent.click(await screen.findByRole('button', { name: 'Send oversized input' }));
+        expect(await screen.findByRole('alert')).toHaveTextContent('queue');
+        expect(mockInvoke.mock.calls.some(([cmd, args]) => cmd === 'ssh_write_pty' &&
+            args.data.length === 350000)).toBe(false);
+        fireEvent.click(screen.getByRole('button', { name: 'Resume input' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Send input' }));
+        await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('ssh_write_pty', {
+            sessionId: 'pty-1', data: 'test input',
+        }));
     });
 
     test('failed startup is not retried automatically and can be retried explicitly', async () => {

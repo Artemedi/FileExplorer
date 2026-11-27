@@ -21,6 +21,9 @@ import {
 } from '../../utils/terminalOsc';
 import './terminal.css';
 
+const MAX_PTY_INPUT_BYTES = 1024 * 1024;
+const MAX_PTY_INPUT_ITEMS = 1024;
+
 const isLocalDirectory = (path) => typeof path === 'string' && path.length > 0 && !path.startsWith('sftp:');
 
 const parseCommandArgs = (input) => {
@@ -240,6 +243,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     const earlyPtyExitRef = useRef(new Map());
     const pendingPtyOutputRef = useRef(new Map());
     const failedPtyWritesRef = useRef(new Set());
+    const ptyInputQueuesRef = useRef(new Map());
     const [ptyListenersReady, setPtyListenersReady] = useState(false);
     const terminalNavigationRef = useRef(new Map());
     const explorerCdRef = useRef(new Map());
@@ -327,6 +331,13 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
         pendingPtyOutputRef.current.delete(sessionId);
         explorerCdRef.current.delete(sessionId);
         failedPtyWritesRef.current.delete(sessionId);
+        const queue = ptyInputQueuesRef.current.get(sessionId);
+        if (queue) {
+            queue.active?.resolve(false);
+            for (const item of queue.pending) item.resolve(false);
+            queue.pending.length = 0;
+            ptyInputQueuesRef.current.delete(sessionId);
+        }
         oscBufferRef.current.delete(sessionId);
         shellIdleRef.current.delete(sessionId);
         shellHookSeenRef.current.delete(sessionId);
@@ -339,21 +350,73 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
         }
     };
 
-    const writePty = async (sessionId, data) => {
-        const tabId = ptyOwnersRef.current.get(sessionId);
-        if (!tabId || failedPtyWritesRef.current.has(sessionId)) return false;
-        try {
-            await invoke('ssh_write_pty', { sessionId, data });
-            return true;
-        } catch (error) {
-            if (ptyOwnersRef.current.get(sessionId) !== tabId) return false;
-            failedPtyWritesRef.current.add(sessionId);
-            updateTab(tabId, (tab) => tab.ptySessionId !== sessionId ? tab : ({
-                ...tab,
-                ptyWriteError: String(error),
-            }));
-            return false;
+    const pausePtyInput = (sessionId, queue, error) => {
+        if (ptyInputQueuesRef.current.get(sessionId) !== queue) return;
+        failedPtyWritesRef.current.add(sessionId);
+        // Drop queued input rather than replaying it after Resume. An IPC
+        // already submitted cannot be recalled.
+        for (const item of queue.pending) {
+            queue.bytes -= item.bytes;
+            item.resolve(false);
         }
+        queue.pending.length = 0;
+        ptyInputLineRef.current.delete(sessionId);
+        shellIdleRef.current.set(sessionId, false);
+        pendingElevationReinjectRef.current.delete(sessionId);
+        const timer = elevationTimerRef.current.get(sessionId);
+        if (timer) clearTimeout(timer);
+        elevationTimerRef.current.delete(sessionId);
+        updateTab(queue.tabId, (tab) => tab.ptySessionId !== sessionId ? tab : ({
+            ...tab,
+            ptyWriteError: String(error),
+        }));
+    };
+
+    const drainPtyInput = async (sessionId, queue) => {
+        const isCurrent = () => ptyInputQueuesRef.current.get(sessionId) === queue &&
+            ptyOwnersRef.current.get(sessionId) === queue.tabId;
+        if (queue.active) return;
+        while (isCurrent() && !failedPtyWritesRef.current.has(sessionId) && queue.pending.length) {
+            const item = queue.pending.shift();
+            queue.active = item;
+            try {
+                await invoke('ssh_write_pty', { sessionId, data: item.data });
+                item.resolve(isCurrent());
+            } catch (error) {
+                pausePtyInput(sessionId, queue, error);
+                item.resolve(false);
+            } finally {
+                queue.bytes -= item.bytes;
+                queue.active = null;
+            }
+        }
+        if (isCurrent() && !queue.pending.length && !queue.active &&
+            !failedPtyWritesRef.current.has(sessionId)) ptyInputQueuesRef.current.delete(sessionId);
+    };
+
+    // All sources of PTY input share one bounded, per-session FIFO.
+    const writePty = (sessionId, data, userInput = false) => {
+        const tabId = ptyOwnersRef.current.get(sessionId);
+        if (!tabId || failedPtyWritesRef.current.has(sessionId)) return Promise.resolve(false);
+        if (!data) return Promise.resolve(true);
+        let queue = ptyInputQueuesRef.current.get(sessionId);
+        if (!queue) {
+            queue = { tabId, pending: [], active: null, bytes: 0 };
+            ptyInputQueuesRef.current.set(sessionId, queue);
+        }
+        const bytes = data.length > MAX_PTY_INPUT_BYTES
+            ? MAX_PTY_INPUT_BYTES + 1 : new TextEncoder().encode(data).byteLength;
+        if (bytes > MAX_PTY_INPUT_BYTES - queue.bytes ||
+            queue.pending.length + Number(Boolean(queue.active)) >= MAX_PTY_INPUT_ITEMS) {
+            pausePtyInput(sessionId, queue, 'SSH frontend input queue is full');
+            return Promise.resolve(false);
+        }
+        if (userInput) trackPtyUserInput(sessionId, data);
+        return new Promise(resolve => {
+            queue.pending.push({ data, bytes, resolve });
+            queue.bytes += bytes;
+            drainPtyInput(sessionId, queue);
+        });
     };
 
     const injectShellIntegration = (sessionId) => {
@@ -765,7 +828,8 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                 rawTarget && rawTarget !== '.' &&
                 shellHookSeenRef.current.get(sid) === true &&
                 shellIdleRef.current.get(sid) === true &&
-                !ptyInputLineRef.current.get(sid) && !explorerCdRef.current.has(sid)
+                !ptyInputLineRef.current.get(sid) && !explorerCdRef.current.has(sid) &&
+                !ptyInputQueuesRef.current.get(sid)?.active && !ptyInputQueuesRef.current.get(sid)?.pending.length
             ) {
                 const normalizedTarget = normalizeRemotePosixPath(rawTarget);
                 const currentPtyDir = existingTab.sshWorkingDir && existingTab.sshWorkingDir !== '.'
@@ -2200,7 +2264,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
             </div>
             {ptySessionId && activeTab.ptyWriteError && (
                 <div role="alert" className="terminal-input-error">
-                    <span>SSH input paused: {activeTab.ptyWriteError}. Check the remote shell before resuming; rejected input is not replayed.</span>
+                    <span>SSH input paused: {activeTab.ptyWriteError}. Check the remote shell before resuming; unsent input was discarded. Input already submitted may still execute.</span>
                     <button type="button" className="terminal-control" onClick={() => {
                         failedPtyWritesRef.current.delete(ptySessionId);
                         updateTab(activeTab.id, { ptyWriteError: null });
@@ -2216,9 +2280,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                         isVisible={isOpen && tab.id === activeTab?.id}
                         isFullscreen={isFullscreen}
                         onData={(data) => {
-                            if (failedPtyWritesRef.current.has(tab.ptySessionId)) return;
-                            trackPtyUserInput(tab.ptySessionId, data);
-                            return writePty(tab.ptySessionId, data);
+                            return writePty(tab.ptySessionId, data, true);
                         }}
                         onResize={(cols, rows) => {
                             invoke('ssh_resize_pty', { sessionId: tab.ptySessionId, cols, rows }).catch(() => {});

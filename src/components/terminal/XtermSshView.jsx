@@ -22,7 +22,6 @@ const XtermSshView = ({
     const fitAddonRef = useRef(null);
     const onDataRef = useRef(onData);
     const onResizeRef = useRef(onResize);
-    const writeQueueRef = useRef(Promise.resolve());
     onDataRef.current = onData;
     onResizeRef.current = onResize;
 
@@ -97,11 +96,9 @@ const XtermSshView = ({
                 setTimeout(safeFit, 80);
             });
 
-            // Serialize PTY writes to preserve strict keystroke ordering across async IPC
+            // The terminal owner bounds and serializes all PTY input.
             dataDisposable = term.onData((data) => {
-                writeQueueRef.current = writeQueueRef.current
-                    .then(() => onDataRef.current?.(data))
-                    .catch(() => {});
+                onDataRef.current?.(data);
             });
 
             term.attachCustomKeyEventHandler((ev) => {
