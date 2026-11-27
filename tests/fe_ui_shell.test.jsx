@@ -128,6 +128,30 @@ describe('w4-ui-shell: BUG-024, BUG-034, BUG-065, BUG-085', () => {
         cleanup();
     });
 
+    test('R3.4 integration: preview accepts keyboard navigation immediately after opening commit', async () => {
+        const first = { name: 'first.txt', path: 'C:\\Test\\first.txt' };
+        const second = { name: 'second.txt', path: 'C:\\Test\\second.txt' };
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'build_preview') return { kind: 'Text', name: args.path.split('\\').pop(), path: args.path, text: 'fixture' };
+            return null;
+        });
+        function Harness() {
+            const sent = React.useRef(false);
+            const preview = usePreview(() => first, null, () => second, null, null, true);
+            React.useLayoutEffect(() => {
+                if (preview.payload?.name === first.name && !sent.current) {
+                    sent.current = true;
+                    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', cancelable: true }));
+                }
+            }, [preview.payload]);
+            return <div data-testid="preview-name">{preview.payload?.name || ''}</div>;
+        }
+        render(<Harness />);
+        fireEvent.keyDown(window, { key: ' ' });
+        await waitFor(() => expect(screen.getByTestId('preview-name')).toHaveTextContent('second.txt'));
+        expect(mockInvoke).toHaveBeenCalledWith('build_preview', { path: second.path });
+    });
+
     test('TP-FE-STATE-08: usePreview arrow navigation has no 1-step lag and Esc cancels pending IPC', async () => {
         const items = [
             { name: 'f1.txt', path: 'C:\\Test\\f1.txt' },

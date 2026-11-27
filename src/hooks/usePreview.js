@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useLayoutEffect, useState, useCallback, useRef } from 'react';
 import { useSftp } from '../providers/SftpProvider';
 import { formatErrorMessage } from '../utils/formatters';
 
@@ -107,8 +107,8 @@ export function usePreview(
     }
   }, [open, closePreview, openPreview, getFocusedItem]);
 
-  // Keyboard event handler
-  useEffect(() => {
+  // Keyboard handling must observe the committed preview state before input.
+  useLayoutEffect(() => {
     const onKey = (e) => {
       // Don't trigger if we're typing in an input or activating a button/link
       const target = e.target;
