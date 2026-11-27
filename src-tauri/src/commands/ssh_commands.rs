@@ -154,7 +154,7 @@ pub async fn ssh_execute_command(
     tokio::task::spawn_blocking(move || {
         let options = resolve_ssh_profile(&host, port, &username, overrides);
         let session =
-            connect_authenticated_ssh_session(&host, port, &username, password, &options)?;
+            connect_authenticated_ssh_session(&host, port, &username, password, &options, false)?;
         let mut channel = session.channel_session().map_err(|e| e.to_string())?;
 
         let full_cmd = match working_dir
@@ -215,7 +215,7 @@ pub async fn ssh_sudo_exec(
     tokio::task::spawn_blocking(move || {
         let options = resolve_ssh_profile(&host, port, &username, overrides);
         let session =
-            connect_authenticated_ssh_session(&host, port, &username, password, &options)?;
+            connect_authenticated_ssh_session(&host, port, &username, password, &options, false)?;
         let mut channel = session.channel_session().map_err(|e| e.to_string())?;
 
         // Pass sudo password strictly on stdin; never embed it in CLI arguments.
@@ -283,7 +283,7 @@ pub async fn ssh_probe_zstd(
     tokio::task::spawn_blocking(move || {
         let options = resolve_ssh_profile(&host, port, &username, overrides);
         let session =
-            connect_authenticated_ssh_session(&host, port, &username, password, &options)?;
+            connect_authenticated_ssh_session(&host, port, &username, password, &options, false)?;
         let mut channel = session.channel_session().map_err(|e| e.to_string())?;
         channel
             .exec("command -v zstd >/dev/null 2>&1")
@@ -331,14 +331,15 @@ pub async fn ssh_start_pty(
     let sid_clone = session_id.clone();
 
     thread::spawn(move || {
-        let session =
-            match connect_authenticated_ssh_session(&host, port, &username, password, &options) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
-            };
+        let session = match connect_authenticated_ssh_session(
+            &host, port, &username, password, &options, true,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
 
         let mut channel = match session.channel_session() {
             Ok(c) => c,
@@ -449,7 +450,7 @@ pub async fn ssh_start_pty(
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
-                    exit_reason = e.to_string();
+                    exit_reason = format!("SSH PTY read failed: {e}");
                     break;
                 }
             }
