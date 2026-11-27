@@ -82,6 +82,13 @@ export default function FileSystemProvider({ children }) {
         }
     }, []);
 
+    const getDirectoryRequestId = useCallback(() => loadRequestIdRef.current, []);
+    const getLoadedDirectoryPath = useCallback(() => lastLoadedPathRef.current, []);
+    const invalidateDirectoryRequests = useCallback(() => {
+        loadRequestIdRef.current += 1;
+        setIsLoading(false);
+    }, []);
+
     // Load directory contents - enhanced with SFTP support and stale-request protection
     const loadDirectory = useCallback(async (path, options = {}) => {
         const silent = Boolean(options?.silent);
@@ -91,7 +98,9 @@ export default function FileSystemProvider({ children }) {
             return false;
         }
 
+        if (options?.isCurrent?.() === false) return false;
         const requestId = ++loadRequestIdRef.current;
+        const isCurrent = () => requestId === loadRequestIdRef.current && options?.isCurrent?.() !== false;
         let timeoutId = null;
 
         console.log(`Attempting to load directory: ${path}`);
@@ -104,14 +113,15 @@ export default function FileSystemProvider({ children }) {
             // Check if it's an SFTP path
             if (isSftpPath(path)) {
                 console.log(`Loading SFTP directory: ${path}`);
-                const sftpData = await loadSftpDirectory(path, options);
-                if (requestId !== loadRequestIdRef.current) {
+                const sftpData = await loadSftpDirectory(path, { ...options, isCurrent });
+                if (!isCurrent()) {
                     return false;
                 }
                 if (sftpData) {
                     setRawDirData(sftpData);
                     lastLoadedPathRef.current = path;
                     navigateTo(path);
+                    options.onCommit?.(sftpData);
                     if (watchedPathRef.current) {
                         watchedPathRef.current = null;
                         invoke('unwatch_directory').catch(() => {});
@@ -134,7 +144,7 @@ export default function FileSystemProvider({ children }) {
             const loadPromise = invoke('open_directory', { path });
             const dirContent = await Promise.race([loadPromise, timeoutPromise]);
 
-            if (requestId !== loadRequestIdRef.current) {
+            if (!isCurrent()) {
                 return false;
             }
 
@@ -149,13 +159,14 @@ export default function FileSystemProvider({ children }) {
                 throw new Error(`Failed to parse directory data: ${parseError.message}`);
             }
 
-            if (requestId !== loadRequestIdRef.current) {
+            if (!isCurrent()) {
                 return false;
             }
 
             setRawDirData(dirData);
             lastLoadedPathRef.current = path;
             navigateTo(path);
+            options.onCommit?.(dirData);
             watchedPathRef.current = path;
             invoke('watch_directory', { path }).catch((err) => {
                 console.warn(`Failed to watch directory: ${path}`, err);
@@ -163,7 +174,7 @@ export default function FileSystemProvider({ children }) {
             console.log(`Successfully loaded directory: ${path}`);
             return true;
         } catch (err) {
-            if (requestId !== loadRequestIdRef.current) {
+            if (!isCurrent()) {
                 return false;
             }
 
@@ -647,8 +658,11 @@ export default function FileSystemProvider({ children }) {
     useEffect(() => {
         if (currentPath && lastLoadedPathRef.current !== currentPath) {
             const targetPath = currentPath;
-            loadDirectory(targetPath).then((ok) => {
-                if (!ok && lastLoadedPathRef.current && currentPathRef.current === targetPath) {
+            const pending = loadDirectory(targetPath);
+            const requestId = loadRequestIdRef.current;
+            pending.then((ok) => {
+                if (!ok && requestId === loadRequestIdRef.current &&
+                    lastLoadedPathRef.current && currentPathRef.current === targetPath) {
                     revertToPath(lastLoadedPathRef.current);
                 }
             });
@@ -663,6 +677,9 @@ export default function FileSystemProvider({ children }) {
         volumes,
         error,
         loadDirectory,
+        getDirectoryRequestId,
+        getLoadedDirectoryPath,
+        invalidateDirectoryRequests,
         openFile,
         createFile,
         createDirectory,

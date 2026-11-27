@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, useContext } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileSystem } from '../../providers/FileSystemProvider';
 import { useHistory } from '../../providers/HistoryProvider';
@@ -9,6 +9,7 @@ import { getDirectoryPath, isRootPath, joinPath, normalizePath } from '../../uti
 import { showSuccess, showError, showConfirm, showInfo } from '../../utils/NotificationSystem';
 import { requestConflictResolution } from '../../utils/conflictResolver';
 import FileList from './FileList';
+import { ExplorerTabsContext } from '../tabs/TabManager';
 import './dualPane.css';
 
 const isSameNormalizedPath = (pathA, pathB, isSftp) => {
@@ -87,8 +88,18 @@ const computeDirectoryDiff = (leftData, rightData, caseInsensitive = true) => {
  * DualPane component for side-by-side directory browsing and fast file transfers.
  */
 const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, onClose }) => {
-    const { volumes, openFile } = useFileSystem();
-    const { currentPath, navigateTo } = useHistory();
+    const { volumes, openFile, loadDirectory, currentDirData, getLoadedDirectoryPath, getDirectoryRequestId } = useFileSystem();
+    const { currentPath } = useHistory();
+    const explorerTabs = useContext(ExplorerTabsContext);
+    const scope = explorerTabs?.scope;
+    const getScopeRef = useRef(explorerTabs?.getScope);
+    getScopeRef.current = explorerTabs?.getScope;
+    const ready = !explorerTabs || Boolean(scope?.tabId && !scope.switching &&
+        explorerTabs.tabs.find((tab) => tab.id === scope.tabId)?.path !== null);
+    const paneRequestsRef = useRef({ left: 0, right: 0 });
+    const activeNavigationRef = useRef(null);
+    const committedPaneRef = useRef('left');
+    const paneHasDataRef = useRef({ left: false, right: false });
     const { settings } = useSettings();
     const { isSftpPath, loadSftpDirectory } = useSftp();
     const { t } = useTranslation();
@@ -124,17 +135,8 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
     const leftPathRef = useRef(leftPath);
     const rightPathRef = useRef(rightPath);
 
-    useEffect(() => {
-        activePaneRef.current = activePane;
-    }, [activePane]);
-
-    useEffect(() => {
-        leftPathRef.current = leftPath;
-    }, [leftPath]);
-
-    useEffect(() => {
-        rightPathRef.current = rightPath;
-    }, [rightPath]);
+    // These refs are written synchronously alongside their state setters.
+    // A passive effect replaying an older render must not overwrite intent.
 
     // Filter hidden files helper
     const filterData = useCallback((data) => {
@@ -146,75 +148,154 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
         };
     }, [settings.show_hidden_files_and_folders]);
 
-    // Load directory for a specific pane
-    const loadPaneDirectory = useCallback(async (pane, path, shouldNavigate) => {
-        if (!path) return;
-        if (pane === 'left') setLeftLoading(true);
-        else setRightLoading(true);
-
-        try {
-            let parsed;
-            if (isSftpPath(path)) {
-                parsed = await loadSftpDirectory(path);
-                if (!parsed) return;
-            } else {
-                const raw = await invoke('open_directory', { path });
-                parsed = JSON.parse(raw);
-            }
-            const filtered = filterData(parsed);
-            const doNavigate = shouldNavigate !== undefined ? shouldNavigate : (activePaneRef.current === pane);
-
-            if (pane === 'left') {
-                leftPathRef.current = path;
-                setLeftDirData(filtered);
-                setLeftPath(path);
-                setLeftSelected([]);
-                localStorage.setItem('explr_dual_pane_left', path);
-                if (doNavigate) navigateTo(path);
-            } else {
-                rightPathRef.current = path;
-                setRightDirData(filtered);
-                setRightPath(path);
-                setRightSelected([]);
-                localStorage.setItem('explr_dual_pane_right', path);
-                if (doNavigate) navigateTo(path);
-            }
-        } catch (err) {
-            console.error(`Failed to load directory ${path} in ${pane} pane:`, err);
-            showError(`Failed to load ${path}: ${err}`);
-        } finally {
-            if (pane === 'left') setLeftLoading(false);
-            else setRightLoading(false);
+    const commitPaneData = useCallback((pane, path, data) => {
+        paneHasDataRef.current[pane] = true;
+        if (pane === 'left') {
+            if (leftPathRef.current !== path) setLeftSelected([]);
+            leftPathRef.current = path;
+            setLeftDirData(data);
+            setLeftPath(path);
+            localStorage.setItem('explr_dual_pane_left', path);
+        } else {
+            if (rightPathRef.current !== path) setRightSelected([]);
+            rightPathRef.current = path;
+            setRightDirData(data);
+            setRightPath(path);
+            localStorage.setItem('explr_dual_pane_right', path);
         }
-    }, [filterData, navigateTo, isSftpPath, loadSftpDirectory]);
-
-    // Initial load for both panes
-    useEffect(() => {
-        loadPaneDirectory('left', leftPath, true);
-        loadPaneDirectory('right', rightPath, false);
     }, []);
 
-    // Sync external navigation (e.g. breadcrumbs or sidebar clicks) with active pane
-    const prevCurrentPathRef = useRef(currentPath);
-    useEffect(() => {
-        if (!currentPath || currentPath === prevCurrentPathRef.current) return;
-        prevCurrentPathRef.current = currentPath;
-        const pane = activePaneRef.current;
-        const currentPanePath = pane === 'left' ? leftPathRef.current : rightPathRef.current;
-        if (currentPath !== currentPanePath) {
-            loadPaneDirectory(pane, currentPath, false);
+    // Only the active pane may commit global navigation. Inactive listings
+    // are independent reads and never overwrite the shared SFTP connection.
+    const loadPaneDirectory = useCallback(async (pane, path, shouldNavigate, swapCommit) => {
+        const owner = getScopeRef.current?.();
+        if (!path || (getScopeRef.current && (!owner?.tabId || owner.switching))) return;
+        const doNavigate = shouldNavigate !== undefined ? shouldNavigate : activePaneRef.current === pane;
+        if (doNavigate && activePaneRef.current !== pane) return;
+        const request = ++paneRequestsRef.current[pane];
+        const otherPane = pane === 'left' ? 'right' : 'left';
+        const otherRequest = paneRequestsRef.current[otherPane];
+        const isCurrent = () => paneRequestsRef.current[pane] === request &&
+            getScopeRef.current?.() === owner && (!doNavigate || activePaneRef.current === pane) &&
+            (!swapCommit || paneRequestsRef.current[otherPane] === otherRequest);
+        const setLoading = pane === 'left' ? setLeftLoading : setRightLoading;
+        setLoading(true);
+        try {
+            if (doNavigate) {
+                // Canonical provider owns global history, request generation and SFTP state.
+                const pending = loadDirectory(path, {
+                    isCurrent,
+                    // Deliver the committed result to its initiating pane before
+                    // React can batch away the intermediate global snapshot.
+                    onCommit: (data) => {
+                        committedPaneRef.current = pane;
+                        swapCommit?.();
+                        commitPaneData(pane, path, filterData(data));
+                    },
+                });
+                const navigation = { path, requestId: getDirectoryRequestId?.() };
+                activeNavigationRef.current = navigation;
+                try {
+                    const ok = await pending;
+                    if (!ok && isCurrent() && activeNavigationRef.current === navigation &&
+                        getDirectoryRequestId?.() === navigation.requestId) {
+                        // Only the latest failed activation may roll back the selection.
+                        const previous = committedPaneRef.current;
+                        if (previous !== pane) {
+                            activePaneRef.current = previous;
+                            setActivePane(previous);
+                        }
+                    }
+                    return ok;
+                } finally {
+                    if (activeNavigationRef.current === navigation) activeNavigationRef.current = null;
+                }
+            }
+            const parsed = isSftpPath(path)
+                ? await loadSftpDirectory(path, { isCurrent, updateActiveState: false })
+                : JSON.parse(await invoke('open_directory', { path }));
+            if (isCurrent() && parsed) commitPaneData(pane, path, filterData(parsed));
+        } catch (err) {
+            if (isCurrent()) {
+                console.error(`Failed to load directory ${path} in ${pane} pane:`, err);
+                showError(`Failed to load ${path}: ${err}`);
+            }
+        } finally {
+            if (paneRequestsRef.current[pane] === request) setLoading(false);
         }
-    }, [currentPath, loadPaneDirectory]);
+    }, [filterData, loadDirectory, isSftpPath, loadSftpDirectory, commitPaneData, getDirectoryRequestId]);
 
-    // Activate pane and sync global history
-    const handleActivate = useCallback((pane) => {
+    // Establish initial request ownership before the browser can deliver input.
+    // Restart on owner changes and StrictMode effect replay; never restore a
+    // persisted pane over the current Explorer tab's own directory.
+    useLayoutEffect(() => {
+        setLeftLoading(false);
+        setRightLoading(false);
+        if (!ready) return;
+        const pane = activePaneRef.current;
+        const other = pane === 'left' ? 'right' : 'left';
+        if (!explorerTabs) loadPaneDirectory(pane, pane === 'left' ? leftPathRef.current : rightPathRef.current, true);
+        loadPaneDirectory(other, other === 'left' ? leftPathRef.current : rightPathRef.current, false);
+        return () => {
+            ++paneRequestsRef.current.left;
+            ++paneRequestsRef.current.right;
+        };
+    }, [scope, ready]);
+
+    // Adopt the actual committed listing, not a transient History path.
+    useEffect(() => {
+        if (!ready || !currentPath || !currentDirData || getLoadedDirectoryPath?.() !== currentPath) return;
+        const navigation = activeNavigationRef.current;
+        if (navigation && navigation.requestId === getDirectoryRequestId?.()) return;
+        if (activePane !== activePaneRef.current) return;
+        const pane = activePane;
+        committedPaneRef.current = pane;
+        // A background read begun before this pane became active is obsolete.
+        ++paneRequestsRef.current[pane];
+        if (pane === 'left') setLeftLoading(false);
+        else setRightLoading(false);
+        commitPaneData(pane, currentPath, currentDirData);
+    }, [scope, ready, activePane, currentPath, currentDirData, getLoadedDirectoryPath, getDirectoryRequestId, commitPaneData]);
+
+    const selectPane = useCallback((pane) => {
+        if (activePaneRef.current === pane) return false;
+        const previous = activePaneRef.current;
+        ++paneRequestsRef.current[previous];
+        if (previous === 'left') setLeftLoading(false);
+        else setRightLoading(false);
         activePaneRef.current = pane;
         setActivePane(pane);
-        const path = pane === 'left' ? leftPathRef.current : rightPathRef.current;
-        if (path) {
-            navigateTo(path);
+        // Initial navigation may have been cancelled before its first listing.
+        // Recover only that empty pane via an isolated read, never navigation.
+        if (!paneHasDataRef.current[previous]) {
+            const path = previous === 'left' ? leftPathRef.current : rightPathRef.current;
+            loadPaneDirectory(previous, path, false);
         }
-    }, [navigateTo]);
+        return true;
+    }, [loadPaneDirectory]);
+
+    // Activating a pane uses the same generation guard as a drive click.
+    const handleActivate = useCallback((pane) => {
+        if (!ready || !selectPane(pane)) return;
+        const path = pane === 'left' ? leftPathRef.current : rightPathRef.current;
+        if (path) loadPaneDirectory(pane, path, true);
+    }, [ready, selectPane, loadPaneDirectory]);
+
+    const captureRefresh = (pane, path) => {
+        const owner = getScopeRef.current?.();
+        const generation = paneRequestsRef.current[pane];
+        const directoryRequest = getDirectoryRequestId?.();
+        return () => {
+            const current = pane === 'left' ? leftPathRef.current : rightPathRef.current;
+            if (getScopeRef.current?.() !== owner || current !== path ||
+                paneRequestsRef.current[pane] !== generation) return false;
+            const active = activePaneRef.current === pane;
+            if (active && (activeNavigationRef.current || getLoadedDirectoryPath?.() !== path ||
+                getDirectoryRequestId?.() !== directoryRequest)) return false;
+            loadPaneDirectory(pane, path, active);
+            return true;
+        };
+    };
 
     // Drag and drop handler between panes or from external sources
     const handlePaneDrop = async (targetPane, e) => {
@@ -223,6 +304,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
 
         const targetDir = targetPane === 'left' ? leftPath : rightPath;
         if (!targetDir) return;
+        const refresh = captureRefresh(targetPane, targetDir);
 
         try {
             const raw = e.dataTransfer.getData('application/json');
@@ -237,7 +319,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                             destinationPath: dest
                         });
                         showSuccess(`${t('common.success')}: ${source.name}`);
-                        loadPaneDirectory(targetPane, targetDir, false);
+                        refresh();
                     }
                     return;
                 }
@@ -269,7 +351,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
             }
             if (count > 0) {
                 showSuccess(`${t('common.success')}: ${count} ${t('common.items')}`);
-                loadPaneDirectory(targetPane, targetDir, false);
+                refresh();
             }
         }
     };
@@ -284,31 +366,28 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
         }
     }, [loadPaneDirectory]);
 
-    // Swap panes
+    // Swap both snapshots only after the new active directory commits.
     const handleSwapPanes = () => {
-        const tempPath = leftPath;
-        const tempData = leftDirData;
-        const tempSelected = leftSelected;
-        const tempFocused = leftFocused;
+        if (!ready || leftLoading || rightLoading || !leftDirData || !rightDirData ||
+            activePaneRef.current !== activePane) return;
+        const currentActivePath = activePane === 'left' ? rightPath : leftPath;
+        loadPaneDirectory(activePane, currentActivePath, true, () => {
+            leftPathRef.current = rightPath;
+            rightPathRef.current = leftPath;
 
-        leftPathRef.current = rightPath;
-        rightPathRef.current = tempPath;
+            setLeftPath(rightPath);
+            setLeftDirData(rightDirData);
+            setLeftSelected(rightSelected);
+            setLeftFocused(rightFocused);
 
-        setLeftPath(rightPath);
-        setLeftDirData(rightDirData);
-        setLeftSelected(rightSelected);
-        setLeftFocused(rightFocused);
+            setRightPath(leftPath);
+            setRightDirData(leftDirData);
+            setRightSelected(leftSelected);
+            setRightFocused(leftFocused);
 
-        setRightPath(tempPath);
-        setRightDirData(tempData);
-        setRightSelected(tempSelected);
-        setRightFocused(tempFocused);
-
-        localStorage.setItem('explr_dual_pane_left', rightPath);
-        localStorage.setItem('explr_dual_pane_right', tempPath);
-
-        const currentActivePath = activePane === 'left' ? rightPath : tempPath;
-        navigateTo(currentActivePath);
+            localStorage.setItem('explr_dual_pane_left', rightPath);
+            localStorage.setItem('explr_dual_pane_right', leftPath);
+        });
     };
 
     // Equalize: make target pane match active pane
@@ -325,6 +404,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
         const targetDir = isLeft ? rightPath : leftPath;
         const targetData = isLeft ? rightDirData : leftDirData;
         const targetPane = isLeft ? 'right' : 'left';
+        const refresh = captureRefresh(targetPane, targetDir);
 
         if (!sourceItems || sourceItems.length === 0) {
             showError(t('common.error') + ': ' + t('toolbar.copy') + ' - ' + t('common.selected') + ' 0');
@@ -386,7 +466,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
 
         if (copied > 0) {
             showSuccess(`${t('common.success')}: ${copied} ${t('common.items')}`);
-            loadPaneDirectory(targetPane, targetDir, false);
+            refresh();
         }
     };
 
@@ -398,6 +478,8 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
         const sourceDir = isLeft ? leftPath : rightPath;
         const targetPane = isLeft ? 'right' : 'left';
         const sourcePane = activePane;
+        const refreshTarget = captureRefresh(targetPane, targetDir);
+        const refreshSource = captureRefresh(sourcePane, sourceDir);
 
         if (!sourceItems || sourceItems.length === 0) {
             return;
@@ -434,8 +516,8 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
 
         if (moved > 0) {
             showSuccess(`${t('common.success')}: ${moved} ${t('common.items')}`);
-            loadPaneDirectory(targetPane, targetDir, false);
-            loadPaneDirectory(sourcePane, sourceDir, true);
+            refreshTarget();
+            refreshSource();
         }
     };
 
@@ -446,6 +528,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
         const focused = isLeft ? leftFocused : rightFocused;
         const sourceItems = (rawItems && rawItems.length > 0) ? rawItems : (focused ? [focused] : []);
         const currentDir = isLeft ? leftPath : rightPath;
+        const refresh = captureRefresh(activePane, currentDir);
 
         if (!sourceItems || sourceItems.length === 0) return;
 
@@ -467,6 +550,7 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
 
         if (deleted > 0) {
             showSuccess(`${t('common.success')}: ${deleted} ${t('common.items')}`);
+            if (!refresh()) return;
             if (isLeft) {
                 setLeftSelected([]);
                 setLeftFocused(null);
@@ -474,7 +558,6 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                 setRightSelected([]);
                 setRightFocused(null);
             }
-            loadPaneDirectory(activePane, currentDir);
         }
     };
 
@@ -710,8 +793,8 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                                             className={`dual-pane-drive-btn ${leftPath.startsWith(vol.mount_point) ? 'active' : ''}`}
                                             onClick={(e) => {
                                                 e.stopPropagation();
-                                                activePaneRef.current = 'left';
-                                                setActivePane('left');
+                                                if (!ready) return;
+                                                selectPane('left');
                                                 loadPaneDirectory('left', vol.mount_point, true);
                                             }}
                                             title={vol.volume_name || vol.mount_point}
@@ -802,8 +885,8 @@ const DualPane = ({ viewMode = 'grid', isPreviewOpen = false, onColumnsChange, o
                                             className={`dual-pane-drive-btn ${rightPath.startsWith(vol.mount_point) ? 'active' : ''}`}
                                             onClick={(e) => {
                                                 e.stopPropagation();
-                                                activePaneRef.current = 'right';
-                                                setActivePane('right');
+                                                if (!ready) return;
+                                                selectPane('right');
                                                 loadPaneDirectory('right', vol.mount_point, true);
                                             }}
                                             title={vol.volume_name || vol.mount_point}

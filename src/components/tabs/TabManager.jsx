@@ -6,6 +6,9 @@ import { useTranslation } from '../../i18n';
 import IconButton from '../common/IconButton';
 import './tabs.css';
 
+// Explorer identity is independent of the currently displayed directory.
+export const ExplorerTabsContext = React.createContext(null);
+
 /**
  * TabManager component - Manages multiple tabs for file explorer navigation
  *
@@ -36,17 +39,84 @@ const TabManager = ({ children }) => {
         return null;
     });
     const { currentPath } = useHistory();
-    const { loadDirectory } = useFileSystem();
+    const { loadDirectory, invalidateDirectoryRequests, getDirectoryRequestId, getLoadedDirectoryPath } = useFileSystem();
     const { isSftpPath, parseSftpPath } = useSftp();
     const { t } = useTranslation();
     const [contextMenu, setContextMenu] = useState(null);
     const draggedTabIndexRef = useRef(-1);
     const activeTabIdRef = useRef(activeTabId);
-    const pendingSwitchTabIdRef = useRef(null);
+    const tabsRef = useRef(tabs);
+    tabsRef.current = tabs;
+    const currentPathRef = useRef(currentPath);
+    const observedPathRef = useRef(currentPath);
+    currentPathRef.current = currentPath;
+    const settledTabIdRef = useRef(activeTabId);
+    const [scope, setScope] = useState({ tabId: null, revision: 0, switching: false });
+    const scopeRef = useRef(scope);
 
-    useEffect(() => {
-        activeTabIdRef.current = activeTabId;
-    }, [activeTabId]);
+    const publishScope = (next) => {
+        scopeRef.current = next;
+        setScope(next);
+        activeTabIdRef.current = next.tabId;
+        setActiveTabId(next.tabId);
+    };
+
+    const replaceTabs = (next) => {
+        tabsRef.current = next;
+        setTabs(next);
+    };
+
+    // Invalidate even when two tabs point to the same directory: the old
+    // request belongs to a different Explorer owner, not to that path.
+    const activateTab = async (tab, restoring = false) => {
+        if (!tab) return;
+        const previousId = settledTabIdRef.current;
+        const previousScope = scopeRef.current;
+        const loadedPath = getLoadedDirectoryPath?.();
+        const needsLoad = Boolean(tab.path && (tab.path !== currentPathRef.current ||
+            (previousScope.tabId !== null && loadedPath !== undefined && loadedPath !== tab.path)));
+        if (previousScope.tabId === tab.id && !previousScope.switching && !needsLoad) {
+            document.dispatchEvent(new CustomEvent(tab.path === null ? 'open-this-pc' : 'force-explorer-view'));
+            return;
+        }
+        const attempt = { tabId: tab.id, revision: previousScope.revision + 1, switching: needsLoad };
+        if (previousScope.tabId !== null || needsLoad) invalidateDirectoryRequests?.();
+        publishScope(attempt);
+
+        if (tab.path === null) {
+            settledTabIdRef.current = tab.id;
+            document.dispatchEvent(new CustomEvent('open-this-pc'));
+            return;
+        }
+        if (!restoring) document.dispatchEvent(new CustomEvent('force-explorer-view'));
+        if (!needsLoad) {
+            settledTabIdRef.current = tab.id;
+            return;
+        }
+
+        let ok = false;
+        let requestId;
+        try {
+            const pending = loadDirectory(tab.path, { isCurrent: () => scopeRef.current === attempt });
+            requestId = getDirectoryRequestId?.();
+            ok = await pending;
+        } catch (error) {
+            console.error('Failed to load directory for tab:', error);
+        }
+        if (scopeRef.current !== attempt) return;
+        const superseded = requestId !== undefined && getDirectoryRequestId?.() !== requestId;
+        const previous = tabsRef.current.find((item) => item.id === previousId &&
+            item.id !== tab.id && item.path === currentPathRef.current);
+        // Keep the selected owner if a newer user navigation superseded the load.
+        const chosen = !ok && !superseded && previous ? previous.id : tab.id;
+        if (!ok && !superseded && !previous) {
+            const path = currentPathRef.current;
+            replaceTabs(tabsRef.current.map((item) => item.id === chosen
+                ? { ...item, path, title: getTabTitle(path) } : item));
+        }
+        settledTabIdRef.current = chosen;
+        publishScope({ ...attempt, tabId: chosen, switching: false });
+    };
 
     useEffect(() => {
         const hideMenu = () => setContextMenu(null);
@@ -55,8 +125,9 @@ const TabManager = ({ children }) => {
     }, []);
 
     const closeOtherTabs = (tabId) => {
-        setTabs(prev => prev.filter(t => t.id === tabId));
-        switchToTab(tabId);
+        const remaining = tabsRef.current.filter(t => t.id === tabId);
+        replaceTabs(remaining);
+        activateTab(remaining[0]);
         setContextMenu(null);
     };
 
@@ -90,20 +161,7 @@ const TabManager = ({ children }) => {
     // Restore active tab on mount
     useEffect(() => {
         if (tabs.length > 0) {
-            const active = tabs.find(t => t.id === activeTabId) || tabs[0];
-            setActiveTabId(active.id);
-            if (active.path === null) {
-                document.dispatchEvent(new CustomEvent('open-this-pc'));
-            } else if (active.path && active.path !== currentPath) {
-                pendingSwitchTabIdRef.current = active.id;
-                loadDirectory(active.path)
-                    .catch(() => {})
-                    .finally(() => {
-                        if (pendingSwitchTabIdRef.current === active.id) {
-                            pendingSwitchTabIdRef.current = null;
-                        }
-                    });
-            }
+            activateTab(tabs.find(t => t.id === activeTabId) || tabs[0], true);
         }
     }, []);
 
@@ -118,8 +176,8 @@ const TabManager = ({ children }) => {
                 path: currentPath,
                 isActive: true
             };
-            setTabs([initialTab]);
-            setActiveTabId(initialTab.id);
+            replaceTabs([initialTab]);
+            activateTab(initialTab, true);
         }
     }, [currentPath, tabs.length]);
 
@@ -127,8 +185,12 @@ const TabManager = ({ children }) => {
      * Update active tab when path changes (never triggered by activeTabId change alone)
      */
     useEffect(() => {
+        // The initial History snapshot is not a new navigation. In particular,
+        // it must not overwrite a restored Home tab's null path.
+        if (observedPathRef.current === currentPath) return;
+        observedPathRef.current = currentPath;
         const targetTabId = activeTabIdRef.current;
-        if (currentPath && targetTabId && !pendingSwitchTabIdRef.current) {
+        if (currentPath && targetTabId && !scopeRef.current.switching) {
             setTabs(prevTabs =>
                 prevTabs.map(tab =>
                     tab.id === targetTabId
@@ -209,8 +271,8 @@ const TabManager = ({ children }) => {
             isActive: false
         };
 
-        setTabs(prevTabs => [...prevTabs, newTab]);
-        setActiveTabId(newTab.id);
+        replaceTabs([...tabsRef.current, newTab]);
+        activateTab(newTab);
     };
 
     /**
@@ -223,36 +285,14 @@ const TabManager = ({ children }) => {
 
         if (tabs.length <= 1) return; // Don't close the last tab
 
-        const tabIndex = tabs.findIndex(tab => tab.id === tabId);
-        const isActiveTab = tabId === activeTabId;
-        const remainingTabs = tabs.filter(tab => tab.id !== tabId);
+        const currentTabs = tabsRef.current;
+        const tabIndex = currentTabs.findIndex(tab => tab.id === tabId);
+        const isActiveTab = tabId === activeTabIdRef.current;
+        const remainingTabs = currentTabs.filter(tab => tab.id !== tabId);
 
-        setTabs(remainingTabs);
-
-        // If we closed the active tab, switch to another tab
+        replaceTabs(remainingTabs);
         if (isActiveTab && remainingTabs.length > 0) {
-            const nextTabIndex = Math.min(tabIndex, remainingTabs.length - 1);
-            const nextTab = remainingTabs[nextTabIndex];
-            if (nextTab.path === null) {
-                pendingSwitchTabIdRef.current = null;
-                setActiveTabId(nextTab.id);
-                document.dispatchEvent(new CustomEvent('open-this-pc'));
-            } else {
-                document.dispatchEvent(new CustomEvent('force-explorer-view'));
-                if (nextTab.path && nextTab.path !== currentPath) {
-                    pendingSwitchTabIdRef.current = nextTab.id;
-                    setActiveTabId(nextTab.id);
-                    loadDirectory(nextTab.path)
-                        .catch(() => {})
-                        .finally(() => {
-                            if (pendingSwitchTabIdRef.current === nextTab.id) {
-                                pendingSwitchTabIdRef.current = null;
-                            }
-                        });
-                } else {
-                    setActiveTabId(nextTab.id);
-                }
-            }
+            activateTab(remainingTabs[Math.min(tabIndex, remainingTabs.length - 1)]);
         }
     };
 
@@ -262,34 +302,7 @@ const TabManager = ({ children }) => {
      * @async
      */
     const switchToTab = async (tabId) => {
-        const tab = tabs.find(t => t.id === tabId);
-        if (!tab) return;
-
-        if (tab.path === null) {
-            pendingSwitchTabIdRef.current = null;
-            setActiveTabId(tabId);
-            document.dispatchEvent(new CustomEvent('open-this-pc'));
-            return;
-        }
-
-        document.dispatchEvent(new CustomEvent('force-explorer-view'));
-
-        // Load the directory for this tab
-        if (tab.path !== currentPath) {
-            pendingSwitchTabIdRef.current = tabId;
-            setActiveTabId(tabId);
-            try {
-                await loadDirectory(tab.path);
-            } catch (error) {
-                console.error('Failed to load directory for tab:', error);
-            } finally {
-                if (pendingSwitchTabIdRef.current === tabId) {
-                    pendingSwitchTabIdRef.current = null;
-                }
-            }
-        } else {
-            setActiveTabId(tabId);
-        }
+        await activateTab(tabsRef.current.find(t => t.id === tabId));
     };
 
     /**
@@ -311,8 +324,8 @@ const TabManager = ({ children }) => {
         const newTabs = [...tabs];
         newTabs.splice(tabIndex + 1, 0, duplicatedTab);
 
-        setTabs(newTabs);
-        setActiveTabId(duplicatedTab.id);
+        replaceTabs(newTabs);
+        activateTab(duplicatedTab);
     };
 
     /**
@@ -436,7 +449,13 @@ const TabManager = ({ children }) => {
             </div>
 
             <div className="tab-content-area">
-                {children}
+                <ExplorerTabsContext.Provider value={{
+                    scope,
+                    getScope: () => scopeRef.current,
+                    tabs,
+                }}>
+                    {children}
+                </ExplorerTabsContext.Provider>
             </div>
 
             {contextMenu && (

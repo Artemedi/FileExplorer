@@ -102,7 +102,9 @@ describe('Wave 4 UI & Tools Regression Tests (TP-FE-UI-09..12)', () => {
             );
 
             fireEvent.click(screen.getByText('TabB'));
-            expect(mockLoadDirectory).toHaveBeenCalledWith('D:\\TabB');
+            expect(mockLoadDirectory).toHaveBeenCalledWith('D:\\TabB', expect.objectContaining({ isCurrent: expect.any(Function) }));
+            const guard = mockLoadDirectory.mock.calls[0][1].isCurrent;
+            expect(guard()).toBe(true);
 
             // Before loadDirectory resolves, saved tabs must still retain D:\TabB
             const storedBefore = JSON.parse(localStorage.getItem('explr_saved_tabs'));
@@ -112,6 +114,8 @@ describe('Wave 4 UI & Tools Regression Tests (TP-FE-UI-09..12)', () => {
             await act(async () => {
                 resolveLoad(false);
             });
+            expect(guard()).toBe(false);
+            expect(localStorage.getItem('explr_active_tab_id')).toBe('tab-1');
             const storedAfter = JSON.parse(localStorage.getItem('explr_saved_tabs'));
             expect(storedAfter.find(t => t.id === 'tab-2').path).toBe('D:\\TabB');
         });
@@ -135,6 +139,7 @@ describe('Wave 4 UI & Tools Regression Tests (TP-FE-UI-09..12)', () => {
                 </TabManager>
             );
 
+            expect(forceExplorerListener).not.toHaveBeenCalled();
             fireEvent.click(screen.getByText('Home'));
             expect(openThisPcListener).toHaveBeenCalledTimes(1);
             expect(mockLoadDirectory).not.toHaveBeenCalledWith(null);
@@ -145,6 +150,17 @@ describe('Wave 4 UI & Tools Regression Tests (TP-FE-UI-09..12)', () => {
 
             document.removeEventListener('open-this-pc', openThisPcListener);
             document.removeEventListener('force-explorer-view', forceExplorerListener);
+        });
+
+        test('AUDIT: restoring a saved Home owner must retain null path despite prior global History', () => {
+            localStorage.setItem('explr_saved_tabs', JSON.stringify([
+                { id: 'tab-1', title: 'TabA', path: 'C:\\TabA', isActive: false },
+                { id: 'tab-pc', title: 'Home', path: null, isActive: true },
+            ]));
+            localStorage.setItem('explr_active_tab_id', 'tab-pc');
+            render(<TabManager><div>content</div></TabManager>);
+            const stored = JSON.parse(localStorage.getItem('explr_saved_tabs'));
+            expect(stored.find(t => t.id === 'tab-pc').path).toBeNull();
         });
 
         test('TP-FE-UI-10: drag-and-drop reorders tabs, dragEnd resets ref, no onSelectStart React warning, new-tab has aria-label', () => {

@@ -1,3 +1,4 @@
+use super::pty_io;
 use crate::commands::sftp_file_system_operation_commands::{
     connect_authenticated_ssh_session, resolve_ssh_profile, SshAuthOptions, ZeroizingString,
 };
@@ -5,7 +6,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock, RwLock};
+use std::sync::{mpsc, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 use tauri::Emitter;
@@ -13,14 +14,6 @@ use tauri::Emitter;
 const MAX_SSH_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB cap per stream
 static SSH_PTY_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ZSTD_PROBE_CACHE: OnceLock<RwLock<HashMap<String, bool>>> = OnceLock::new();
-static PTY_SESSIONS: OnceLock<Mutex<HashMap<String, mpsc::Sender<PtyControl>>>> = OnceLock::new();
-
-enum PtyControl {
-    Write(Vec<u8>),
-    Resize(u32, u32),
-    Close,
-}
-
 #[derive(Debug, Serialize)]
 pub struct SshCommandResponse {
     pub stdout: String,
@@ -38,10 +31,6 @@ struct SshPtyOutputPayload {
 struct SshPtyExitPayload {
     session_id: String,
     reason: String,
-}
-
-fn pty_sessions() -> &'static Mutex<HashMap<String, mpsc::Sender<PtyControl>>> {
-    PTY_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn zstd_cache() -> &'static RwLock<HashMap<String, bool>> {
@@ -339,7 +328,6 @@ pub async fn ssh_start_pty(
         SSH_PTY_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-    let (ctrl_tx, ctrl_rx) = mpsc::channel::<PtyControl>();
     let sid_clone = session_id.clone();
 
     thread::spawn(move || {
@@ -379,50 +367,69 @@ pub async fn ssh_start_pty(
             .map(str::trim)
             .filter(|d| !d.is_empty() && *d != ".")
         {
-            let _ = channel.write_all(format!("cd {}\n", posix_shell_quote(dir)).as_bytes());
-            let _ = channel.flush();
+            if let Err(e) =
+                channel.write_all(format!("cd -- {}\n", posix_shell_quote(dir)).as_bytes())
+            {
+                let _ = ready_tx.send(Err(e.to_string()));
+                return;
+            }
         }
 
         session.set_blocking(false);
-        let _ = ready_tx.send(Ok(()));
+        let (registration, controls) = pty_io::Registration::new(sid_clone.clone());
+        if ready_tx.send(Ok(())).is_err() {
+            return;
+        }
 
         let mut buf = [0u8; 4096];
         let mut pending_utf8: Vec<u8> = Vec::new();
+        let mut pending_resize = None;
         let mut exit_reason = "closed".to_string();
 
         loop {
-            while let Ok(msg) = ctrl_rx.try_recv() {
-                match msg {
-                    PtyControl::Write(bytes) => {
-                        let _ = channel.write_all(&bytes);
-                        let _ = channel.flush();
-                    }
-                    PtyControl::Resize(c, r) => {
-                        for _ in 0..10 {
-                            match channel.request_pty_size(c, r, None, None) {
-                                Ok(()) => break,
-                                Err(e) if matches!(e.code(), ssh2::ErrorCode::Session(-37)) => {
-                                    thread::sleep(Duration::from_millis(10));
-                                }
-                                Err(_) => break,
-                            }
+            let mut progressed = false;
+            {
+                let mut control = controls.lock().unwrap_or_else(|e| e.into_inner());
+                if control.closed {
+                    exit_reason = "closed_by_user".to_string();
+                    break;
+                }
+                // Retry a resize with the same arguments on EAGAIN. New
+                // dimensions are coalesced in the control state meanwhile.
+                if pending_resize.is_none() && !control.write_blocked {
+                    pending_resize = control.resize.take();
+                }
+                if let Some((cols, rows)) = pending_resize {
+                    match channel.request_pty_size(cols, rows, None, None) {
+                        Ok(()) => {
+                            pending_resize = None;
+                            progressed = true;
+                        }
+                        Err(e) if matches!(e.code(), ssh2::ErrorCode::Session(-37)) => {}
+                        Err(e) => {
+                            exit_reason = format!("SSH PTY resize failed: {e}");
+                            break;
                         }
                     }
-                    PtyControl::Close => {
-                        let _ = channel.close();
-                        exit_reason = "closed_by_user".to_string();
-                        break;
+                }
+                if pending_resize.is_none() {
+                    match control.write_next(&mut channel) {
+                        Ok(wrote) => progressed |= wrote,
+                        Err(e) => {
+                            exit_reason = format!("SSH PTY write failed: {e}");
+                            break;
+                        }
                     }
                 }
             }
 
-            if exit_reason == "closed_by_user" {
-                break;
-            }
-
+            // Always give reads a turn, even when the remote write window
+            // is exhausted. Do not discard buffered output at remote EOF.
             match channel.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) if channel.eof() => break,
+                Ok(0) => {}
                 Ok(n) => {
+                    progressed = true;
                     pending_utf8.extend_from_slice(&buf[..n]);
                     let text = drain_valid_utf8(&mut pending_utf8);
                     if !text.is_empty() {
@@ -436,23 +443,24 @@ pub async fn ssh_start_pty(
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(15));
+                    if channel.eof() {
+                        break;
+                    }
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     exit_reason = e.to_string();
                     break;
                 }
             }
 
-            if channel.eof() {
-                break;
+            if !progressed {
+                thread::sleep(Duration::from_millis(15));
             }
         }
 
-        pty_sessions()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&sid_clone);
+        drop(registration);
+        let _ = channel.close();
         let _ = app.emit(
             "ssh-pty-exit",
             SshPtyExitPayload {
@@ -466,13 +474,7 @@ pub async fn ssh_start_pty(
         .await
         .map_err(|e| format!("SSH PTY join error: {e}"))?
     {
-        Ok(Ok(())) => {
-            pty_sessions()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id.clone(), ctrl_tx);
-            Ok(session_id)
-        }
+        Ok(Ok(())) => Ok(session_id),
         Ok(Err(e)) => Err(e),
         Err(_) => Err("SSH PTY initialization thread terminated unexpectedly".to_string()),
     }
@@ -480,33 +482,31 @@ pub async fn ssh_start_pty(
 
 #[tauri::command]
 pub fn ssh_write_pty(session_id: String, data: String) -> Result<(), String> {
-    let sessions = pty_sessions().lock().unwrap_or_else(|e| e.into_inner());
-    let tx = sessions
-        .get(session_id.trim())
-        .ok_or_else(|| format!("SSH PTY session not found: {session_id}"))?;
-    tx.send(PtyControl::Write(data.into_bytes()))
-        .map_err(|_| "SSH PTY session is closed".to_string())
+    let controls = pty_io::lookup(session_id.trim())?;
+    let result = controls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .enqueue(data);
+    result
 }
 
 #[tauri::command]
 pub fn ssh_resize_pty(session_id: String, cols: u32, rows: u32) -> Result<(), String> {
-    let sessions = pty_sessions().lock().unwrap_or_else(|e| e.into_inner());
-    let tx = sessions
-        .get(session_id.trim())
-        .ok_or_else(|| format!("SSH PTY session not found: {session_id}"))?;
-    tx.send(PtyControl::Resize(cols, rows))
-        .map_err(|_| "SSH PTY session is closed".to_string())
+    if cols == 0 || rows == 0 {
+        return Err("Invalid SSH PTY dimensions".to_string());
+    }
+    let controls = pty_io::lookup(session_id.trim())?;
+    let mut control = controls.lock().unwrap_or_else(|e| e.into_inner());
+    if control.closed {
+        return Err("SSH PTY session is closed".to_string());
+    }
+    control.resize = Some((cols, rows));
+    Ok(())
 }
 
 #[tauri::command]
 pub fn ssh_close_pty(session_id: String) -> Result<(), String> {
-    let tx = pty_sessions()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(session_id.trim());
-    if let Some(sender) = tx {
-        let _ = sender.send(PtyControl::Close);
-    }
+    pty_io::close(session_id.trim());
     Ok(())
 }
 
