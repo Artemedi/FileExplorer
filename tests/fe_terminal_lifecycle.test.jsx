@@ -315,6 +315,105 @@ describe('TERM-R1 PTY lifecycle', () => {
         expect(mockNavigation.load).not.toHaveBeenCalled();
     });
 
+    test('R3.2: Attach transfers binding to an existing shell and Unlink preserves both PTYs', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2');
+        const scope = { tabId: 'A', revision: 1, switching: false };
+        const tabs = [{ id: 'A', path: mockNavigation.path }];
+        render(
+            <ExplorerTabsContext.Provider value={{ scope, getScope: () => scope, tabs }}>
+                <Terminal isOpen={true} onToggle={vi.fn()} />
+            </ExplorerTabsContext.Provider>
+        );
+        const first = await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name: 'Duplicate SSH' }));
+        const second = await screen.findByTestId('pty-2');
+        expect(second).toBeVisible();
+        const writes = () => mockInvoke.mock.calls.filter(([cmd]) => cmd === 'ssh_write_pty').length;
+        const before = writes();
+        fireEvent.click(screen.getByRole('button', { name: 'Attach' }));
+        expect(screen.getByRole('button', { name: 'Unlink' })).toBeVisible();
+        expect(writes()).toBe(before);
+        expect(mockStart).toHaveBeenCalledTimes(2);
+        expect(screen.getByTestId('pty-1')).toBe(first);
+        expect(screen.getByTestId('pty-2')).toBe(second);
+
+        fireEvent.click(screen.getByText('SSH: Test #1'));
+        expect(first).toBeVisible();
+        expect(screen.getByRole('button', { name: 'Attach' })).toBeEnabled();
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/independent\x07' });
+        expect(mockNavigation.load).not.toHaveBeenCalled();
+
+        fireEvent.click(screen.getByText('SSH: Test #2'));
+        emit('ssh-pty-output', { session_id: 'pty-2', data: '\x1b]7;file://db/attached\x07' });
+        await waitFor(() => expect(mockNavigation.load).toHaveBeenCalledWith(
+            'sftp:Test:/attached', expect.objectContaining({ isCurrent: expect.any(Function) })
+        ));
+        mockNavigation.load.mockClear();
+        fireEvent.click(screen.getByRole('button', { name: 'Unlink' }));
+        emit('ssh-pty-output', { session_id: 'pty-2', data: '\x1b]7;file://db/unlinked\x07' });
+        expect(mockNavigation.load).not.toHaveBeenCalled();
+        expect(mockStart).toHaveBeenCalledTimes(2);
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_close_pty', expect.anything());
+        expect(screen.getByTestId('pty-2')).toBe(second);
+        expect(second).toBeVisible();
+    });
+
+    test('R3.2: Unlink and reattach revoke an in-flight navigation even with the same owner and PTY', async () => {
+        const scope = { tabId: 'A', revision: 1, switching: false };
+        const tabs = [{ id: 'A', path: mockNavigation.path }];
+        let resolve;
+        mockNavigation.load.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+        render(
+            <ExplorerTabsContext.Provider value={{ scope, getScope: () => scope, tabs }}>
+                <Terminal isOpen={true} onToggle={vi.fn()} />
+            </ExplorerTabsContext.Provider>
+        );
+        const original = await screen.findByTestId('pty-1');
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/old/child\x07' });
+        await waitFor(() => expect(mockNavigation.load).toHaveBeenCalledTimes(1));
+        const guard = mockNavigation.load.mock.calls[0][1].isCurrent;
+        expect(guard()).toBe(true);
+        fireEvent.click(screen.getByRole('button', { name: 'Unlink' }));
+        expect(guard()).toBe(false);
+        fireEvent.click(screen.getByRole('button', { name: 'Attach' }));
+        expect(guard()).toBe(false);
+        await act(async () => resolve(false));
+        expect(mockNavigation.load).toHaveBeenCalledTimes(1);
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/fresh\x07' });
+        await waitFor(() => expect(mockNavigation.load).toHaveBeenCalledTimes(2));
+        expect(mockNavigation.load.mock.calls[1][0]).toBe('sftp:Test:/fresh');
+        expect(mockNavigation.load.mock.calls[1][1].isCurrent()).toBe(true);
+        expect(screen.getByTestId('pty-1')).toBe(original);
+        expect(mockStart).toHaveBeenCalledTimes(1);
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_close_pty', expect.anything());
+    });
+
+    test('R3.2: Attach is disabled for another SSH profile and while Explorer is hidden', async () => {
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2');
+        const scope = { tabId: 'A', revision: 1, switching: false };
+        const tabs = [{ id: 'A', path: mockNavigation.path }];
+        const tree = (visible = true) => (
+            <ExplorerTabsContext.Provider value={{ scope, getScope: () => scope, tabs }}>
+                <Terminal isOpen={true} onToggle={vi.fn()} explorerVisible={visible} />
+            </ExplorerTabsContext.Provider>
+        );
+        const { rerender } = render(tree());
+        await screen.findByTestId('pty-1');
+        act(() => window.dispatchEvent(new CustomEvent('open-ssh-terminal', { detail: {
+            connection: { ...connection, name: 'Other' },
+        } })));
+        await screen.findByTestId('pty-2');
+        expect(screen.getByRole('button', { name: 'Attach' })).toBeDisabled();
+        fireEvent.click(screen.getByText('SSH: Test'));
+        fireEvent.click(screen.getByRole('button', { name: 'Unlink' }));
+        expect(screen.getByRole('button', { name: 'Attach' })).toBeEnabled();
+        rerender(tree(false));
+        expect(screen.getByRole('button', { name: 'Attach' })).toBeDisabled();
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]7;file://db/home-hidden\x07' });
+        expect(mockNavigation.load).not.toHaveBeenCalled();
+        expect(mockStart).toHaveBeenCalledTimes(2);
+    });
+
     test('R3.1: late non-PTY cd cannot navigate after A to B to A', async () => {
         mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2');
         let scope = { tabId: 'A', revision: 1, switching: false };

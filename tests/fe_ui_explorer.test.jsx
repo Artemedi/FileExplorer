@@ -19,9 +19,10 @@ import HistoryProvider, { useHistory } from '../src/providers/HistoryProvider.js
 import FileSystemProvider from '../src/providers/FileSystemProvider.jsx';
 import ContextMenuProvider, { ContextMenuContext } from '../src/providers/ContextMenuProvider.jsx';
 import { SettingsContext } from '../src/providers/SettingsProvider.jsx';
-import SftpProvider from '../src/providers/SftpProvider.jsx';
+import SftpProvider, { useSftp } from '../src/providers/SftpProvider.jsx';
 import FileList from '../src/components/explorer/FileList.jsx';
 import DualPane from '../src/components/explorer/DualPane.jsx';
+import TabManager from '../src/components/tabs/TabManager.jsx';
 
 const defaultSettingsValue = {
     settings: {
@@ -417,8 +418,12 @@ describe('TP-FE-UI-07 & TP-FE-UI-08: DualPane keyboard isolation, drive switch, 
         renderWithProviders(<DualPaneAfterInit viewMode="list" />);
 
         await waitFor(() => {
+            const panels = document.querySelectorAll('.dual-pane-panel');
             expect(screen.getByText('C:\\A')).toBeInTheDocument();
             expect(screen.getByText('D:\\B')).toBeInTheDocument();
+            // The persisted headers can render before either listing is ready.
+            expect(within(panels[0]).getAllByRole('option')).toHaveLength(3);
+            expect(within(panels[1]).getAllByRole('option')).toHaveLength(3);
         });
 
         const panels = document.querySelectorAll('.dual-pane-panel');
@@ -447,6 +452,289 @@ describe('TP-FE-UI-07 & TP-FE-UI-08: DualPane keyboard isolation, drive switch, 
             expect(within(panels[0]).getByText('E:\\')).toBeInTheDocument();
         });
         expect(panels[0]).toHaveClass('active');
+    });
+
+    test('R3.2: initial layout interaction must not be overwritten by passive initialization', async () => {
+        localStorage.setItem('explr_dual_pane_left', 'C:\\A');
+        localStorage.setItem('explr_dual_pane_right', 'D:\\B');
+        const pending = [];
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_system_volumes_information_as_json') return JSON.stringify([{ mount_point: 'C:\\' }]);
+            if (cmd === 'get_initial_cli_path') return null;
+            if (cmd === 'open_directory') {
+                if (args.path === 'C:\\A' || args.path === 'D:\\B') {
+                    return new Promise(resolve => pending.push({ path: args.path, resolve }));
+                }
+                return JSON.stringify(makeDirData(args.path, 2));
+            }
+        });
+        function EarlyInteraction() {
+            const { currentPath } = useHistory();
+            React.useLayoutEffect(() => {
+                if (!currentPath) return;
+                document.querySelectorAll('.dual-pane-panel')[1].click();
+            }, [Boolean(currentPath)]);
+            if (!currentPath) return null;
+            return <><output data-testid="history-path">{currentPath}</output><DualPane viewMode="list" /></>;
+        }
+        renderWithProviders(<EarlyInteraction />);
+        await waitFor(() => expect(pending.some(r => r.path === 'D:\\B')).toBe(true));
+        const panels = document.querySelectorAll('.dual-pane-panel');
+        await act(async () => pending.splice(0).reverse().forEach(({ path, resolve }) => resolve(JSON.stringify(makeDirData(path, 2)))));
+        expect(panels[1]).toHaveClass('active');
+        expect(screen.getByTestId('history-path')).toHaveTextContent('D:\\B');
+        expect(within(panels[0]).getAllByRole('option')).toHaveLength(3);
+        expect(within(panels[1]).getAllByRole('option')).toHaveLength(3);
+    });
+
+    test('R3.2: StrictMode replay preserves latest pane ownership and ignores superseded listings', async () => {
+        localStorage.setItem('explr_dual_pane_left', 'C:\\A');
+        localStorage.setItem('explr_dual_pane_right', 'D:\\B');
+        const pending = [];
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_system_volumes_information_as_json') return JSON.stringify([{ mount_point: 'C:\\' }]);
+            if (cmd === 'get_initial_cli_path') return null;
+            if (cmd === 'open_directory') {
+                if (args.path === 'C:\\A' || args.path === 'D:\\B') {
+                    return new Promise(resolve => pending.push({ path: args.path, resolve }));
+                }
+                return JSON.stringify(makeDirData(args.path, 2));
+            }
+        });
+        function Probe() {
+            const { currentPath } = useHistory();
+            return <output data-testid="history-path">{currentPath}</output>;
+        }
+        renderWithProviders(<React.StrictMode><Probe /><DualPaneAfterInit viewMode="list" /></React.StrictMode>);
+        await waitFor(() => {
+            expect(pending.filter(r => r.path === 'C:\\A').length).toBeGreaterThanOrEqual(2);
+            expect(pending.filter(r => r.path === 'D:\\B').length).toBeGreaterThanOrEqual(2);
+        });
+        const panels = document.querySelectorAll('.dual-pane-panel');
+        await act(async () => fireEvent.click(panels[1]));
+        const latestLeft = pending.findLast(r => r.path === 'C:\\A');
+        const latestRight = pending.findLast(r => r.path === 'D:\\B');
+        await act(async () => {
+            latestRight.resolve(JSON.stringify(makeDirData(latestRight.path, 2)));
+            latestLeft.resolve(JSON.stringify(makeDirData(latestLeft.path, 2)));
+        });
+        expect(screen.getByTestId('history-path')).toHaveTextContent('D:\\B');
+        expect(within(panels[0]).getAllByRole('option')).toHaveLength(3);
+        expect(within(panels[1]).getAllByRole('option')).toHaveLength(3);
+        await act(async () => {
+            pending.filter(r => r !== latestLeft && r !== latestRight).forEach(({ path, resolve }) =>
+                resolve(JSON.stringify(makeDirData(path, 5))));
+        });
+        expect(panels[1]).toHaveClass('active');
+        expect(screen.getByTestId('history-path')).toHaveTextContent('D:\\B');
+        expect(within(panels[0]).getAllByRole('option')).toHaveLength(3);
+        expect(within(panels[1]).getAllByRole('option')).toHaveLength(3);
+    });
+
+    test('R3.2: switching before initial left load completes keeps right navigation and recovers left listing', async () => {
+        localStorage.setItem('explr_dual_pane_left', 'C:\\A');
+        localStorage.setItem('explr_dual_pane_right', 'D:\\B');
+        const pending = [];
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_system_volumes_information_as_json') return JSON.stringify([{ mount_point: 'C:\\' }]);
+            if (cmd === 'get_initial_cli_path') return null;
+            if (cmd === 'open_directory') {
+                if (args.path === 'C:\\A') return new Promise(resolve => pending.push(resolve));
+                return JSON.stringify(makeDirData(args.path, 2));
+            }
+        });
+        function Probe() {
+            const { currentPath } = useHistory();
+            return <output data-testid="history-path">{currentPath}</output>;
+        }
+        renderWithProviders(<><Probe /><DualPaneAfterInit viewMode="list" /></>);
+        await waitFor(() => expect(pending.length).toBeGreaterThan(0));
+        const panels = document.querySelectorAll('.dual-pane-panel');
+        await waitFor(() => expect(within(panels[1]).getAllByRole('option')).toHaveLength(3));
+        await act(async () => fireEvent.click(panels[1]));
+        await waitFor(() => expect(screen.getByTestId('history-path')).toHaveTextContent('D:\\B'));
+        await act(async () => pending.splice(0).forEach(resolve => resolve(JSON.stringify(makeDirData('C:\\A', 2)))));
+        expect(panels[1]).toHaveClass('active');
+        expect(screen.getByTestId('history-path')).toHaveTextContent('D:\\B');
+        expect(within(panels[0]).getAllByRole('option')).toHaveLength(3);
+        expect(within(panels[0]).getByText('C:\\A')).toBeInTheDocument();
+    });
+
+    test('R3.2: failed activation preserves previous active pane and committed history', async () => {
+        localStorage.setItem('explr_dual_pane_left', 'C:\\A');
+        localStorage.setItem('explr_dual_pane_right', 'D:\\B');
+        let rejectRight;
+        let rightReads = 0;
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_system_volumes_information_as_json') return JSON.stringify([{ mount_point: 'C:\\' }]);
+            if (cmd === 'get_initial_cli_path') return null;
+            if (cmd === 'open_directory') {
+                if (args.path === 'D:\\B' && ++rightReads > 1) return new Promise((_, reject) => { rejectRight = reject; });
+                return JSON.stringify(makeDirData(args.path, 2));
+            }
+        });
+        function Probe() {
+            const { currentPath } = useHistory();
+            return <output data-testid="history-path">{currentPath}</output>;
+        }
+        renderWithProviders(<><Probe /><DualPaneAfterInit viewMode="list" /></>);
+        const panels = await waitFor(() => {
+            const found = document.querySelectorAll('.dual-pane-panel');
+            expect(found).toHaveLength(2);
+            expect(within(found[0]).getAllByRole('option')).toHaveLength(3);
+            expect(within(found[1]).getAllByRole('option')).toHaveLength(3);
+            expect(screen.getByTestId('history-path')).toHaveTextContent('C:\\A');
+            return found;
+        });
+        fireEvent.click(panels[1]);
+        await waitFor(() => expect(rejectRight).toBeTypeOf('function'));
+        await act(async () => rejectRight(new Error('Permission denied')));
+        expect(screen.getByTestId('history-path')).toHaveTextContent('C:\\A');
+        expect(panels[0]).toHaveClass('active');
+        expect(within(panels[1]).getByText('D:\\B')).toBeInTheDocument();
+        expect(within(panels[1]).getAllByRole('option')).toHaveLength(3);
+    });
+
+    test('R3.2: stale active and background SFTP reads cannot commit after Explorer owner change', async () => {
+        const a = 'sftp:A:/base/sub';
+        const b = 'sftp:B:/target';
+        const c = 'sftp:C:/background';
+        localStorage.setItem('fileExplorerSftpConnections', JSON.stringify(['A', 'B', 'C'].map(name => ({
+            name, host: name.toLowerCase() + '.invalid', username: 'test', port: 22,
+        }))));
+        localStorage.setItem('explr_saved_tabs', JSON.stringify([
+            { id: 'tab-a', title: 'Owner A', path: a }, { id: 'tab-b', title: 'Owner B', path: b },
+        ]));
+        localStorage.setItem('explr_active_tab_id', 'tab-a');
+        localStorage.setItem('explr_dual_pane_left', a);
+        localStorage.setItem('explr_dual_pane_right', c);
+        sessionStorage.setItem('fileExplorerHistory', JSON.stringify([a]));
+        sessionStorage.setItem('fileExplorerHistoryIndex', '0');
+        let resolveActive;
+        let resolveBackground;
+        let backgroundReads = 0;
+        const listing = (name) => JSON.stringify({ directories: [], files: [name] });
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_system_volumes_information_as_json') return '[]';
+            if (cmd === 'get_initial_cli_path') return null;
+            if (cmd === 'load_dir') {
+                if (args.host === 'a.invalid' && args.directory === '/base') {
+                    return new Promise(resolve => { resolveActive = resolve; });
+                }
+                if (args.host === 'c.invalid') {
+                    if (++backgroundReads === 1) return new Promise(resolve => { resolveBackground = resolve; });
+                    return listing('/background/new.txt');
+                }
+                return listing(args.directory + '/current.txt');
+            }
+        });
+        function Probe() {
+            const { currentPath } = useHistory();
+            const { currentSftpConnection, currentSftpPath } = useSftp();
+            return <><output data-testid="history-path">{currentPath}</output><output data-testid="sftp-state">{currentSftpConnection?.name}:{currentSftpPath}</output></>;
+        }
+        renderWithProviders(<TabManager><Probe /><DualPane viewMode="list" /></TabManager>);
+        const panels = document.querySelectorAll('.dual-pane-panel');
+        await waitFor(() => {
+            expect(within(panels[0]).getByRole('option')).toBeInTheDocument();
+            expect(resolveBackground).toBeTypeOf('function');
+            expect(screen.getByTestId('sftp-state')).toHaveTextContent('A:/base/sub');
+        });
+        fireEvent.click(within(panels[0]).getByTitle('Up one level'));
+        await waitFor(() => expect(resolveActive).toBeTypeOf('function'));
+        fireEvent.click(screen.getByText('Owner B'));
+        await waitFor(() => {
+            expect(screen.getByTestId('history-path')).toHaveTextContent(b);
+            expect(screen.getByTestId('sftp-state')).toHaveTextContent('B:/target');
+            expect(within(panels[1]).getByText('new.txt')).toBeInTheDocument();
+        });
+        await act(async () => {
+            resolveActive(listing('/base/stale-active.txt'));
+            resolveBackground(listing('/background/stale-background.txt'));
+        });
+        expect(screen.getByTestId('history-path')).toHaveTextContent(b);
+        expect(screen.getByTestId('sftp-state')).toHaveTextContent('B:/target');
+        expect(within(panels[0]).getByText(b)).toBeInTheDocument();
+        expect(within(panels[1]).getByText('new.txt')).toBeInTheDocument();
+        expect(screen.queryByText('stale-active.txt')).not.toBeInTheDocument();
+        expect(screen.queryByText('stale-background.txt')).not.toBeInTheDocument();
+    });
+
+    test('R3.2: failed Swap leaves both pane snapshots and global history unchanged', async () => {
+        localStorage.setItem('explr_dual_pane_left', 'C:\\A');
+        localStorage.setItem('explr_dual_pane_right', 'D:\\B');
+        let rejectSwap;
+        let rightReads = 0;
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_system_volumes_information_as_json') return JSON.stringify([{ mount_point: 'C:\\' }]);
+            if (cmd === 'get_initial_cli_path') return null;
+            if (cmd === 'open_directory') {
+                if (args.path === 'D:\\B' && ++rightReads === 2) return new Promise((_, reject) => { rejectSwap = reject; });
+                return JSON.stringify(makeDirData(args.path, 2));
+            }
+        });
+        function Probe() {
+            const { currentPath } = useHistory();
+            return <output data-testid="history-path">{currentPath}</output>;
+        }
+        renderWithProviders(<><Probe /><DualPaneAfterInit viewMode="list" /></>);
+        const panels = await waitFor(() => {
+            const found = document.querySelectorAll('.dual-pane-panel');
+            expect(found).toHaveLength(2);
+            expect(within(found[0]).getAllByRole('option')).toHaveLength(3);
+            expect(within(found[1]).getAllByRole('option')).toHaveLength(3);
+            expect(screen.getByTestId('history-path')).toHaveTextContent('C:\\A');
+            return found;
+        });
+        fireEvent.click(screen.getByRole('button', { name: /swap panes/i }));
+        await waitFor(() => expect(rejectSwap).toBeTypeOf('function'));
+        await act(async () => rejectSwap(new Error('Permission denied')));
+        expect(screen.getByTestId('history-path')).toHaveTextContent('C:\\A');
+        expect(within(panels[0]).getByText('C:\\A')).toBeInTheDocument();
+        expect(within(panels[1]).getByText('D:\\B')).toBeInTheDocument();
+        await act(async () => fireEvent.click(screen.getByRole('button', { name: /swap panes/i })));
+        await waitFor(() => expect(screen.getByTestId('history-path')).toHaveTextContent('D:\\B'));
+        expect(within(panels[0]).getByText('D:\\B')).toBeInTheDocument();
+        expect(within(panels[1]).getByText('C:\\A')).toBeInTheDocument();
+    });
+
+    test('R3.2: late drop refresh cannot replace a pane after it navigates elsewhere', async () => {
+        localStorage.setItem('explr_dual_pane_left', 'C:\\A');
+        localStorage.setItem('explr_dual_pane_right', 'D:\\B');
+        let finishCopy;
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_system_volumes_information_as_json') return JSON.stringify([
+                { mount_point: 'C:\\' }, { mount_point: 'D:\\' }, { mount_point: 'E:\\' },
+            ]);
+            if (cmd === 'get_initial_cli_path') return null;
+            if (cmd === 'copy_file_or_dir') return new Promise(resolve => { finishCopy = resolve; });
+            if (cmd === 'open_directory') return JSON.stringify(makeDirData(args.path, 2));
+        });
+        function Probe() {
+            const { currentPath } = useHistory();
+            return <output data-testid="history-path">{currentPath}</output>;
+        }
+        renderWithProviders(<><Probe /><DualPaneAfterInit viewMode="list" /></>);
+        const panels = await waitFor(() => {
+            const found = document.querySelectorAll('.dual-pane-panel');
+            expect(found).toHaveLength(2);
+            expect(within(found[0]).getAllByRole('option')).toHaveLength(3);
+            expect(within(found[1]).getAllByRole('option')).toHaveLength(3);
+            return found;
+        });
+        fireEvent.drop(panels[1], {
+            dataTransfer: {
+                getData: type => type === 'application/json'
+                    ? JSON.stringify({ path: 'C:\\A\\file1.txt', name: 'file1.txt', isDirectory: false }) : '',
+                files: [],
+            },
+        });
+        await waitFor(() => expect(finishCopy).toBeTypeOf('function'));
+        await act(async () => fireEvent.click(within(panels[1]).getByRole('button', { name: 'E:' })));
+        await waitFor(() => expect(screen.getByTestId('history-path')).toHaveTextContent('E:\\'));
+        await act(async () => finishCopy());
+        expect(within(panels[1]).getByText('E:\\')).toBeInTheDocument();
+        expect(screen.getByTestId('history-path')).toHaveTextContent('E:\\');
     });
 
     test('TP-FE-UI-08: drops into target pane, blocks Shift+F6 move_to_trash on identical paths, and ignores plain F6', async () => {

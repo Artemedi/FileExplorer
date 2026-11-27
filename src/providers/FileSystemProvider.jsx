@@ -121,6 +121,7 @@ export default function FileSystemProvider({ children }) {
                     setRawDirData(sftpData);
                     lastLoadedPathRef.current = path;
                     navigateTo(path);
+                    options.onCommit?.(sftpData);
                     if (watchedPathRef.current) {
                         watchedPathRef.current = null;
                         invoke('unwatch_directory').catch(() => {});
@@ -165,6 +166,7 @@ export default function FileSystemProvider({ children }) {
             setRawDirData(dirData);
             lastLoadedPathRef.current = path;
             navigateTo(path);
+            options.onCommit?.(dirData);
             watchedPathRef.current = path;
             invoke('watch_directory', { path }).catch((err) => {
                 console.warn(`Failed to watch directory: ${path}`, err);

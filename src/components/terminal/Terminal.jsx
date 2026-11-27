@@ -210,14 +210,14 @@ const resolveTerminalCdPath = (targetPath, basePath) => {
  * @param {Function} props.onToggle - Callback function to toggle terminal visibility
  * @returns {React.ReactElement} Terminal component
  */
-const Terminal = ({ isOpen, onToggle }) => {
+const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     const { currentPath, navigateTo } = useHistory();
     const { loadDirectory, getDirectoryRequestId } = useFileSystem();
     const explorerTabs = useContext(ExplorerTabsContext);
     const explorerScope = explorerTabs?.scope;
     // Standalone Terminal consumers have a single implicit Explorer owner.
     const explorerTabId = explorerTabs ? explorerScope.tabId : 'legacy';
-    const explorerHome = explorerTabs?.tabs.find((tab) => tab.id === explorerTabId)?.path === null;
+    const explorerHome = !explorerVisible || explorerTabs?.tabs.find((tab) => tab.id === explorerTabId)?.path === null;
     const explorerHomeRef = useRef(explorerHome);
     explorerHomeRef.current = explorerHome;
     const explorerScopeRef = useRef(null);
@@ -388,7 +388,8 @@ const Terminal = ({ isOpen, onToggle }) => {
         const ownerId = ownerTab?.id;
         if (!ownerTab?.sshConnection || !ownerTab.sshFollowsExplorer ||
             ownerTab.sshExplorerTabId !== (scope ? scope.tabId : 'legacy') ||
-            scope?.switching || explorerHomeRef.current || ownerId !== activeTabIdRef.current || !targetDir) return;
+            scope?.switching || explorerHomeRef.current || ownerId !== activeTabIdRef.current || !targetDir ||
+            explorerSshTabsRef.current.get(getExplorerSshKey(ownerTab.sshExplorerTabId, ownerTab.sshConnection)) !== ownerId) return;
         const normalizedTarget = normalizeRemotePosixPath(targetDir);
         const cur = currentPathRef.current;
         if (!isSftpPathRef.current(cur)) return;
@@ -411,6 +412,7 @@ const Terminal = ({ isOpen, onToggle }) => {
                 activeTabIdRef.current === ownerId &&
                 live?.sshFollowsExplorer &&
                 live.sshExplorerTabId === ownerTab.sshExplorerTabId &&
+                explorerSshTabsRef.current.get(getExplorerSshKey(live.sshExplorerTabId, live.sshConnection)) === ownerId &&
                 live.ptySessionId === ownerTab.ptySessionId &&
                 (!ownerTab.ptySessionId || ptyOwnersRef.current.get(ownerTab.ptySessionId) === ownerId));
         };
@@ -675,6 +677,53 @@ const Terminal = ({ isOpen, onToggle }) => {
         return () => window.removeEventListener('open-ssh-terminal', handleOpenSsh);
     }, []);
 
+    // A binding belongs to a logical tab, not to the underlying shell.
+    // Revoke pending navigation synchronously before changing ownership.
+    const revokeBinding = (tab) => {
+        if (tab.sshFollowsExplorer) {
+            const key = getExplorerSshKey(tab.sshExplorerTabId, tab.sshConnection);
+            if (explorerSshTabsRef.current.get(key) === tab.id) explorerSshTabsRef.current.delete(key);
+        }
+        terminalNavigationRef.current.delete(tab.id);
+        lastFailedSyncDirRef.current.delete(tab.id);
+        forceSyncNextOscRef.current.delete(tab.id);
+        // Keep a pending injected cd until its OSC/prompt arrives; it must
+        // not become a user-originated navigation after reattachment.
+        terminalSelectionRevisionRef.current += 1;
+    };
+
+    const independentBinding = (tab) => ({
+        ...tab,
+        sshExplorerTabId: null,
+        sshFollowsExplorer: false,
+        label: 'SSH: ' + (tab.sshConnection.name || tab.sshConnection.host) + ' #' + tab.id.slice(4),
+        ptyStatus: tab.ptyStatus === 'idle' ? 'stopped' : tab.ptyStatus,
+        ptyDisabledManually: tab.ptyStatus === 'idle' || tab.ptyDisabledManually,
+    });
+
+    const canAttachToExplorer = (tab) => Boolean(tab?.sshConnection && explorerTabs &&
+        explorerTabId && !explorerScope?.switching && !explorerHome && parsedSftp?.connection &&
+        getSshConnectionKey(tab.sshConnection) === getSshConnectionKey(parsedSftp.connection));
+
+    const changeBinding = (tab, attach) => {
+        const scope = explorerScopeRef.current();
+        if (!tab?.sshConnection || activeTabIdRef.current !== tab.id) return;
+        if (attach && (!canAttachToExplorer(tab) || scope !== explorerScope)) return;
+        const key = attach ? getExplorerSshKey(scope.tabId, tab.sshConnection) : null;
+        const previousId = attach ? explorerSshTabsRef.current.get(key) : null;
+        const previous = terminalTabsRef.current.find((item) => item.id === previousId && item.id !== tab.id);
+        revokeBinding(tab);
+        if (previous) revokeBinding(previous);
+        if (attach) explorerSshTabsRef.current.set(key, tab.id);
+        // No PTY starts/stops, input injection, or directory changes here.
+        setTerminalTabs((prev) => prev.map((item) => {
+            if (previous && item.id === previous.id) return independentBinding(item);
+            if (item.id !== tab.id) return item;
+            return attach ? { ...item, sshFollowsExplorer: true, sshExplorerTabId: scope.tabId }
+                : independentBinding(item);
+        }));
+    };
+
     // Closing an Explorer tab unlinks its terminals; it does not close a PTY.
     useEffect(() => {
         if (!explorerTabs) return;
@@ -682,23 +731,9 @@ const Terminal = ({ isOpen, onToggle }) => {
         const detached = terminalTabsRef.current.filter((tab) => tab.sshFollowsExplorer &&
             !liveIds.has(tab.sshExplorerTabId));
         if (detached.length === 0) return;
-        for (const tab of detached) {
-            explorerSshTabsRef.current.delete(getExplorerSshKey(tab.sshExplorerTabId, tab.sshConnection));
-            terminalNavigationRef.current.delete(tab.id);
-            lastFailedSyncDirRef.current.delete(tab.id);
-            forceSyncNextOscRef.current.delete(tab.id);
-        }
+        for (const tab of detached) revokeBinding(tab);
         const ids = new Set(detached.map((tab) => tab.id));
-        setTerminalTabs((prev) => prev.map((tab) => ids.has(tab.id) ? {
-            ...tab,
-            sshExplorerTabId: null,
-            sshFollowsExplorer: false,
-            label: 'SSH: ' + (tab.sshConnection.name || tab.sshConnection.host) + ' #' + tab.id.slice(4),
-            // Do not open a new connection just because an idle Explorer
-            // placeholder lost its owner while the terminal was hidden.
-            ptyStatus: tab.ptyStatus === 'idle' ? 'stopped' : tab.ptyStatus,
-            ptyDisabledManually: tab.ptyStatus === 'idle' || tab.ptyDisabledManually,
-        } : tab));
+        setTerminalTabs((prev) => prev.map((tab) => ids.has(tab.id) ? independentBinding(tab) : tab));
     }, [explorerTabs?.tabs]);
 
     // Same path is not the same Explorer tab. Wait for the selected tab's
@@ -2061,6 +2096,19 @@ const Terminal = ({ isOpen, onToggle }) => {
                         >
                             {ptySessionId ? 'Stop PTY' : activeTab.ptyStatus === 'connecting' ? 'Connecting…' :
                                 ['disconnected', 'error'].includes(activeTab.ptyStatus) ? 'Reconnect' : 'PTY'}
+                        </button>
+                    )}
+                    {activeSshConnection && explorerTabs && (
+                        <button
+                            type="button"
+                            className="terminal-control"
+                            disabled={!activeTab.sshFollowsExplorer && !canAttachToExplorer(activeTab)}
+                            onClick={() => changeBinding(activeTab, !activeTab.sshFollowsExplorer)}
+                            title={activeTab.sshFollowsExplorer
+                                ? 'Unlink from Explorer without closing the shell'
+                                : 'Attach to active Explorer tab (same SSH profile); preserve both shells'}
+                        >
+                            {activeTab.sshFollowsExplorer ? 'Unlink' : 'Attach'}
                         </button>
                     )}
                     {activeSshConnection && ptySessionId && (

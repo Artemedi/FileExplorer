@@ -503,8 +503,10 @@ export default function SftpProvider({ children }) {
 
             // Update active SFTP state only for the current directory request.
             if (options?.isCurrent?.() === false) return null;
-            setCurrentSftpConnection(connection);
-            setCurrentSftpPath(remotePath);
+            if (options.updateActiveState !== false) {
+                setCurrentSftpConnection(connection);
+                setCurrentSftpPath(remotePath);
+            }
 
             return transformedData;
         } catch (error) {
@@ -516,8 +518,10 @@ export default function SftpProvider({ children }) {
                     const elevatedData = await listDirWithSudo(connection, remotePath || '.');
                     if (options?.isCurrent?.() === false) return null;
                     if (elevatedData) {
-                        setCurrentSftpConnection(connection);
-                        setCurrentSftpPath(remotePath || '.');
+                        if (options.updateActiveState !== false) {
+                            setCurrentSftpConnection(connection);
+                            setCurrentSftpPath(remotePath || '.');
+                        }
                         return elevatedData;
                     }
                 } catch (sudoErr) {

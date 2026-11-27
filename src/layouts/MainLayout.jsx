@@ -1380,6 +1380,7 @@ const MainLayout = () => {
                             <Terminal
                                 isOpen={isTerminalOpen}
                                 onToggle={() => setIsTerminalOpen(!isTerminalOpen)}
+                                explorerVisible={currentView === 'explorer'}
                             />
                         </div>
                     </div>
