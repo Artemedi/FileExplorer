@@ -9,6 +9,7 @@ import Icon from '../common/Icon';
 import { ExplorerTabsContext } from '../tabs/TabManager';
 import XtermSshView from './XtermSshView';
 import { joinPath } from '../../utils/pathUtils';
+import { showConfirm, showWarning } from '../../utils/NotificationSystem';
 import {
     buildShellIntegrationCommand,
     consumeOscChunk,
@@ -16,7 +17,6 @@ import {
     extractOscDirectory,
     extractOscPromptState,
     getParentRemoteDirs,
-    isElevationCommand,
     normalizeRemotePosixPath,
 } from '../../utils/terminalOsc';
 import './terminal.css';
@@ -253,11 +253,10 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     const oscBufferRef = useRef(new Map());
     const shellIdleRef = useRef(new Map());
     const shellHookSeenRef = useRef(new Map());
-    const ptyInputLineRef = useRef(new Map());
+    const ptyInputPendingRef = useRef(new Set());
+    const manualHookRequestsRef = useRef(new Map());
     const sshHomeDirRef = useRef(new Map());
     const lastFailedSyncDirRef = useRef(new Map());
-    const pendingElevationReinjectRef = useRef(new Map());
-    const elevationTimerRef = useRef(new Map());
     const forceSyncNextOscRef = useRef(new Set());
 
     const loadDirectoryRef = useRef(loadDirectory);
@@ -344,13 +343,8 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
         oscBufferRef.current.delete(sessionId);
         shellIdleRef.current.delete(sessionId);
         shellHookSeenRef.current.delete(sessionId);
-        ptyInputLineRef.current.delete(sessionId);
-        pendingElevationReinjectRef.current.delete(sessionId);
-        const timer = elevationTimerRef.current.get(sessionId);
-        if (timer) {
-            clearTimeout(timer);
-            elevationTimerRef.current.delete(sessionId);
-        }
+        ptyInputPendingRef.current.delete(sessionId);
+        manualHookRequestsRef.current.delete(sessionId);
     };
 
     const pausePtyInput = (sessionId, queue, error) => {
@@ -363,12 +357,11 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
             item.resolve(false);
         }
         queue.pending.length = 0;
-        ptyInputLineRef.current.delete(sessionId);
+        // The remote line may contain part of a write already submitted.
+        ptyInputPendingRef.current.add(sessionId);
         shellIdleRef.current.set(sessionId, false);
-        pendingElevationReinjectRef.current.delete(sessionId);
-        const timer = elevationTimerRef.current.get(sessionId);
-        if (timer) clearTimeout(timer);
-        elevationTimerRef.current.delete(sessionId);
+        const manualRequest = manualHookRequestsRef.current.get(sessionId);
+        if (manualRequest) manualRequest.cancelled = true;
         updateTab(queue.tabId, (tab) => tab.ptySessionId !== sessionId ? tab : ({
             ...tab,
             ptyWriteError: String(error),
@@ -400,8 +393,14 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     // All sources of PTY input share one bounded, per-session FIFO.
     const writePty = (sessionId, data, userInput = false) => {
         const tabId = ptyOwnersRef.current.get(sessionId);
-        if (!tabId || failedPtyWritesRef.current.has(sessionId)) return Promise.resolve(false);
+        if (!tabId) return Promise.resolve(false);
         if (!data) return Promise.resolve(true);
+        if (userInput) {
+            // Even rejected input must invalidate a deferred hook request.
+            const manualRequest = manualHookRequestsRef.current.get(sessionId);
+            if (manualRequest) manualRequest.cancelled = true;
+        }
+        if (failedPtyWritesRef.current.has(sessionId)) return Promise.resolve(false);
         let queue = ptyInputQueuesRef.current.get(sessionId);
         if (!queue) {
             queue = { tabId, pending: [], active: null, bytes: 0 };
@@ -422,9 +421,55 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
         });
     };
 
+    // A FIFO preserves byte order, not the remote shell's input-line boundary.
+    const canInjectShellInput = (sessionId) => {
+        const queue = ptyInputQueuesRef.current.get(sessionId);
+        return Boolean(ptyOwnersRef.current.has(sessionId) &&
+            !failedPtyWritesRef.current.has(sessionId) &&
+            !ptyInputPendingRef.current.has(sessionId) &&
+            !queue?.active && !queue?.pending.length);
+    };
+
     const injectShellIntegration = (sessionId) => {
-        if (!sessionId) return;
+        if (!canInjectShellInput(sessionId)) return Promise.resolve(false);
+        shellIdleRef.current.set(sessionId, false);
         return writePty(sessionId, buildShellIntegrationCommand());
+    };
+
+    const requestShellIntegration = async (tab) => {
+        const sid = tab.ptySessionId;
+        if (manualHookRequestsRef.current.has(sid)) return;
+        if (!canInjectShellInput(sid)) {
+            showWarning('Finish or cancel the current shell input before enabling directory sync.');
+            return;
+        }
+        // A text prompt or the absence of input is not proof of shell readiness.
+        // The user explicitly confirms a clean, idle prompt for manual recovery.
+        const selection = terminalSelectionRevisionRef.current;
+        const request = { cancelled: false };
+        manualHookRequestsRef.current.set(sid, request);
+        try {
+            const confirmed = await showConfirm(
+                'Enable directory sync by sending a shell integration command. Confirm only at an empty, idle shell prompt, not while a command or password prompt is active.',
+                'Enable SSH directory sync'
+            );
+            if (!confirmed || request.cancelled ||
+                manualHookRequestsRef.current.get(sid) !== request ||
+                terminalSelectionRevisionRef.current !== selection ||
+                activeTabIdRef.current !== tab.id ||
+                ptyOwnersRef.current.get(sid) !== tab.id ||
+                !canInjectShellInput(sid)) return;
+            const live = terminalTabsRef.current.find(t => t.id === tab.id);
+            if (live?.sshFollowsExplorer) {
+                lastFailedSyncDirRef.current.delete(tab.id);
+                forceSyncNextOscRef.current.add(tab.id);
+            }
+            if (!await injectShellIntegration(sid)) forceSyncNextOscRef.current.delete(tab.id);
+        } finally {
+            if (manualHookRequestsRef.current.get(sid) === request) {
+                manualHookRequestsRef.current.delete(sid);
+            }
+        }
     };
 
     const fetchHomeDirForTab = async (tabId, conn) => {
@@ -444,9 +489,8 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     const setupPtySessionHooks = (tabId, conn, sessionId) => {
         if (!sessionId) return;
         fetchHomeDirForTab(tabId, conn);
-        setTimeout(() => {
-            if (ptyOwnersRef.current.get(sessionId) === tabId) injectShellIntegration(sessionId);
-        }, 350);
+        // A shell without OSC integration must be enabled explicitly.
+        // A shell already emitting prompt markers needs no bootstrap command.
     };
 
     const syncExplorerToRemoteDir = async (ownerTab, targetDir, forceRetry = false) => {
@@ -530,23 +574,14 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
 
     const trackPtyUserInput = (sessionId, data) => {
         if (!sessionId || !data) return;
-        let line = ptyInputLineRef.current.get(sessionId) || '';
-        for (const ch of data) {
-            if (ch === '\r' || ch === '\n') {
-                shellIdleRef.current.set(sessionId, false);
-                if (isElevationCommand(line)) {
-                    pendingElevationReinjectRef.current.set(sessionId, true);
-                }
-                line = '';
-            } else if (ch === '\x7f' || ch === '\b') {
-                line = line.slice(0, -1);
-            } else if (ch === '\x03' || ch === '\x15') {
-                line = '';
-            } else if (ch >= ' ') {
-                line += ch;
-            }
+        shellIdleRef.current.set(sessionId, false);
+        // Treat editing/control keys as input too. Do not try to emulate
+        // readline, raw-mode applications or remote shell editing state.
+        if (/[\r\n\x03]$/.test(data) && !data.includes('\x1b')) {
+            ptyInputPendingRef.current.delete(sessionId);
+        } else {
+            ptyInputPendingRef.current.add(sessionId);
         }
-        ptyInputLineRef.current.set(sessionId, line.slice(-256));
     };
 
     useEffect(() => {
@@ -589,32 +624,10 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                     if (promptState) {
                         shellHookSeenRef.current.set(payload.session_id, true);
                         shellIdleRef.current.set(payload.session_id, promptState === 'idle');
-                        if (promptState === 'idle') {
-                            pendingElevationReinjectRef.current.delete(payload.session_id);
-                        }
                     }
 
-                    // Re-inject shell hook after sudo -i / su reaches the elevated shell prompt
-                    if (pendingElevationReinjectRef.current.get(payload.session_id)) {
-                        const plainChunk = stripAnsiCodes(payload.data);
-                        if (!/password|пароль|passphrase|try again/i.test(plainChunk) &&
-                            /(?:^|\n)[^\r\n]*(?:#|\$|>|%)\s*$/.test(plainChunk)
-                        ) {
-                            const prevTimer = elevationTimerRef.current.get(payload.session_id);
-                            if (prevTimer) clearTimeout(prevTimer);
-                            const sidToReinject = payload.session_id;
-                            elevationTimerRef.current.set(
-                                sidToReinject,
-                                setTimeout(() => {
-                                    elevationTimerRef.current.delete(sidToReinject);
-                                    if (pendingElevationReinjectRef.current.get(sidToReinject)) {
-                                        pendingElevationReinjectRef.current.delete(sidToReinject);
-                                        injectShellIntegration(sidToReinject);
-                                    }
-                                }, 180)
-                            );
-                        }
-                    }
+                    // Elevation and arbitrary foreground programs are not reliably
+                    // identifiable from terminal text. Recovery is explicit Sync.
 
                     // Follow directory changes emitted by remote shell (OSC 7 / OSC 0/2)
                     const ownerTab = terminalTabsRef.current.find((t) => t.ptySessionId === payload.session_id);
@@ -864,8 +877,8 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                 rawTarget && rawTarget !== '.' &&
                 shellHookSeenRef.current.get(sid) === true &&
                 shellIdleRef.current.get(sid) === true &&
-                !ptyInputLineRef.current.get(sid) && !explorerCdRef.current.has(sid) &&
-                !ptyInputQueuesRef.current.get(sid)?.active && !ptyInputQueuesRef.current.get(sid)?.pending.length
+                !explorerCdRef.current.has(sid) &&
+                !manualHookRequestsRef.current.has(sid) && canInjectShellInput(sid)
             ) {
                 const normalizedTarget = normalizeRemotePosixPath(rawTarget);
                 const currentPtyDir = existingTab.sshWorkingDir && existingTab.sshWorkingDir !== '.'
@@ -1080,7 +1093,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
 
         try {
             if (ptySessionId) {
-                const accepted = await writePty(ptySessionId, `${command}\n`);
+                const accepted = await writePty(ptySessionId, `${command}\n`, true);
                 return accepted ? null : { type: 'error', content: 'SSH PTY input was not accepted' };
             }
             if (activeSshConnection) {
@@ -2220,16 +2233,10 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                         <button
                             type="button"
                             className="terminal-control"
-                            onClick={() => {
-                                if (activeTab.sshFollowsExplorer) {
-                                    lastFailedSyncDirRef.current.delete(activeTab.id);
-                                    forceSyncNextOscRef.current.add(activeTab.id);
-                                }
-                                injectShellIntegration(ptySessionId);
-                            }}
+                            onClick={() => requestShellIntegration(activeTab)}
                             title={activeTab.sshFollowsExplorer
-                                ? 'Re-enable directory sync hook in current shell (useful after sudo/su)'
-                                : 'Refresh working directory hook in this independent shell'}
+                                ? 'Enable directory sync at an empty shell prompt (also after sudo/su)'
+                                : 'Enable working directory hook at an empty shell prompt'}
                         >
                             {activeTab.sshFollowsExplorer ? 'Sync' : 'Refresh CWD'}
                         </button>

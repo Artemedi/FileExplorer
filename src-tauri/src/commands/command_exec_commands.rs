@@ -572,17 +572,31 @@ mod command_exec_tests {
         assert_eq!(prepare_ping_command("ping", true), "ping");
     }
 
+    #[test]
+    fn compound_ping_does_not_append_count_to_trailing_command_tp_sec_01() {
+        // No explicit count: these cases must exercise the metacharacter guard.
+        for (command, is_windows) in [
+            ("ping 127.0.0.1 | Out-Null; Write-Output 'marker'", true),
+            ("ping.exe 127.0.0.1; Write-Output 'marker'", true),
+            ("ping 127.0.0.1 >/dev/null 2>&1; echo marker", false),
+        ] {
+            assert_eq!(prepare_ping_command(command, is_windows), command);
+        }
+    }
+
     #[tokio::test]
-    async fn compound_ping_does_not_append_count_to_trailing_command_tp_sec_01() {
+    async fn compound_shell_command_preserves_trailing_output_tp_sec_01() {
+        // Exercise the real executor without depending on an ICMP subprocess.
         let cmd = if cfg!(target_os = "windows") {
-            "ping -n 1 127.0.0.1 | Out-Null; Write-Output 'marker'".to_string()
+            "Write-Output 'discard' | Out-Null; Write-Output 'marker'".to_string()
         } else {
-            "ping -c 1 127.0.0.1 >/dev/null 2>&1; echo marker".to_string()
+            "printf discard >/dev/null; printf marker".to_string()
         };
-        let res = execute_command_with_timeout(cmd, None, Some(10))
+        let res = execute_command_with_timeout(cmd, None, None)
             .await
             .expect("compound command should succeed");
         let parsed: CommandResponse = from_str(&res).expect("valid CommandResponse JSON");
+        assert_eq!(parsed.status, 0);
         assert_eq!(parsed.stdout.trim(), "marker");
     }
 

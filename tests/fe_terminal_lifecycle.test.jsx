@@ -44,10 +44,15 @@ vi.mock('../src/components/terminal/XtermSshView', () => ({
             mockRegister(sessionId, () => registerController(sessionId, { write: (data) => mockWrite(data, sessionId), getBufferText: mockSnapshot, flushBufferText: mockFlush }));
             return () => registerController(sessionId, null);
         }, [sessionId]);
-        return <div data-testid={sessionId} style={{ display: isVisible ? undefined : "none" }}><button onClick={() => onData("test input")}>Send input</button><button onClick={() => onData("界".repeat(350000))}>Send oversized input</button></div>;
+        return <div data-testid={sessionId} style={{ display: isVisible ? undefined : "none" }}><button onClick={() => onData("test input")}>Send input</button><button onClick={() => onData("sudo -i\r")}>Elevate</button><button onClick={() => onData("\x1b[A")}>Send cursor key</button><button onClick={() => onData("\x01")}>Send control key</button><button onClick={() => onData("\r")}>Submit input</button><button onClick={() => onData("界".repeat(350000))}>Send oversized input</button></div>;
     },
 }));
 
+vi.mock('../src/utils/NotificationSystem', () => ({
+    showConfirm: vi.fn(),
+    showWarning: vi.fn(),
+}));
+import { showConfirm, showWarning } from '../src/utils/NotificationSystem';
 import Terminal from '../src/components/terminal/Terminal';
 import { ExplorerTabsContext } from '../src/components/tabs/TabManager';
 
@@ -59,6 +64,8 @@ describe('TERM-R1 PTY lifecycle', () => {
         vi.clearAllMocks();
         listeners = {};
         mockInvoke.mockResolvedValue(null);
+        showConfirm.mockReset().mockResolvedValue(true);
+        showWarning.mockClear();
         mockSnapshot.mockReset().mockReturnValue('');
         mockFlush.mockReset().mockResolvedValue('');
         mockRegister.mockReset().mockImplementation((_, register) => register());
@@ -226,6 +233,104 @@ describe('TERM-R1 PTY lifecycle', () => {
         await screen.findByRole('button', { name: 'Reconnect' });
         expect(screen.getByText(/SSH startup output truncated/)).toBeInTheDocument();
         expect(screen.getByText('newest parsed line')).toBeInTheDocument();
+    });
+
+    test('AUDIT-008: scheduled shell integration must not submit an automatic command while user has a partial line', async () => {
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name: 'Send input' }));
+        expect(mockInvoke).toHaveBeenCalledWith('ssh_write_pty', { sessionId: 'pty-1', data: 'test input' });
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]133;A\x07' });
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 450)); });
+        const writes = mockInvoke.mock.calls.filter(([cmd, args]) => cmd === 'ssh_write_pty' && args.sessionId === 'pty-1').map(([, args]) => args.data);
+        console.log('AUDIT-008 writes:', writes.map(data => data === 'test input' ? 'user partial line' : 'automatic command'));
+        expect(writes).toEqual(['test input']);
+    });
+
+    test.each(['Send cursor key', 'Submit input'])('R3.5: startup hook yields to user input (%s)', async (name) => {
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name }));
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]133;A\x07' });
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 450)); });
+        const writes = mockInvoke.mock.calls.filter(([cmd, args]) => cmd === 'ssh_write_pty' && args.sessionId === 'pty-1');
+        expect(writes).toHaveLength(1);
+    });
+
+    test('R3.5: elevated prompt lookalike must not trigger automatic shell input', async () => {
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]133;A\x07' });
+        await act(async () => {});
+        mockInvoke.mockClear();
+        fireEvent.click(screen.getByRole('button', { name: 'Elevate' }));
+        emit('ssh-pty-output', { session_id: 'pty-1', data: 'root@db:# ' });
+        fireEvent.click(screen.getByRole('button', { name: 'Send input' }));
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 250)); });
+        const writes = mockInvoke.mock.calls.filter(([cmd, args]) => cmd === 'ssh_write_pty' && args.sessionId === 'pty-1').map(([,args]) => args.data);
+        expect(writes).toEqual(['sudo -i\r', 'test input']);
+    });
+
+    test('R3.5: existing prompt integration does not trigger a redundant hook', async () => {
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]133;A\x07' });
+        await act(async () => {});
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]133;A\x07' });
+        await act(async () => {});
+        const writes = mockInvoke.mock.calls.filter(([cmd, args]) => cmd === 'ssh_write_pty' && args.sessionId === 'pty-1').map(([,args]) => args.data);
+        expect(writes).toEqual([]);
+    });
+
+    test('R3.5: manual Sync never appends to partial input', async () => {
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name: 'Send input' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Sync', exact: true }));
+        await act(async () => {});
+        const writes = mockInvoke.mock.calls.filter(([cmd, args]) => cmd === 'ssh_write_pty' && args.sessionId === 'pty-1').map(([,args]) => args.data);
+        expect(writes).toEqual(['test input']);
+    });
+
+    test('R3.5: unverified startup does not inject; manual Sync requires confirmation', async () => {
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        emit('ssh-pty-output', { session_id: 'pty-1', data: 'Password: ' });
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 450)); });
+        expect(mockInvoke.mock.calls.filter(([cmd]) => cmd === 'ssh_write_pty')).toHaveLength(0);
+        showConfirm.mockResolvedValueOnce(false);
+        await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Sync', exact: true })));
+        expect(showConfirm).toHaveBeenCalledTimes(1);
+        expect(mockInvoke.mock.calls.filter(([cmd]) => cmd === 'ssh_write_pty')).toHaveLength(0);
+        await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Sync', exact: true })));
+        const writes = mockInvoke.mock.calls.filter(([cmd]) => cmd === 'ssh_write_pty');
+        expect(writes).toHaveLength(1);
+        expect(writes[0][1].data).toContain('__explr_osc7');
+    });
+
+    test('R3.5: pending manual confirmation is invalidated by subsequent user input', async () => {
+        let resolve;
+        showConfirm.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name: 'Sync', exact: true }));
+        await waitFor(() => expect(resolve).toBeTypeOf('function'));
+        fireEvent.click(screen.getByRole('button', { name: 'Submit input' }));
+        await act(async () => resolve(true));
+        expect(mockInvoke.mock.calls.filter(([cmd]) => cmd === 'ssh_write_pty').map(([,args]) => args.data)).toEqual(['\r']);
+    });
+
+    test('R3.5: stale idle marker cannot allow automatic cd over a partial line', async () => {
+        const { rerender } = render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]133;A\x07' });
+        await act(async () => {});
+        fireEvent.click(screen.getByRole('button', { name: 'Send control key' }));
+        await act(async () => {});
+        emit('ssh-pty-output', { session_id: 'pty-1', data: '\x1b]133;A\x07' });
+        mockNavigation.path = 'sftp:Test:/next';
+        rerender(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        expect(mockInvoke.mock.calls.filter(([cmd,args]) => cmd === 'ssh_write_pty' && args.data.startsWith(' cd -- '))).toHaveLength(0);
     });
 
     test('rejected input is visible, pauses subsequent input and is never replayed', async () => {
