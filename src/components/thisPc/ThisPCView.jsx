@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useContext } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileSystem } from '../../providers/FileSystemProvider';
-import { useHistory } from '../../providers/HistoryProvider';
+import { ExplorerTabsContext } from '../tabs/TabManager';
 import { formatFileSize } from '../../utils/formatters';
 import './thisPc.css';
 import {showConfirm, showError, showSuccess} from "../../utils/NotificationSystem.js";
@@ -17,7 +17,7 @@ const ThisPCView = () => {
     const [systemInfo, setSystemInfo] = useState(null);
     const [isLoading, setIsLoading] = useState(true);
     const { volumes, loadDirectory, loadVolumes } = useFileSystem();
-    const { navigateTo } = useHistory();
+    const explorerTabs = useContext(ExplorerTabsContext);
 
     // Common folders for different operating systems
     const [userFolders, setUserFolders] = useState([]);
@@ -277,10 +277,15 @@ const ThisPCView = () => {
     const handleFolderClick = async (path) => {
         console.log('Clicking folder with path:', path);
         try {
-            const ok = await loadDirectory(path);
-            if (ok) {
-                navigateTo(path);
-            }
+            const owner = explorerTabs?.getScope();
+            if (owner?.switching) return;
+            await loadDirectory(path, {
+                isCurrent: () => !owner || explorerTabs.getScope() === owner,
+                onCommit: () => {
+                    explorerTabs?.commitDirectory(owner, path);
+                    document.dispatchEvent(new CustomEvent('force-explorer-view'));
+                },
+            });
         } catch (error) {
             console.error('Failed to navigate to folder:', error);
             showError(`Cannot access ${path}. The folder may not exist or is inaccessible.`);

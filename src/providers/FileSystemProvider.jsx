@@ -35,7 +35,8 @@ export default function FileSystemProvider({ children }) {
     const loadRequestIdRef = useRef(0);
     const activeMountTokenRef = useRef(0);
     const watchedPathRef = useRef(null);
-    const initInFlightRef = useRef(false);
+    const initInFlightRef = useRef(null);
+    const mountedRef = useRef(false);
 
     const { navigateTo, revertToPath, currentPath } = useHistory();
     const { settings } = useSettings();
@@ -67,14 +68,16 @@ export default function FileSystemProvider({ children }) {
     }, [rawDirData, settings.show_hidden_files_and_folders]);
 
     // Load system volumes information
-    const loadVolumes = useCallback(async () => {
+    const loadVolumes = useCallback(async (options = {}) => {
         try {
             const volumesJson = await invoke('get_system_volumes_information_as_json');
             const volumesData = JSON.parse(volumesJson);
             const list = Array.isArray(volumesData) ? volumesData : [];
+            if (options?.isCurrent?.() === false) return [];
             setVolumes(list);
             return list;
         } catch (err) {
+            if (options?.isCurrent?.() === false) return [];
             console.error('Failed to load volumes:', err);
             setError(`Failed to load volumes: ${formatErrorMessage(err)}`);
             setVolumes([]);
@@ -206,12 +209,11 @@ export default function FileSystemProvider({ children }) {
         }
     }, [navigateTo, isSftpPath, loadSftpDirectory]);
 
-    const getDefaultDirectory = useCallback(async () => {
-        setIsLoading(true);
-
+    const getDefaultDirectory = useCallback(async (isCurrent) => {
         try {
             try {
                 const initialCliPath = await invoke('get_initial_cli_path');
+                if (!isCurrent()) return null;
                 if (initialCliPath) {
                     console.log(`Using initial CLI path: ${initialCliPath}`);
                     return initialCliPath;
@@ -220,12 +222,14 @@ export default function FileSystemProvider({ children }) {
                 console.warn('Could not retrieve CLI path:', cliErr);
             }
 
+            if (!isCurrent()) return null;
             if (settings.default_folder_path_on_opening && settings.default_folder_path_on_opening.trim()) {
                 return settings.default_folder_path_on_opening.trim();
             }
 
             console.log('Attempting to load volumes...');
-            const volumesList = await loadVolumes();
+            const volumesList = await loadVolumes({ isCurrent });
+            if (!isCurrent()) return null;
 
             if (volumesList && volumesList.length > 0) {
                 console.log(`Found volumes, using first mount point: ${volumesList[0].mount_point}`);
@@ -236,9 +240,11 @@ export default function FileSystemProvider({ children }) {
             const commonPaths = ['C:\\', '/Users', '/home'];
 
             for (const path of commonPaths) {
+                if (!isCurrent()) return null;
                 console.log(`Checking if path is accessible: ${path}`);
                 try {
                     const result = await invoke('open_directory', { path });
+                    if (!isCurrent()) return null;
                     if (result) {
                         console.log(`Successfully found accessible path: ${path}`);
                         return path;
@@ -248,6 +254,7 @@ export default function FileSystemProvider({ children }) {
                 }
             }
 
+            if (!isCurrent()) return null;
             console.warn('All paths failed, using hardcoded default');
             return '/';
         } catch (err) {
@@ -257,50 +264,70 @@ export default function FileSystemProvider({ children }) {
     }, [loadVolumes, settings.default_folder_path_on_opening]);
 
     const initializeFirstDirectory = useCallback(async () => {
-        if (initInFlightRef.current) return;
-        initInFlightRef.current = true;
+        // Startup must never claim ownership after an explicit request started.
+        if (initInFlightRef.current || loadRequestIdRef.current !== 0) return;
+        const attempt = {};
+        initInFlightRef.current = attempt;
+        let requestId = loadRequestIdRef.current;
+        const ownsAttempt = () => mountedRef.current && initInFlightRef.current === attempt;
+        const isCurrent = () => ownsAttempt() && requestId === loadRequestIdRef.current;
+        const loadInitialDirectory = (path) => {
+            if (!path || !isCurrent()) return Promise.resolve(false);
+            const pending = loadDirectory(path, { isCurrent: ownsAttempt });
+            requestId += 1;
+            return pending;
+        };
+        setIsLoading(true);
         console.log('Initializing first directory...');
 
         const timeoutId = setTimeout(() => {
+            if (!isCurrent()) return;
+            // Revoke an outstanding initial listing too, not only its spinner.
+            loadRequestIdRef.current += 1;
+            initInFlightRef.current = null;
             console.error('Directory initialization timed out');
             setIsLoading(false);
             setError('Failed to initialize directory within the time limit');
         }, 10000);
 
         try {
-            const defaultDir = await getDefaultDirectory();
+            const defaultDir = await getDefaultDirectory(isCurrent);
+            if (!isCurrent()) return;
             console.log(`Got default directory: ${defaultDir}`);
 
-            const reqBefore = loadRequestIdRef.current;
-            const success = await loadDirectory(defaultDir);
+            const success = await loadInitialDirectory(defaultDir);
 
-            if (!success && loadRequestIdRef.current === reqBefore + 1) {
+            if (!success && isCurrent()) {
                 console.warn('First directory load failed, trying fallbacks...');
                 const fallbacks = ['/', 'C:\\', '/tmp'];
 
                 for (const fallback of fallbacks) {
+                    if (!isCurrent()) break;
                     if (fallback !== defaultDir) {
-                        const fallbackReqBefore = loadRequestIdRef.current;
                         console.log(`Trying fallback directory: ${fallback}`);
-                        if (await loadDirectory(fallback)) {
+                        if (await loadInitialDirectory(fallback)) {
                             console.log(`Successfully loaded fallback directory: ${fallback}`);
-                            break;
-                        }
-                        if (loadRequestIdRef.current !== fallbackReqBefore + 1) {
                             break;
                         }
                     }
                 }
             }
         } catch (err) {
-            console.error('Failed to initialize directory:', err);
-            setError('Failed to load any directory. Please check file system permissions.');
+            if (isCurrent()) {
+                console.error('Failed to initialize directory:', err);
+                setError('Failed to load any directory. Please check file system permissions.');
+            }
         } finally {
-            initInFlightRef.current = false;
             clearTimeout(timeoutId);
-            setIsLoading(false);
+            if (isCurrent()) setIsLoading(false);
+            if (initInFlightRef.current === attempt) initInFlightRef.current = null;
         }
     }, [getDefaultDirectory, loadDirectory]);
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => { mountedRef.current = false; };
+    }, []);
 
     // Initialize only when no directory or restored history path exists
     useEffect(() => {
