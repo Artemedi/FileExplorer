@@ -4,6 +4,7 @@ use crate::log_info;
 use crate::models::SFTPDirectory;
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use socket2::{SockRef, TcpKeepalive};
 use ssh2::{FileStat, Session, Sftp};
 use std::collections::HashMap;
 use std::fs;
@@ -16,6 +17,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SFTP_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const SFTP_SSH_SESSION_TIMEOUT_MS: u32 = 30_000;
+const PTY_KEEPALIVE_IDLE_SECS: u64 = 15;
+const PTY_KEEPALIVE_INTERVAL_SECS: u64 = 5;
+#[cfg(any(target_os = "linux", windows))]
+const PTY_KEEPALIVE_PROBES: u32 = 3;
+#[cfg(any(target_os = "linux", windows))]
+const PTY_TCP_TIMEOUT_SECS: u32 = 30;
 const MAX_OPEN_FILE_SFTP_BYTES: usize = 10 * 1024 * 1024; // 10 MiB max for text open
 const MAX_PREVIEW_IMAGE_BYTES: usize = 6 * 1024 * 1024; // 6 MiB max for image preview
 const MAX_PREVIEW_PDF_BYTES: usize = 12 * 1024 * 1024; // 12 MiB max for PDF preview
@@ -443,8 +450,111 @@ pub fn persist_trusted_host_key_to_path(
         .map_err(|e| format!("Failed to write sftp_known_hosts: {e}"))
 }
 
+// Transport liveness, not shell activity: a healthy idle shell or long
+// command remains connected as long as its TCP peer acknowledges packets.
+fn configure_pty_transport(tcp: &TcpStream) -> std::io::Result<()> {
+    let socket = SockRef::from(tcp);
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(PTY_KEEPALIVE_IDLE_SECS))
+        .with_interval(Duration::from_secs(PTY_KEEPALIVE_INTERVAL_SECS));
+    #[cfg(target_os = "linux")]
+    let keepalive = keepalive.with_retries(PTY_KEEPALIVE_PROBES);
+    socket.set_tcp_keepalive(&keepalive)?;
+
+    // Keepalive alone does not bound the lifetime of unacknowledged writes.
+    #[cfg(target_os = "linux")]
+    socket.set_tcp_user_timeout(Some(Duration::from_secs(u64::from(PTY_TCP_TIMEOUT_SECS))))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, WSAGetLastError, IPPROTO_TCP, SOCKET_ERROR, TCP_KEEPCNT, TCP_MAXRT,
+        };
+        // socket2 0.5 sets the idle and interval values on Windows but
+        // does not expose the probe count or TCP retransmission timeout.
+        for (option, value) in [
+            (TCP_KEEPCNT, PTY_KEEPALIVE_PROBES),
+            (TCP_MAXRT, PTY_TCP_TIMEOUT_SECS),
+        ] {
+            // SAFETY: tcp owns a live Winsock socket, and each option takes
+            // a DWORD. The pointer is valid for this synchronous call.
+            let result = unsafe {
+                setsockopt(
+                    tcp.as_raw_socket() as _,
+                    IPPROTO_TCP,
+                    option,
+                    (&value as *const u32).cast(),
+                    std::mem::size_of::<u32>() as i32,
+                )
+            };
+            if result == SOCKET_ERROR {
+                return Err(std::io::Error::from_raw_os_error(unsafe {
+                    WSAGetLastError()
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn pty_transport_enables_bounded_tcp_liveness() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (_peer, _) = listener.accept().unwrap();
+    let socket = SockRef::from(&client);
+    assert!(!socket.keepalive().unwrap());
+    configure_pty_transport(&client).unwrap();
+    assert!(socket.keepalive().unwrap());
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(
+            socket.keepalive_time().unwrap(),
+            Duration::from_secs(PTY_KEEPALIVE_IDLE_SECS)
+        );
+        assert_eq!(
+            socket.keepalive_interval().unwrap(),
+            Duration::from_secs(PTY_KEEPALIVE_INTERVAL_SECS)
+        );
+        assert_eq!(socket.keepalive_retries().unwrap(), PTY_KEEPALIVE_PROBES);
+        assert_eq!(
+            socket.tcp_user_timeout().unwrap(),
+            Some(Duration::from_secs(u64::from(PTY_TCP_TIMEOUT_SECS)))
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            getsockopt, IPPROTO_TCP, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXRT,
+        };
+        for (option, expected) in [
+            (TCP_KEEPIDLE, PTY_KEEPALIVE_IDLE_SECS as u32),
+            (TCP_KEEPINTVL, PTY_KEEPALIVE_INTERVAL_SECS as u32),
+            (TCP_KEEPCNT, PTY_KEEPALIVE_PROBES),
+            (TCP_MAXRT, PTY_TCP_TIMEOUT_SECS),
+        ] {
+            let mut value = 0u32;
+            let mut len = std::mem::size_of::<u32>() as i32;
+            // SAFETY: live socket and writable DWORD/length for getsockopt.
+            let result = unsafe {
+                getsockopt(
+                    client.as_raw_socket() as _,
+                    IPPROTO_TCP,
+                    option,
+                    (&mut value as *mut u32).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(result, 0, "getsockopt failed for {option}");
+            assert_eq!(value, expected, "socket option {option}");
+        }
+    }
+}
+
 fn connect_ssh_session(host: &str, port: u16) -> Result<(Session, String), String> {
-    connect_ssh_session_with_compression(host, port, false)
+    connect_ssh_session_with_compression(host, port, false, false)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -471,6 +581,7 @@ fn connect_ssh_session_with_compression(
     host: &str,
     port: u16,
     compress: bool,
+    pty_transport: bool,
 ) -> Result<(Session, String), String> {
     let trimmed_host = host.trim();
     if trimmed_host.is_empty() {
@@ -518,6 +629,10 @@ fn connect_ssh_session_with_compression(
         let _ = tcp.set_read_timeout(Some(io_timeout));
         let _ = tcp.set_write_timeout(Some(io_timeout));
         let _ = tcp.set_nodelay(true);
+        if pty_transport {
+            configure_pty_transport(&tcp)
+                .map_err(|e| format!("Failed to configure SSH PTY transport liveness: {e}"))?;
+        }
 
         let mut session =
             Session::new().map_err(|_| "Could not initialize SSH session".to_string())?;
@@ -599,6 +714,7 @@ pub(crate) fn connect_authenticated_ssh_session(
     username: &str,
     password: String,
     options: &SshAuthOptions,
+    pty_transport: bool,
 ) -> Result<Session, String> {
     let trimmed_user = username.trim();
     let auth_mode = options
@@ -640,8 +756,12 @@ pub(crate) fn connect_authenticated_ssh_session(
         }
     };
 
-    let (session, live_fingerprint) =
-        connect_ssh_session_with_compression(host, port, options.should_compress_transport())?;
+    let (session, live_fingerprint) = connect_ssh_session_with_compression(
+        host,
+        port,
+        options.should_compress_transport(),
+        pty_transport,
+    )?;
 
     // Verify SSH host key BEFORE sending credentials to prevent MITM credential interception
     let known_contents = load_known_hosts_contents();
@@ -785,7 +905,8 @@ pub(crate) fn connect_to_sftp_with_options(
     password: String,
     options: &SshAuthOptions,
 ) -> Result<Sftp, String> {
-    let session = connect_authenticated_ssh_session(&host, port, &username, password, options)?;
+    let session =
+        connect_authenticated_ssh_session(&host, port, &username, password, options, false)?;
     session.sftp().map_err(|e| e.to_string())
 }
 

@@ -1221,6 +1221,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smallvec",
+ "socket2",
  "ssh2",
  "sysinfo",
  "tauri",
@@ -1233,6 +1234,7 @@ dependencies = [
  "tokio",
  "trash",
  "walkdir",
+ "windows-sys 0.52.0",
  "zip",
  "zstd",
 ]
