@@ -48,6 +48,7 @@ const TabManager = ({ children }) => {
     const tabsRef = useRef(tabs);
     tabsRef.current = tabs;
     const currentPathRef = useRef(currentPath);
+    const observedPathRef = useRef(currentPath);
     currentPathRef.current = currentPath;
     const settledTabIdRef = useRef(activeTabId);
     const [scope, setScope] = useState({ tabId: null, revision: 0, switching: false });
@@ -184,6 +185,10 @@ const TabManager = ({ children }) => {
      * Update active tab when path changes (never triggered by activeTabId change alone)
      */
     useEffect(() => {
+        // The initial History snapshot is not a new navigation. In particular,
+        // it must not overwrite a restored Home tab's null path.
+        if (observedPathRef.current === currentPath) return;
+        observedPathRef.current = currentPath;
         const targetTabId = activeTabIdRef.current;
         if (currentPath && targetTabId && !scopeRef.current.switching) {
             setTabs(prevTabs =>

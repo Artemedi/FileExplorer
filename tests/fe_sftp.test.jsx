@@ -3,11 +3,12 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { act, cleanup, render, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
-const { mockInvoke, mockShowConfirm, mockShowError, mockShowSuccess } = vi.hoisted(() => ({
+const { mockInvoke, mockShowConfirm, mockShowError, mockShowSuccess, mockShowPasswordPrompt } = vi.hoisted(() => ({
     mockInvoke: vi.fn(),
     mockShowConfirm: vi.fn(),
     mockShowError: vi.fn(),
-    mockShowSuccess: vi.fn()
+    mockShowSuccess: vi.fn(),
+    mockShowPasswordPrompt: vi.fn()
 }));
 
 vi.mock('@tauri-apps/api/core', () => ({
@@ -17,7 +18,8 @@ vi.mock('@tauri-apps/api/core', () => ({
 vi.mock('../src/utils/NotificationSystem', () => ({
     showConfirm: mockShowConfirm,
     showError: mockShowError,
-    showSuccess: mockShowSuccess
+    showSuccess: mockShowSuccess,
+    showPasswordPrompt: mockShowPasswordPrompt
 }));
 
 import SftpProvider, { useSftp } from '../src/providers/SftpProvider';
@@ -47,6 +49,7 @@ describe('SftpProvider (BUG-007, BUG-026, TP-FE-STATE-01, TP-FE-STATE-06, TP-IPC
         mockShowConfirm.mockReset();
         mockShowError.mockReset();
         mockShowSuccess.mockReset();
+        mockShowPasswordPrompt.mockReset();
     });
 
     afterEach(() => {
@@ -145,6 +148,61 @@ describe('SftpProvider (BUG-007, BUG-026, TP-FE-STATE-01, TP-FE-STATE-06, TP-IPC
         });
         expect(getApi().currentSftpConnection.name).toBe('B');
         expect(getApi().currentSftpPath).toBe('/new');
+    });
+
+    test('AUDIT: stale directory request must not open a new trust dialog', async () => {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify([
+            { name: 'A', host: 'a.invalid', port: 22, username: 'test' },
+            { name: 'B', host: 'b.invalid', port: 22, username: 'test' },
+        ]));
+        let rejectOld;
+        mockShowConfirm.mockResolvedValue(false);
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'load_dir') {
+                if (args.host === 'a.invalid') return new Promise((_, reject) => { rejectOld = reject; });
+                return JSON.stringify({ directories: [], files: [] });
+            }
+            return null;
+        });
+        const { getApi } = renderSftpHarness();
+        let current = true;
+        let pending;
+        act(() => { pending = getApi().loadSftpDirectory('sftp:A:/old', { isCurrent: () => current }); });
+        await waitFor(() => expect(rejectOld).toBeTypeOf('function'));
+        current = false;
+        await act(async () => { await getApi().loadSftpDirectory('sftp:B:/new'); });
+        await act(async () => { rejectOld('HOST_KEY_UNTRUSTED:SHA256:fixture'); await pending; });
+        expect(getApi().currentSftpConnection.name).toBe('B');
+        expect(mockShowConfirm).not.toHaveBeenCalled();
+    });
+
+    test.each(['trust', 'sudo'])('R3.4: stale %s confirmation cannot start another IPC operation', async (kind) => {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify([
+            { name: 'A', host: 'a.invalid', port: 22, username: 'test' },
+            { name: 'B', host: 'b.invalid', port: 22, username: 'test' },
+        ]));
+        let confirm;
+        const prompt = kind === 'trust' ? mockShowConfirm : mockShowPasswordPrompt;
+        prompt.mockImplementationOnce(() => new Promise(resolve => { confirm = resolve; }));
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'load_dir') {
+                if (args.host === 'a.invalid') throw new Error(kind === 'trust'
+                    ? 'HOST_KEY_UNTRUSTED:SHA256:fixture' : 'Permission denied');
+                return JSON.stringify({ directories: [], files: [] });
+            }
+            return null;
+        });
+        const { getApi } = renderSftpHarness();
+        let current = true;
+        let pending;
+        act(() => { pending = getApi().loadSftpDirectory('sftp:A:/old', { isCurrent: () => current }); });
+        await waitFor(() => expect(confirm).toBeTypeOf('function'));
+        current = false;
+        await act(async () => { await getApi().loadSftpDirectory('sftp:B:/new'); });
+        await act(async () => { confirm(kind === 'trust' ? true : 'fixture-password'); expect(await pending).toBeNull(); });
+        expect(getApi().currentSftpConnection.name).toBe('B');
+        expect(mockInvoke.mock.calls.filter(([cmd]) => cmd === 'trust_sftp_host_key' || cmd === 'ssh_sudo_exec')).toHaveLength(0);
+        expect(mockInvoke.mock.calls.filter(([cmd, args]) => cmd === 'load_dir' && args.host === 'a.invalid')).toHaveLength(1);
     });
 
     test('TP-FE-STATE-06: parseSftpPath handles @ in path, : in connection name, and numeric port in sftp:// URLs', async () => {

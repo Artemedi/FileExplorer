@@ -192,13 +192,18 @@ export default function SftpProvider({ children }) {
      * Invokes a Rust SFTP command with port validation, credential migration sync,
      * and interactive HOST_KEY_UNTRUSTED verification/retry.
      */
-    const invokeSftp = useCallback(async (command, connection, extraArgs = {}) => {
+    const invokeSftp = useCallback(async (command, connection, extraArgs = {}, isCurrent) => {
+        const assertCurrent = () => {
+            if (isCurrent?.() === false) throw new Error('SFTP navigation superseded');
+        };
+        assertCurrent();
         const portNum = parseSftpPort(connection?.port);
         if (portNum === null) {
             throw new Error(`Invalid SFTP port: ${connection?.port}`);
         }
 
         await pendingMigrationRef.current;
+        assertCurrent();
 
         const payload = {
             host: connection.host,
@@ -222,6 +227,7 @@ export default function SftpProvider({ children }) {
         try {
             return await invoke(command, payload);
         } catch (error) {
+            assertCurrent();
             const errMsg = getErrorMessage(error).trim();
             if (!errMsg.startsWith(HOST_KEY_UNTRUSTED_PREFIX)) {
                 throw error;
@@ -233,6 +239,7 @@ export default function SftpProvider({ children }) {
                 'Untrusted SSH Host Key'
             );
 
+            assertCurrent();
             if (!confirmed) {
                 throw new Error('Host key verification cancelled by user');
             }
@@ -243,6 +250,7 @@ export default function SftpProvider({ children }) {
                 expectedFingerprint: fingerprint
             });
 
+            assertCurrent();
             return await invoke(command, payload);
         }
     }, []);
@@ -362,16 +370,16 @@ export default function SftpProvider({ children }) {
         );
     }, []);
 
-    const executeWithSudoPassword = useCallback(async (connection, promptText, runner) => {
+    const executeWithSudoPassword = useCallback(async (connection, promptText, runner, isCurrent) => {
+        const cancelled = { cancelled: true, result: null };
+        if (isCurrent?.() === false) return cancelled;
         const cacheKey = buildSftpConnectionKey(connection);
         let sudoPassword = sudoPasswordCacheRef.current.get(cacheKey);
         let promptedNow = false;
 
         if (!sudoPassword) {
             sudoPassword = await showPasswordPrompt(promptText, 'Elevated SSH Operation (sudo)');
-            if (!sudoPassword) {
-                return { cancelled: true, result: null };
-            }
+            if (!sudoPassword || isCurrent?.() === false) return cancelled;
             sudoPasswordCacheRef.current.set(cacheKey, sudoPassword);
             promptedNow = true;
         }
@@ -380,6 +388,7 @@ export default function SftpProvider({ children }) {
             const result = await runner(sudoPassword);
             return { cancelled: false, result };
         } catch (err) {
+            if (isCurrent?.() === false) return cancelled;
             if (isSudoAuthError(err)) {
                 sudoPasswordCacheRef.current.delete(cacheKey);
                 if (!promptedNow) {
@@ -387,14 +396,13 @@ export default function SftpProvider({ children }) {
                         `Cached sudo password failed on ${connection.host}.\nEnter sudo password:`,
                         'Elevated SSH Operation (sudo)'
                     );
-                    if (!retryPassword) {
-                        return { cancelled: true, result: null };
-                    }
+                    if (!retryPassword || isCurrent?.() === false) return cancelled;
                     sudoPasswordCacheRef.current.set(cacheKey, retryPassword);
                     try {
                         const retryResult = await runner(retryPassword);
                         return { cancelled: false, result: retryResult };
                     } catch (retryErr) {
+                        if (isCurrent?.() === false) return cancelled;
                         if (isSudoAuthError(retryErr)) {
                             sudoPasswordCacheRef.current.delete(cacheKey);
                         }
@@ -406,7 +414,7 @@ export default function SftpProvider({ children }) {
         }
     }, [isSudoAuthError]);
 
-    const listDirWithSudo = useCallback(async (connection, remotePath) => {
+    const listDirWithSudo = useCallback(async (connection, remotePath, isCurrent) => {
         if (!connection?.host) return null;
         const targetDir = remotePath || '.';
         const outcome = await executeWithSudoPassword(
@@ -423,9 +431,10 @@ export default function SftpProvider({ children }) {
                     privateKeyPath: connection.privateKeyPath || null,
                     certificatePath: connection.certificatePath || null,
                     compressionMode: connection.compressionMode || null,
-                })
+                }, isCurrent),
+            isCurrent
         );
-        if (outcome.cancelled) return null;
+        if (outcome.cancelled || isCurrent?.() === false) return null;
 
         const parsed = parseSudoFindOutput(outcome.result, connection, targetDir, createSftpUrl);
         return {
@@ -446,7 +455,7 @@ export default function SftpProvider({ children }) {
         try {
             const sftpPath = remotePath || '.';
             if (options?.isCurrent?.() === false) return null;
-            const result = await invokeSftp('load_dir', connection, { directory: sftpPath });
+            const result = await invokeSftp('load_dir', connection, { directory: sftpPath }, options.isCurrent);
             if (options?.isCurrent?.() === false) return null;
             const dirData = JSON.parse(result);
 
@@ -515,7 +524,7 @@ export default function SftpProvider({ children }) {
             console.error('Failed to load SFTP directory:', errMsg);
             if (isPermissionDeniedError(error) && !options?.silentError) {
                 try {
-                    const elevatedData = await listDirWithSudo(connection, remotePath || '.');
+                    const elevatedData = await listDirWithSudo(connection, remotePath || '.', options.isCurrent);
                     if (options?.isCurrent?.() === false) return null;
                     if (elevatedData) {
                         if (options.updateActiveState !== false) {

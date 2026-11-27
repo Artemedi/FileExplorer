@@ -152,6 +152,17 @@ describe('Wave 4 UI & Tools Regression Tests (TP-FE-UI-09..12)', () => {
             document.removeEventListener('force-explorer-view', forceExplorerListener);
         });
 
+        test('AUDIT: restoring a saved Home owner must retain null path despite prior global History', () => {
+            localStorage.setItem('explr_saved_tabs', JSON.stringify([
+                { id: 'tab-1', title: 'TabA', path: 'C:\\TabA', isActive: false },
+                { id: 'tab-pc', title: 'Home', path: null, isActive: true },
+            ]));
+            localStorage.setItem('explr_active_tab_id', 'tab-pc');
+            render(<TabManager><div>content</div></TabManager>);
+            const stored = JSON.parse(localStorage.getItem('explr_saved_tabs'));
+            expect(stored.find(t => t.id === 'tab-pc').path).toBeNull();
+        });
+
         test('TP-FE-UI-10: drag-and-drop reorders tabs, dragEnd resets ref, no onSelectStart React warning, new-tab has aria-label', () => {
             const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
             const savedTabs = [
