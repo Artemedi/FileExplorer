@@ -3,13 +3,14 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
-const { mockInvoke, mockListen, mockStart, mockWrite, mockSnapshot, mockFlush, mockNavigation } = vi.hoisted(() => ({
+const { mockInvoke, mockListen, mockStart, mockWrite, mockSnapshot, mockFlush, mockRegister, mockNavigation } = vi.hoisted(() => ({
     mockInvoke: vi.fn(),
     mockListen: vi.fn(),
     mockStart: vi.fn(),
     mockWrite: vi.fn(),
     mockSnapshot: vi.fn(),
     mockFlush: vi.fn(),
+    mockRegister: vi.fn(),
     mockNavigation: { path: "sftp:Test:/test", load: vi.fn(), navigate: vi.fn(), execute: vi.fn() },
 }));
 const connection = { name: 'Test', host: 'test.invalid', username: 'test', port: 22 };
@@ -40,7 +41,7 @@ vi.mock('../src/providers/SftpProvider', () => ({
 vi.mock('../src/components/terminal/XtermSshView', () => ({
     default: ({ sessionId, isVisible, registerController, onData }) => {
         React.useEffect(() => {
-            registerController(sessionId, { write: (data) => mockWrite(data, sessionId), getBufferText: mockSnapshot, flushBufferText: mockFlush });
+            mockRegister(sessionId, () => registerController(sessionId, { write: (data) => mockWrite(data, sessionId), getBufferText: mockSnapshot, flushBufferText: mockFlush }));
             return () => registerController(sessionId, null);
         }, [sessionId]);
         return <div data-testid={sessionId} style={{ display: isVisible ? undefined : "none" }}><button onClick={() => onData("test input")}>Send input</button><button onClick={() => onData("界".repeat(350000))}>Send oversized input</button></div>;
@@ -60,6 +61,7 @@ describe('TERM-R1 PTY lifecycle', () => {
         mockInvoke.mockResolvedValue(null);
         mockSnapshot.mockReset().mockReturnValue('');
         mockFlush.mockReset().mockResolvedValue('');
+        mockRegister.mockReset().mockImplementation((_, register) => register());
         mockStart.mockReset().mockResolvedValue('pty-1');
         mockNavigation.path = 'sftp:Test:/test';
         mockNavigation.load.mockReset().mockResolvedValue(true);
@@ -344,7 +346,9 @@ describe('TERM-R1 PTY lifecycle', () => {
         expect(mockInvoke).not.toHaveBeenCalledWith('ssh_close_pty', expect.anything());
         for (const id of ['pty-1', 'pty-2', 'pty-3']) {
             emit('ssh-pty-output', { session_id: id, data: 'output:' + id });
-            expect(mockWrite).toHaveBeenCalledWith('output:' + id, id);
+            // The DOM can be committed before the passive xterm registration.
+            await waitFor(() => expect(mockWrite).toHaveBeenCalledWith('output:' + id, id));
+            expect(mockWrite.mock.calls.filter(([data, sid]) => data === 'output:' + id && sid === id)).toHaveLength(1);
         }
         fireEvent.click(screen.getByRole('button', { name: 'Send input' }));
         expect(mockInvoke).toHaveBeenCalledWith('ssh_write_pty', { sessionId: 'pty-3', data: 'test input' });
@@ -358,6 +362,29 @@ describe('TERM-R1 PTY lifecycle', () => {
         expect(mockInvoke).not.toHaveBeenCalledWith('ssh_close_pty', { sessionId: 'pty-3' });
         expect(screen.getByTestId('pty-1')).toBe(original);
         expect(screen.getByTestId('pty-3')).toBe(third);
+    });
+
+    test('R2: output before third controller registration is replayed exactly once', async () => {
+        let registerThird;
+        mockRegister.mockImplementation((sid, register) => {
+            if (sid === 'pty-3') registerThird = register;
+            else register();
+        });
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2').mockResolvedValueOnce('pty-3');
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name: 'Duplicate SSH' }));
+        await screen.findByTestId('pty-2');
+        fireEvent.click(screen.getByRole('button', { name: 'Duplicate SSH' }));
+        const third = await screen.findByTestId('pty-3');
+        expect(third).toBeVisible();
+        await waitFor(() => expect(registerThird).toEqual(expect.any(Function)));
+        emit('ssh-pty-output', { session_id: 'pty-3', data: 'output:pty-3' });
+        // The original immediate assertion would fail at this boundary.
+        expect(mockWrite).not.toHaveBeenCalledWith('output:pty-3', 'pty-3');
+        act(() => registerThird());
+        await waitFor(() => expect(mockWrite).toHaveBeenCalledWith('output:pty-3', 'pty-3'));
+        expect(mockWrite.mock.calls.filter(([data]) => data === 'output:pty-3')).toEqual([['output:pty-3', 'pty-3']]);
     });
 
     test('R2: confirmed directory belongs to its shell; independent shell never drives explorer', async () => {
