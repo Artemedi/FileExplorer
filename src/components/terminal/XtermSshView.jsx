@@ -35,6 +35,7 @@ const XtermSshView = ({
         let dataDisposable = null;
         let lastCols = 0;
         let lastRows = 0;
+        let cancelFlush = null;
 
         try {
             term = new XTerm({
@@ -125,6 +126,21 @@ const XtermSshView = ({
                 resizeObserver.observe(mountEl);
             }
 
+            const getBufferText = () => {
+                const t = termRef.current === term ? term : null;
+                if (!t?.buffer?.active) return '';
+                const lines = [];
+                const buf = t.buffer.active;
+                for (let i = 0; i < buf.length; i++) {
+                    const line = buf.getLine(i);
+                    if (line) lines.push(line.translateToString(true));
+                }
+                while (lines.length > 0 && lines[lines.length - 1] === '') {
+                    lines.pop();
+                }
+                return lines.join('\n');
+            };
+
             registerController?.(sessionId, {
                 write: (chunk) => {
                     termRef.current?.write(chunk);
@@ -136,26 +152,39 @@ const XtermSshView = ({
                     termRef.current?.clear();
                 },
                 fit: safeFit,
-                getBufferText: () => {
-                    const t = termRef.current;
-                    if (!t?.buffer?.active) return '';
-                    const lines = [];
-                    const buf = t.buffer.active;
-                    for (let i = 0; i < buf.length; i++) {
-                        const line = buf.getLine(i);
-                        if (line) lines.push(line.translateToString(true));
+                getBufferText,
+                flushBufferText: () => new Promise((resolve, reject) => {
+                    // xterm.write callbacks run after parsing, not on enqueue.
+                    // Bound the wait and cancel it if the view is disposed.
+                    const finish = (error) => {
+                        if (cancelFlush !== cancel) return;
+                        cancelFlush = null;
+                        clearTimeout(timer);
+                        if (error) reject(error);
+                        else {
+                            try {
+                                resolve(getBufferText());
+                            } catch (e) {
+                                reject(e);
+                            }
+                        }
+                    };
+                    const cancel = () => finish(new Error('Terminal view disposed'));
+                    const timer = setTimeout(() => finish(new Error('Terminal flush timed out')), 5000);
+                    cancelFlush = cancel;
+                    try {
+                        term.write('', () => finish());
+                    } catch (e) {
+                        finish(e);
                     }
-                    while (lines.length > 0 && lines[lines.length - 1] === '') {
-                        lines.pop();
-                    }
-                    return lines.join('\n');
-                },
+                }),
             });
         } catch {
             // Non-canvas test environments (e.g. jsdom) cannot mount xterm canvas
         }
 
         return () => {
+            cancelFlush?.();
             registerController?.(sessionId, null);
             if (resizeObserver) resizeObserver.disconnect();
             if (dataDisposable) dataDisposable.dispose();

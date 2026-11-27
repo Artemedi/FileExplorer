@@ -23,6 +23,8 @@ import './terminal.css';
 
 const MAX_PTY_INPUT_BYTES = 1024 * 1024;
 const MAX_PTY_INPUT_ITEMS = 1024;
+const MAX_PENDING_PTY_OUTPUT = 256 * 1024; // UTF-16 code units, not bytes
+const PTY_STARTUP_TRUNCATED = '[SSH startup output truncated; newest output retained]';
 
 const isLocalDirectory = (path) => typeof path === 'string' && path.length > 0 && !path.startsWith('sftp:');
 
@@ -242,6 +244,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     const ptyOwnersRef = useRef(new Map());
     const earlyPtyExitRef = useRef(new Map());
     const pendingPtyOutputRef = useRef(new Map());
+    const finalizingPtyRef = useRef(new Map());
     const failedPtyWritesRef = useRef(new Set());
     const ptyInputQueuesRef = useRef(new Map());
     const [ptyListenersReady, setPtyListenersReady] = useState(false);
@@ -559,18 +562,21 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
 
                     const sessionId = payload.session_id;
                     const owner = ptyOwnersRef.current.get(sessionId);
-                    if (!owner && pendingPtyStartsRef.current.size === 0) return;
+                    if (finalizingPtyRef.current.has(sessionId) ||
+                        (!owner && pendingPtyStartsRef.current.size === 0)) return;
 
                     // Preserve initial VT output until the xterm controller mounts.
                     const ctrl = xtermControllersRef.current[sessionId];
                     if (ctrl) {
                         ctrl.write(payload.data);
                     } else {
-                        const previous = pendingPtyOutputRef.current.get(sessionId) || '';
-                        const limit = 256 * 1024;
-                        if (previous.length < limit) {
-                            pendingPtyOutputRef.current.set(sessionId, (previous + payload.data).slice(0, limit));
-                        }
+                        const previous = pendingPtyOutputRef.current.get(sessionId);
+                        const combined = (previous?.text || '') + payload.data;
+                        const truncated = previous?.truncated || combined.length > MAX_PENDING_PTY_OUTPUT;
+                        let text = combined.slice(-MAX_PENDING_PTY_OUTPUT);
+                        // Do not retain half of a surrogate pair at the cut.
+                        if (truncated && /^[\uDC00-\uDFFF]/.test(text)) text = text.slice(1);
+                        pendingPtyOutputRef.current.set(sessionId, { text, truncated });
                     }
                     if (!owner) return;
 
@@ -644,6 +650,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                     const payload = event?.payload;
                     if (!active || !payload?.session_id) return;
                     const sessionId = payload.session_id;
+                    if (finalizingPtyRef.current.has(sessionId)) return;
                     const tabId = ptyOwnersRef.current.get(sessionId);
                     if (!tabId) {
                         if (pendingPtyStartsRef.current.size > 0) {
@@ -651,20 +658,48 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                         }
                         return;
                     }
+                    // Revoke input/navigation immediately; retain the mounted view
+                    // until xterm has parsed every write preceding the exit event.
+                    finalizingPtyRef.current.set(sessionId, tabId);
                     ptyOwnersRef.current.delete(sessionId);
-                    const output = xtermControllersRef.current[sessionId]?.getBufferText() ||
-                        stripAnsiCodes(pendingPtyOutputRef.current.get(sessionId) || '');
+                    const ctrl = xtermControllersRef.current[sessionId];
+                    const pending = pendingPtyOutputRef.current.get(sessionId);
+                    let output = stripAnsiCodes(pending?.text || '');
                     cleanupSessionTracking(sessionId);
-                    updateTab(tabId, (tab) => tab.ptySessionId !== sessionId ? tab : ({
-                        ...tab,
-                        ptySessionId: null,
-                        ptyStatus: 'disconnected',
-                        history: [
-                            ...tab.history,
-                            ...(output ? [{ type: 'output', content: output, timestamp: new Date().toLocaleTimeString() }] : []),
-                            { type: 'system', content: '[SSH PTY exited: ' + payload.reason + ']', timestamp: new Date().toLocaleTimeString() },
-                        ],
-                    }));
+                    const finishExit = async () => {
+                        let incomplete = false;
+                        if (ctrl) {
+                            updateTab(tabId, (tab) => tab.ptySessionId !== sessionId ? tab : ({
+                                ...tab, ptyStatus: 'finishing', ptyWriteError: null,
+                            }));
+                            try {
+                                output = await ctrl.flushBufferText();
+                            } catch {
+                                incomplete = true;
+                                try {
+                                    output = ctrl.getBufferText() || output;
+                                } catch {
+                                    // Retain the pre-controller fallback if the view is gone.
+                                }
+                            }
+                        }
+                        if (!active || finalizingPtyRef.current.get(sessionId) !== tabId) return;
+                        finalizingPtyRef.current.delete(sessionId);
+                        updateTab(tabId, (tab) => tab.ptySessionId !== sessionId ? tab : ({
+                            ...tab,
+                            ptySessionId: null,
+                            ptyStatus: 'disconnected',
+                            history: [
+                                ...tab.history,
+                                ...(pending?.truncated && !output.includes(PTY_STARTUP_TRUNCATED)
+                                    ? [{ type: 'system', content: PTY_STARTUP_TRUNCATED, timestamp: new Date().toLocaleTimeString() }] : []),
+                                ...(output ? [{ type: 'output', content: output, timestamp: new Date().toLocaleTimeString() }] : []),
+                                ...(incomplete ? [{ type: 'error', content: '[SSH final output incomplete: terminal flush failed or timed out]', timestamp: new Date().toLocaleTimeString() }] : []),
+                                { type: 'system', content: '[SSH PTY exited: ' + payload.reason + ']', timestamp: new Date().toLocaleTimeString() },
+                            ],
+                        }));
+                    };
+                    void finishExit();
                 });
                 if (active) setPtyListenersReady(true);
                 else if (typeof unlistenExit === 'function') unlistenExit();
@@ -690,6 +725,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                 invoke('ssh_close_pty', { sessionId }).catch(() => {});
             }
             ptyOwnersRef.current.clear();
+            finalizingPtyRef.current.clear();
             pendingPtyOutputRef.current.clear();
         };
     }, []);
@@ -870,13 +906,15 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
             if (!sid) throw new Error('SSH PTY did not return a session ID');
             if (earlyPtyExitRef.current.has(sid)) {
                 const reason = earlyPtyExitRef.current.get(sid);
-                const output = stripAnsiCodes(pendingPtyOutputRef.current.get(sid) || '');
+                const pending = pendingPtyOutputRef.current.get(sid);
+                const output = stripAnsiCodes(pending?.text || '');
                 earlyPtyExitRef.current.delete(sid);
                 cleanupSessionTracking(sid);
                 updateTab(tabId, (current) => ({
                     ...current,
                     ptyStatus: 'disconnected',
                     history: [...current.history,
+                        ...(pending?.truncated ? [{ type: 'system', content: PTY_STARTUP_TRUNCATED, timestamp: new Date().toLocaleTimeString() }] : []),
                         ...(output ? [{ type: 'output', content: output, timestamp: new Date().toLocaleTimeString() }] : []),
                         { type: 'system', content: '[SSH PTY exited: ' + reason + ']', timestamp: new Date().toLocaleTimeString() },
                     ],
@@ -911,6 +949,9 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     const closeTabPty = (tabId) => {
         terminalNavigationRef.current.delete(tabId);
         pendingPtyStartsRef.current.delete(tabId);
+        for (const [sessionId, owner] of finalizingPtyRef.current) {
+            if (owner === tabId) finalizingPtyRef.current.delete(sessionId);
+        }
         for (const [sessionId, owner] of ptyOwnersRef.current) {
             if (owner !== tabId) continue;
             ptyOwnersRef.current.delete(sessionId);
@@ -2147,7 +2188,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                     {activeSshConnection && (
                         <button
                             className="terminal-control"
-                            disabled={!ptyListenersReady || activeTab.ptyStatus === 'connecting'}
+                            disabled={!ptyListenersReady || ['connecting', 'finishing'].includes(activeTab.ptyStatus)}
                             onClick={() => {
                                 if (ptySessionId) {
                                     closeTabPty(activeTab.id);
@@ -2158,7 +2199,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                             }}
                             title={ptySessionId ? 'Stop interactive SSH PTY' : 'Start interactive SSH PTY'}
                         >
-                            {ptySessionId ? 'Stop PTY' : activeTab.ptyStatus === 'connecting' ? 'Connecting…' :
+                            {activeTab.ptyStatus === 'finishing' ? 'Finishing…' : ptySessionId ? 'Stop PTY' : activeTab.ptyStatus === 'connecting' ? 'Connecting…' :
                                 ['disconnected', 'error'].includes(activeTab.ptyStatus) ? 'Reconnect' : 'PTY'}
                         </button>
                     )}
@@ -2283,14 +2324,20 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                             return writePty(tab.ptySessionId, data, true);
                         }}
                         onResize={(cols, rows) => {
-                            invoke('ssh_resize_pty', { sessionId: tab.ptySessionId, cols, rows }).catch(() => {});
+                            if (ptyOwnersRef.current.get(tab.ptySessionId) === tab.id) {
+                                invoke('ssh_resize_pty', { sessionId: tab.ptySessionId, cols, rows }).catch(() => {});
+                            }
                         }}
                         registerController={(sid, ctrl) => {
                             if (ctrl) {
                                 xtermControllersRef.current[sid] = ctrl;
                                 const buffered = pendingPtyOutputRef.current.get(sid);
-                                if (buffered) ctrl.write(buffered);
-                                pendingPtyOutputRef.current.delete(sid);
+                                if (buffered?.text) {
+                                    ctrl.write((buffered.truncated ? PTY_STARTUP_TRUNCATED + '\r\n' : '') + buffered.text);
+                                }
+                                // Keep only the truncation flag after replay.
+                                if (buffered?.truncated) pendingPtyOutputRef.current.set(sid, { text: '', truncated: true });
+                                else pendingPtyOutputRef.current.delete(sid);
                             } else {
                                 delete xtermControllersRef.current[sid];
                             }

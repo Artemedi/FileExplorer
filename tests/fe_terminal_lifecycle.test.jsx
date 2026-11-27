@@ -3,11 +3,13 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
-const { mockInvoke, mockListen, mockStart, mockWrite, mockNavigation } = vi.hoisted(() => ({
+const { mockInvoke, mockListen, mockStart, mockWrite, mockSnapshot, mockFlush, mockNavigation } = vi.hoisted(() => ({
     mockInvoke: vi.fn(),
     mockListen: vi.fn(),
     mockStart: vi.fn(),
     mockWrite: vi.fn(),
+    mockSnapshot: vi.fn(),
+    mockFlush: vi.fn(),
     mockNavigation: { path: "sftp:Test:/test", load: vi.fn(), navigate: vi.fn(), execute: vi.fn() },
 }));
 const connection = { name: 'Test', host: 'test.invalid', username: 'test', port: 22 };
@@ -38,7 +40,7 @@ vi.mock('../src/providers/SftpProvider', () => ({
 vi.mock('../src/components/terminal/XtermSshView', () => ({
     default: ({ sessionId, isVisible, registerController, onData }) => {
         React.useEffect(() => {
-            registerController(sessionId, { write: (data) => mockWrite(data, sessionId), getBufferText: () => '' });
+            registerController(sessionId, { write: (data) => mockWrite(data, sessionId), getBufferText: mockSnapshot, flushBufferText: mockFlush });
             return () => registerController(sessionId, null);
         }, [sessionId]);
         return <div data-testid={sessionId} style={{ display: isVisible ? undefined : "none" }}><button onClick={() => onData("test input")}>Send input</button><button onClick={() => onData("界".repeat(350000))}>Send oversized input</button></div>;
@@ -56,6 +58,8 @@ describe('TERM-R1 PTY lifecycle', () => {
         vi.clearAllMocks();
         listeners = {};
         mockInvoke.mockResolvedValue(null);
+        mockSnapshot.mockReset().mockReturnValue('');
+        mockFlush.mockReset().mockResolvedValue('');
         mockStart.mockReset().mockResolvedValue('pty-1');
         mockNavigation.path = 'sftp:Test:/test';
         mockNavigation.load.mockReset().mockResolvedValue(true);
@@ -127,6 +131,99 @@ describe('TERM-R1 PTY lifecycle', () => {
         await act(async () => resolve('pty-fast'));
         expect(await screen.findByRole('button', { name: 'Reconnect' })).toBeEnabled();
         expect(screen.queryByTestId('pty-fast')).not.toBeInTheDocument();
+    });
+
+    test('UR-FINAL-005: exit waits for parsed xterm output before unmount', async () => {
+        let finish;
+        mockSnapshot.mockReturnValue('prior line');
+        mockFlush.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const view = await screen.findByTestId('pty-1');
+        emit('ssh-pty-output', { session_id: 'pty-1', data: 'LAST-LINE' });
+        emit('ssh-pty-exit', { session_id: 'pty-1', reason: 'closed' });
+        expect(mockFlush).toHaveBeenCalledTimes(1);
+        expect(view).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: 'Reconnect' })).not.toBeInTheDocument();
+        await act(async () => finish('prior line\nLAST-LINE'));
+        expect(await screen.findByRole('button', { name: 'Reconnect' })).toBeEnabled();
+        expect(screen.getByText('LAST-LINE', { exact: false })).toBeInTheDocument();
+        expect(screen.queryByTestId('pty-1')).not.toBeInTheDocument();
+    });
+
+    test('UR-FINAL-005: overflowing pre-controller output retains final tail and reports loss on early exit', async () => {
+        let resolve;
+        mockStart.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByRole('button', { name: 'Connecting…' });
+        emit('ssh-pty-output', { session_id: 'pty-early', data: 'A'.repeat(256 * 1024) });
+        emit('ssh-pty-output', { session_id: 'pty-early', data: '\nFINAL-TAIL' });
+        emit('ssh-pty-exit', { session_id: 'pty-early', reason: 'closed' });
+        await act(async () => resolve('pty-early'));
+        expect(await screen.findByRole('button', { name: 'Reconnect' })).toBeEnabled();
+        const history = document.querySelector('.terminal-content').textContent;
+        expect(history.includes('FINAL-TAIL')).toBe(true);
+        expect(history).toContain('SSH startup output truncated');
+    });
+
+    test('UR-FINAL-005: finalization revokes writes, ignores duplicate exit and reports flush failure', async () => {
+        let reject;
+        mockSnapshot.mockReturnValue('last parsed text');
+        mockFlush.mockImplementationOnce(() => new Promise((_, r) => { reject = r; }));
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const view = await screen.findByTestId('pty-1');
+        emit('ssh-pty-exit', { session_id: 'pty-1', reason: 'transport lost' });
+        expect(screen.getByRole('button', { name: 'Finishing…' })).toBeDisabled();
+        emit('ssh-pty-exit', { session_id: 'pty-1', reason: 'duplicate' });
+        emit('ssh-pty-output', { session_id: 'pty-1', data: 'late output' });
+        fireEvent.click(screen.getByRole('button', { name: 'Send input' }));
+        expect(mockFlush).toHaveBeenCalledTimes(1);
+        expect(mockWrite).not.toHaveBeenCalledWith('late output', 'pty-1');
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_write_pty', { sessionId: 'pty-1', data: 'test input' });
+        expect(view).toBeInTheDocument();
+        await act(async () => reject(new Error('Terminal flush timed out')));
+        expect(await screen.findByRole('button', { name: 'Reconnect' })).toBeEnabled();
+        expect(screen.getByText('last parsed text')).toBeInTheDocument();
+        expect(screen.getByText(/SSH final output incomplete/)).toBeInTheDocument();
+        expect(screen.queryByText(/SSH PTY exited: duplicate/)).not.toBeInTheDocument();
+    });
+
+    test('UR-FINAL-005: closing a finishing tab cannot restore it or overwrite a new PTY', async () => {
+        let finish;
+        mockStart.mockResolvedValueOnce('pty-1').mockResolvedValueOnce('pty-2');
+        mockFlush.mockImplementationOnce(() => new Promise(r => { finish = r; }));
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name: 'Duplicate SSH' }));
+        await screen.findByTestId('pty-2');
+        emit('ssh-pty-exit', { session_id: 'pty-1', reason: 'closed' });
+        fireEvent.click(screen.getByText('SSH: Test').parentElement.querySelector('[title="Close terminal tab"]'));
+        expect(screen.queryByTestId('pty-1')).not.toBeInTheDocument();
+        await act(async () => finish('STALE-SNAPSHOT'));
+        expect(screen.getByTestId('pty-2')).toBeVisible();
+        expect(screen.queryByText('STALE-SNAPSHOT')).not.toBeInTheDocument();
+        expect(screen.queryByTestId('pty-1')).not.toBeInTheDocument();
+    });
+
+    test('UR-FINAL-005: startup tail replay is bounded and keeps truncation warning after mount', async () => {
+        let resolve;
+        mockStart.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        await screen.findByRole('button', { name: 'Connecting…' });
+        const limit = 256 * 1024;
+        emit('ssh-pty-output', { session_id: 'pty-early', data: '😀' + 'a'.repeat(limit - 2) });
+        emit('ssh-pty-output', { session_id: 'pty-early', data: 'Z' });
+        await act(async () => resolve('pty-early'));
+        await screen.findByTestId('pty-early');
+        const replay = mockWrite.mock.calls.find(([, sid]) => sid === 'pty-early')[0];
+        const [warning, tail] = replay.split('\r\n');
+        expect(warning).toContain('SSH startup output truncated');
+        expect(tail).toBe('a'.repeat(limit - 2) + 'Z');
+        expect(tail.length).toBeLessThanOrEqual(limit);
+        mockFlush.mockResolvedValueOnce('newest parsed line');
+        emit('ssh-pty-exit', { session_id: 'pty-early', reason: 'closed' });
+        await screen.findByRole('button', { name: 'Reconnect' });
+        expect(screen.getByText(/SSH startup output truncated/)).toBeInTheDocument();
+        expect(screen.getByText('newest parsed line')).toBeInTheDocument();
     });
 
     test('rejected input is visible, pauses subsequent input and is never replayed', async () => {

@@ -432,7 +432,7 @@ pub async fn ssh_start_pty(
                 Ok(n) => {
                     progressed = true;
                     pending_utf8.extend_from_slice(&buf[..n]);
-                    let text = drain_valid_utf8(&mut pending_utf8);
+                    let text = drain_valid_utf8(&mut pending_utf8, false);
                     if !text.is_empty() {
                         let _ = app.emit(
                             "ssh-pty-output",
@@ -460,6 +460,18 @@ pub async fn ssh_start_pty(
             }
         }
 
+        // Preserve a visible replacement character for an incomplete final
+        // UTF-8 sequence instead of silently dropping already received bytes.
+        let final_text = drain_valid_utf8(&mut pending_utf8, true);
+        if !final_text.is_empty() {
+            let _ = app.emit(
+                "ssh-pty-output",
+                SshPtyOutputPayload {
+                    session_id: sid_clone.clone(),
+                    data: final_text,
+                },
+            );
+        }
         drop(registration);
         let _ = channel.close();
         let _ = app.emit(
@@ -511,7 +523,12 @@ pub fn ssh_close_pty(session_id: String) -> Result<(), String> {
     Ok(())
 }
 
-fn drain_valid_utf8(pending: &mut Vec<u8>) -> String {
+fn drain_valid_utf8(pending: &mut Vec<u8>, eof: bool) -> String {
+    if eof {
+        let out = String::from_utf8_lossy(pending).into_owned();
+        pending.clear();
+        return out;
+    }
     match std::str::from_utf8(pending) {
         Ok(valid) => {
             let out = valid.to_string();
@@ -638,6 +655,21 @@ pub fn open_external_ssh_terminal(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pty_utf8_split_and_final_incomplete_sequence() {
+        let mut pending = vec![b'a', 0xe2, 0x82];
+        assert_eq!(super::drain_valid_utf8(&mut pending, false), "a");
+        assert_eq!(pending, [0xe2, 0x82]);
+        pending.push(0xac);
+        assert_eq!(super::drain_valid_utf8(&mut pending, false), "€");
+        assert!(pending.is_empty());
+        pending.extend_from_slice(&[0xf0, 0x9f]);
+        assert_eq!(super::drain_valid_utf8(&mut pending, false), "");
+        assert_eq!(super::drain_valid_utf8(&mut pending, true), "�");
+        assert!(pending.is_empty());
+        assert_eq!(super::drain_valid_utf8(&mut pending, true), "");
+    }
+
     use super::*;
 
     #[test]
