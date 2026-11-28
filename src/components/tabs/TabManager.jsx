@@ -201,6 +201,15 @@ const TabManager = ({ children }) => {
         }
     }, [currentPath]);
 
+    // Explicit navigation commits even if History already contains this path.
+    // The captured scope prevents a delayed Home listing from changing another tab.
+    const commitDirectory = (owner, path) => {
+        if (!path || !owner?.tabId || owner.switching || scopeRef.current !== owner) return;
+        observedPathRef.current = path;
+        replaceTabs(tabsRef.current.map(tab => tab.id === owner.tabId
+            ? { ...tab, title: getTabTitle(path), path } : tab));
+    };
+
     /**
      * Generates a unique ID for a new tab
      * @returns {string} Unique tab ID
@@ -452,6 +461,7 @@ const TabManager = ({ children }) => {
                 <ExplorerTabsContext.Provider value={{
                     scope,
                     getScope: () => scopeRef.current,
+                    commitDirectory,
                     tabs,
                 }}>
                     {children}

@@ -16,13 +16,14 @@ vi.mock('@tauri-apps/api/event', () => ({
 
 import I18nProvider from '../src/i18n/index.jsx';
 import HistoryProvider, { useHistory } from '../src/providers/HistoryProvider.jsx';
-import FileSystemProvider from '../src/providers/FileSystemProvider.jsx';
+import FileSystemProvider, { useFileSystem } from '../src/providers/FileSystemProvider.jsx';
 import ContextMenuProvider, { ContextMenuContext } from '../src/providers/ContextMenuProvider.jsx';
 import { SettingsContext } from '../src/providers/SettingsProvider.jsx';
 import SftpProvider, { useSftp } from '../src/providers/SftpProvider.jsx';
 import FileList from '../src/components/explorer/FileList.jsx';
 import DualPane from '../src/components/explorer/DualPane.jsx';
 import TabManager from '../src/components/tabs/TabManager.jsx';
+import ThisPCView from '../src/components/thisPc/ThisPCView.jsx';
 
 const defaultSettingsValue = {
     settings: {
@@ -809,5 +810,223 @@ describe('TP-FE-UI-07 & TP-FE-UI-08: DualPane keyboard isolation, drive switch, 
         });
         expect(mockInvoke).not.toHaveBeenCalledWith('rename', expect.anything());
         expect(mockInvoke).not.toHaveBeenCalledWith('move_to_trash', expect.anything());
+    });
+});
+
+describe('Final integration audit probes', () => {
+    test('AUDIT-006: delayed initial CLI lookup must not override explicit directory navigation', async () => {
+        let resolveInitial;
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_initial_cli_path') return new Promise(r => { resolveInitial = r; });
+            if (cmd === 'get_system_volumes_information_as_json') return '[]';
+            if (cmd === 'open_directory') return JSON.stringify(makeDirData(args.path, 1));
+        });
+        function Probe() {
+            const { currentPath } = useHistory();
+            const { loadDirectory } = useFileSystem();
+            return <><button onClick={() => loadDirectory('/user-choice')}>User navigation</button><output data-testid="actual-path">{currentPath}</output></>;
+        }
+        renderWithProviders(<TabManager><Probe /></TabManager>);
+        await waitFor(() => expect(resolveInitial).toBeTypeOf('function'));
+        fireEvent.click(screen.getByText('User navigation'));
+        await waitFor(() => expect(screen.getByTestId('actual-path')).toHaveTextContent('/user-choice'));
+        await act(async () => resolveInitial('/initial-default'));
+        console.log('AUDIT-006 actual path:', screen.getByTestId('actual-path').textContent);
+        expect(screen.getByTestId('actual-path')).toHaveTextContent('/user-choice');
+    });
+
+    test('AUDIT-006: obsolete initialization cleanup must not clear a newer loading state', async () => {
+        let resolveInitial;
+        let resolveUser;
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_initial_cli_path') return new Promise(r => { resolveInitial = r; });
+            if (cmd === 'get_system_volumes_information_as_json') return '[]';
+            if (cmd === 'open_directory') {
+                if (args.path === '/user-choice') return new Promise(r => { resolveUser = r; });
+                return JSON.stringify(makeDirData(args.path, 1));
+            }
+        });
+        function Probe() {
+            const { currentPath } = useHistory();
+            const { loadDirectory, isLoading, error } = useFileSystem();
+            return <><button onClick={() => loadDirectory('/user-choice')}>User navigation</button><output data-testid="actual-path">{currentPath}</output><output data-testid="loading">{String(isLoading)}</output><output data-testid="error">{error}</output></>;
+        }
+        renderWithProviders(<TabManager><Probe /></TabManager>);
+        await waitFor(() => expect(resolveInitial).toBeTypeOf('function'));
+        fireEvent.click(screen.getByText('User navigation'));
+        await waitFor(() => expect(resolveUser).toBeTypeOf('function'));
+        await act(async () => resolveInitial('/initial-default'));
+        expect(screen.getByTestId('loading')).toHaveTextContent('true');
+        expect(mockInvoke).not.toHaveBeenCalledWith('open_directory', { path: '/initial-default' });
+        await act(async () => resolveUser(JSON.stringify(makeDirData('/user-choice', 1))));
+        expect(screen.getByTestId('actual-path')).toHaveTextContent('/user-choice');
+        expect(screen.getByTestId('loading')).toHaveTextContent('false');
+        expect(screen.getByTestId('error')).toBeEmptyDOMElement();
+    });
+
+    test('AUDIT-006: obsolete initialization timeout must not publish an error after navigation', async () => {
+        vi.useFakeTimers();
+        try {
+            let resolveInitial;
+            mockInvoke.mockImplementation(async (cmd, args) => {
+                if (cmd === 'get_initial_cli_path') return new Promise(r => { resolveInitial = r; });
+                if (cmd === 'get_system_volumes_information_as_json') return '[]';
+                if (cmd === 'open_directory') return JSON.stringify(makeDirData(args.path, 1));
+            });
+            function Probe() {
+                const { currentPath } = useHistory();
+                const { loadDirectory, error } = useFileSystem();
+                return <><button onClick={() => loadDirectory('/user-choice')}>User navigation</button><output data-testid="actual-path">{currentPath}</output><output data-testid="error">{error}</output></>;
+            }
+            renderWithProviders(<TabManager><Probe /></TabManager>);
+            await act(async () => {});
+            expect(resolveInitial).toBeTypeOf('function');
+            await act(async () => fireEvent.click(screen.getByText('User navigation')));
+            expect(screen.getByTestId('actual-path')).toHaveTextContent('/user-choice');
+            await act(async () => { await vi.advanceTimersByTimeAsync(10001); });
+            expect(screen.getByTestId('error')).toBeEmptyDOMElement();
+            await act(async () => resolveInitial('/initial-default'));
+            expect(screen.getByTestId('actual-path')).toHaveTextContent('/user-choice');
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    test('AUDIT-006: current startup timeout revokes its pending listing', async () => {
+        vi.useFakeTimers();
+        try {
+            let resolveInitial;
+            mockInvoke.mockImplementation(async (cmd, args) => {
+                if (cmd === 'get_initial_cli_path') return '/initial-default';
+                if (cmd === 'get_system_volumes_information_as_json') return '[]';
+                if (cmd === 'open_directory') return new Promise(r => { resolveInitial = r; });
+            });
+            function Probe() {
+                const { currentPath } = useHistory();
+                const { isLoading, error } = useFileSystem();
+                return <><output data-testid="actual-path">{currentPath}</output><output data-testid="loading">{String(isLoading)}</output><output data-testid="error">{error}</output></>;
+            }
+            renderWithProviders(<TabManager><Probe /></TabManager>);
+            await act(async () => {});
+            expect(resolveInitial).toBeTypeOf('function');
+            await act(async () => { await vi.advanceTimersByTimeAsync(10001); });
+            expect(screen.getByTestId('loading')).toHaveTextContent('false');
+            expect(screen.getByTestId('error')).toHaveTextContent('Failed to initialize directory within the time limit');
+            await act(async () => resolveInitial(JSON.stringify(makeDirData('/initial-default', 1))));
+            expect(screen.getByTestId('actual-path')).toBeEmptyDOMElement();
+            expect(mockInvoke.mock.calls.filter(([cmd]) => cmd === 'open_directory')).toHaveLength(1);
+            expect(mockInvoke).not.toHaveBeenCalledWith('watch_directory', { path: '/initial-default' });
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    test('AUDIT-006: startup still tries a fallback on a current failed listing', async () => {
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_initial_cli_path') return '/initial-default';
+            if (cmd === 'get_system_volumes_information_as_json') return '[]';
+            if (cmd === 'open_directory') {
+                if (args.path === '/initial-default') throw new Error('inaccessible');
+                return JSON.stringify(makeDirData(args.path, 1));
+            }
+        });
+        function Probe() {
+            const { currentPath } = useHistory();
+            const { error, isLoading } = useFileSystem();
+            return <><output data-testid="actual-path">{currentPath}</output><output data-testid="error">{error}</output><output data-testid="loading">{String(isLoading)}</output></>;
+        }
+        renderWithProviders(<TabManager><Probe /></TabManager>);
+        await waitFor(() => expect(screen.getByTestId('actual-path')).toHaveTextContent('/'));
+        expect(mockInvoke).toHaveBeenCalledWith('open_directory', { path: '/initial-default' });
+        expect(mockInvoke).toHaveBeenCalledWith('open_directory', { path: '/' });
+        expect(screen.getByTestId('loading')).toHaveTextContent('false');
+        expect(screen.getByTestId('error')).toBeEmptyDOMElement();
+    });
+
+    test('AUDIT-007: explicit Home volume navigation to prior History path must update owner', async () => {
+        sessionStorage.setItem('fileExplorerHistory', JSON.stringify(['/same']));
+        sessionStorage.setItem('fileExplorerHistoryIndex', '0');
+        localStorage.setItem('explr_saved_tabs', JSON.stringify([
+            { id: 'tab-dir', title: 'Same folder', path: '/same' },
+            { id: 'tab-home', title: 'Home', path: null },
+        ]));
+        localStorage.setItem('explr_active_tab_id', 'tab-dir');
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_system_volumes_information_as_json') return JSON.stringify([{ mount_point: '/same', volume_name: 'Same volume', file_system: 'ext4', total_space: 1000, available_space: 500 }]);
+            if (cmd === 'get_meta_data_as_json') return JSON.stringify({ os: 'Linux', user_home_dir: '/home/test' });
+            if (cmd === 'get_user_directories' || cmd === 'get_physical_disks_info') return [];
+            if (cmd === 'open_directory') return JSON.stringify(makeDirData(args.path, 1));
+        });
+        function Probe() {
+            const { loadVolumes } = useFileSystem();
+            React.useEffect(() => { loadVolumes(); }, []);
+            return <ThisPCView />;
+        }
+        renderWithProviders(<TabManager><Probe /></TabManager>);
+        const volume = await screen.findByText('Same volume');
+        await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('open_directory', { path: '/same' }));
+        fireEvent.click(screen.getByText('Home'));
+        expect(JSON.parse(localStorage.getItem('explr_saved_tabs')).find(t => t.id === 'tab-home').path).toBeNull();
+        mockInvoke.mockClear();
+        const showExplorer = vi.fn();
+        document.addEventListener('force-explorer-view', showExplorer);
+        try {
+            await act(async () => fireEvent.click(volume));
+            expect(showExplorer).toHaveBeenCalledTimes(1);
+        } finally {
+            document.removeEventListener('force-explorer-view', showExplorer);
+        }
+        expect(mockInvoke).toHaveBeenCalledWith('open_directory', { path: '/same' });
+        const stored = JSON.parse(localStorage.getItem('explr_saved_tabs'));
+        console.log('AUDIT-007 actual owner path:', stored.find(t => t.id === 'tab-home').path);
+        expect(stored.find(t => t.id === 'tab-home').path).toBe('/same');
+    });
+
+    test('AUDIT-007: late Home navigation cannot commit after switching owners', async () => {
+        sessionStorage.setItem('fileExplorerHistory', JSON.stringify(['/same']));
+        sessionStorage.setItem('fileExplorerHistoryIndex', '0');
+        localStorage.setItem('explr_saved_tabs', JSON.stringify([
+            { id: 'tab-dir', title: 'Same folder', path: '/same' },
+            { id: 'tab-home', title: 'Home', path: null },
+        ]));
+        localStorage.setItem('explr_active_tab_id', 'tab-dir');
+        let deferListing = false;
+        let resolveListing;
+        mockInvoke.mockImplementation(async (cmd, args) => {
+            if (cmd === 'get_system_volumes_information_as_json') return JSON.stringify([{ mount_point: '/same', volume_name: 'Same volume', file_system: 'ext4', total_space: 1000, available_space: 500 }]);
+            if (cmd === 'get_meta_data_as_json') return JSON.stringify({ os: 'Linux', user_home_dir: '/home/test' });
+            if (cmd === 'get_user_directories' || cmd === 'get_physical_disks_info') return [];
+            if (cmd === 'open_directory') {
+                if (deferListing && args.path === '/same') return new Promise(r => { resolveListing = r; });
+                return JSON.stringify(makeDirData(args.path, 1));
+            }
+        });
+        function Probe() {
+            const { loadVolumes } = useFileSystem();
+            React.useEffect(() => { loadVolumes(); }, []);
+            return <ThisPCView />;
+        }
+        renderWithProviders(<TabManager><Probe /></TabManager>);
+        const volume = await screen.findByText('Same volume');
+        await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('open_directory', { path: '/same' }));
+        fireEvent.click(screen.getByText('Home'));
+        expect(JSON.parse(localStorage.getItem('explr_saved_tabs')).find(t => t.id === 'tab-home').path).toBeNull();
+
+        deferListing = true;
+        fireEvent.click(volume);
+        await waitFor(() => expect(resolveListing).toBeTypeOf('function'));
+        deferListing = false;
+        fireEvent.click(screen.getByText('Same folder'));
+        const showExplorer = vi.fn();
+        document.addEventListener('force-explorer-view', showExplorer);
+        try {
+            await act(async () => resolveListing(JSON.stringify(makeDirData('/same', 1))));
+            expect(showExplorer).not.toHaveBeenCalled();
+        } finally {
+            document.removeEventListener('force-explorer-view', showExplorer);
+        }
+        const stored = JSON.parse(localStorage.getItem('explr_saved_tabs'));
+        expect(stored.find(t => t.id === 'tab-home').path).toBeNull();
+        expect(stored.find(t => t.id === 'tab-dir').path).toBe('/same');
     });
 });
