@@ -257,6 +257,12 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     const finalizingPtyRef = useRef(new Map());
     const failedPtyWritesRef = useRef(new Set());
     const ptyInputQueuesRef = useRef(new Map());
+    const [, refreshPtyInputState] = useState(0);
+    const hasPendingPtyInput = (sessionId) => {
+        const queue = ptyInputQueuesRef.current.get(sessionId);
+        return Boolean((queue?.active && !queue.active.protocolResponse) ||
+            queue?.pending.some(item => !item.protocolResponse) || failedPtyWritesRef.current.has(sessionId));
+    };
     const [ptyListenersReady, setPtyListenersReady] = useState(false);
     const terminalNavigationRef = useRef(new Map());
     const explorerCdRef = useRef(new Map());
@@ -400,8 +406,10 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                 pausePtyInput(sessionId, queue, error);
                 item.resolve(false);
             } finally {
+                const wasBlocked = hasPendingPtyInput(sessionId);
                 queue.bytes -= item.bytes;
                 queue.active = null;
+                if (isCurrent() && wasBlocked !== hasPendingPtyInput(sessionId)) refreshPtyInputState(v => v + 1);
             }
         }
         if (isCurrent() && !queue.pending.length && !queue.active &&
@@ -433,8 +441,10 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
         }
         if (userInput) trackPtyUserInput(sessionId, data);
         return new Promise(resolve => {
+            const wasBlocked = hasPendingPtyInput(sessionId);
             queue.pending.push({ data, bytes, resolve, protocolResponse });
             queue.bytes += bytes;
+            if (wasBlocked !== hasPendingPtyInput(sessionId)) refreshPtyInputState(v => v + 1);
             drainPtyInput(sessionId, queue);
         });
     };
@@ -644,9 +654,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     const detachPtyView = async (tab) => {
         const sessionId = tab?.ptySessionId;
         if (!sessionId || !isAttachedView(sessionId) || !xtermControllersRef.current[sessionId]) return;
-        const queue = ptyInputQueuesRef.current.get(sessionId);
-        if ((queue?.active && !queue.active.protocolResponse) ||
-            queue?.pending.some(item => !item.protocolResponse) || failedPtyWritesRef.current.has(sessionId)) {
+        if (hasPendingPtyInput(sessionId)) {
             showWarning('Finish pending terminal input before detaching.');
             return;
         }
@@ -2344,7 +2352,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                             </button>
                         ) : (
                             <button type="button" className="terminal-control"
-                                disabled={activeTab.ptyStatus !== 'connected' || !isAttachedView(ptySessionId)}
+                                disabled={activeTab.ptyStatus !== 'connected' || !isAttachedView(ptySessionId) || hasPendingPtyInput(ptySessionId)}
                                 onClick={() => void detachPtyView(activeTab)}>
                                 {activeTab.ptyViewPending || activeTab.ptyView?.phase === 'detaching' ? 'Detaching…' : 'Detach to Window'}
                             </button>

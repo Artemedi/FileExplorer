@@ -789,6 +789,61 @@ describe('TERM-R1 PTY lifecycle', () => {
         expect(mockNavigation.navigate).not.toHaveBeenCalled();
     });
 
+    test('UR-FINAL-011 Detach waits for ordinary input acknowledgements, not VT replies', async () => {
+        const writes = [];
+        let finishReply;
+        mockInvoke.mockImplementation(async (command, args) => {
+            if (command === 'ssh_write_pty' && args.data === 'test input') {
+                return new Promise(resolve => writes.push(resolve));
+            }
+            if (command === 'ssh_write_pty_response') {
+                return new Promise(resolve => { finishReply = resolve; });
+            }
+            if (command === 'ssh_detach_pty') return { epoch: 1, phase: 'detaching', label: 'terminal-pty-1-1' };
+            return null;
+        });
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const view = await screen.findByTestId('pty-1');
+        const detach = screen.getByRole('button', { name: 'Detach to Window' });
+        expect(detach).toBeEnabled();
+        fireEvent.click(view.querySelector('button'));
+        fireEvent.click(view.querySelector('button'));
+        expect(writes).toHaveLength(1);
+        expect(detach).toBeDisabled();
+        fireEvent.click(detach);
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_detach_pty', expect.anything());
+        await act(async () => writes[0](null));
+        expect(writes).toHaveLength(2);
+        expect(detach).toBeDisabled();
+        fireEvent.click(view.querySelector('button:last-child'));
+        await act(async () => writes[1](null));
+        expect(finishReply).toBeTypeOf('function');
+        expect(detach).toBeEnabled();
+        fireEvent.click(detach);
+        await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('ssh_detach_pty', { sessionId: 'pty-1' }));
+        await act(async () => finishReply(null));
+        expect(mockStart).toHaveBeenCalledTimes(1);
+    });
+
+    test('UR-FINAL-011 write failure keeps Detach disabled until explicit Resume', async () => {
+        let rejectWrite;
+        mockInvoke.mockImplementation(async (command, args) => {
+            if (command === 'ssh_write_pty' && args.data === 'test input') {
+                return new Promise((_, reject) => { rejectWrite = reject; });
+            }
+            return null;
+        });
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const view = await screen.findByTestId('pty-1');
+        const detach = screen.getByRole('button', { name: 'Detach to Window' });
+        fireEvent.click(view.querySelector('button'));
+        await act(async () => rejectWrite(new Error('queue full')));
+        expect(screen.getByRole('alert')).toHaveTextContent('queue full');
+        expect(detach).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', { name: 'Resume input' }));
+        expect(detach).toBeEnabled();
+    });
+
     test('R4 transfers only the view, blocks main input, and rejects stale ownership events', async () => {
         mockInvoke.mockImplementation(async (command) => {
             if (command === 'ssh_detach_pty') return { epoch: 1, phase: 'detaching', label: 'terminal-pty-1-1' };
