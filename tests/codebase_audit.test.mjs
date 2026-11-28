@@ -765,3 +765,47 @@ test('package metadata versions, lockfile, and packaging scripts are synchronize
         'package.json tauri:build:intel must pass CARGO_CFG_TARGET_ARCH=x86_64'
     );
 });
+test('R4 app ACL covers the command registry and denies unrelated commands in detached windows', () => {
+    const source = fs.readFileSync(path.join(RUST_SRC_DIR, 'main.rs'), 'utf8');
+    const registered = [...source.match(/generate_handler!\[([\s\S]*?)\]/)[1].matchAll(/^\s*\w+::(\w+),$/gm)].map(m => m[1]);
+    const acl = fs.readFileSync(path.join(ROOT_DIR, 'src-tauri', 'permissions', 'terminal.toml'), 'utf8');
+    const sets = [...acl.matchAll(/identifier = "([^"]+)"[\s\S]*?commands\.allow = \[([\s\S]*?)\]/g)];
+    const permissions = Object.fromEntries(sets.map(m => [m[1], [...m[2].matchAll(/"([^"]+)"/g)].map(x => x[1])]));
+    const terminal = permissions['detached-terminal-commands'];
+    assert.deepEqual([...terminal].sort(), [
+        'ssh_attach_pty', 'ssh_clear_pty_view', 'ssh_close_pty', 'ssh_detached_read',
+        'ssh_detached_ready', 'ssh_resize_pty', 'ssh_write_pty',
+    ].sort());
+    assert.ok(permissions['main-commands'].includes('ssh_write_pty_response'));
+    assert.ok(!terminal.includes('ssh_write_pty_response'));
+    assert.deepEqual([...new Set([...permissions['main-commands'], ...terminal])].sort(), [...registered].sort());
+    const cap = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'src-tauri', 'capabilities', 'terminal.json'), 'utf8'));
+    assert.deepEqual(cap.windows, ['terminal-*']);
+    assert.deepEqual(cap.permissions, ['detached-terminal-commands']);
+});
+test('UR-FINAL-010 locked xterm keeps parser reply origin separate from genuine user input', { timeout: 5000 }, async () => {
+    const { Terminal } = await import('../node_modules/@xterm/xterm/lib/xterm.mjs');
+    const terminal = new Terminal({ allowProposedApi: true });
+    const core = terminal._core.coreService;
+    const original = core.triggerDataEvent;
+    const events = [];
+    core.triggerDataEvent = function (data, wasUserInput = false) {
+        events.push([data, wasUserInput]);
+        return original.call(this, data, wasUserInput);
+    };
+    try {
+        await new Promise(resolve => terminal.write(
+            '\x1b[2;3H\x1b[6n\x1b[c\x1b[?3000$p\x1bP$qm\x1b\\', resolve,
+        ));
+        terminal.input('user', true);
+        assert.deepEqual(events, [
+            ['\x1b[2;3R', false],
+            ['\x1b[?1;2c', false],
+            ['\x1b[?3000;0$y', false],
+            ['\x1bP1$r0m\x1b\\', false],
+            ['user', true],
+        ]);
+    } finally {
+        terminal.dispose();
+    }
+});

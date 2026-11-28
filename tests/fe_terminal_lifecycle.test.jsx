@@ -39,12 +39,12 @@ vi.mock('../src/providers/SftpProvider', () => ({
     }),
 }));
 vi.mock('../src/components/terminal/XtermSshView', () => ({
-    default: ({ sessionId, isVisible, registerController, onData }) => {
+    default: ({ sessionId, isVisible, registerController, onData, onProtocolResponse }) => {
         React.useEffect(() => {
             mockRegister(sessionId, () => registerController(sessionId, { write: (data) => mockWrite(data, sessionId), getBufferText: mockSnapshot, flushBufferText: mockFlush }));
             return () => registerController(sessionId, null);
         }, [sessionId]);
-        return <div data-testid={sessionId} style={{ display: isVisible ? undefined : "none" }}><button onClick={() => onData("test input")}>Send input</button><button onClick={() => onData("sudo -i\r")}>Elevate</button><button onClick={() => onData("\x1b[A")}>Send cursor key</button><button onClick={() => onData("\x01")}>Send control key</button><button onClick={() => onData("\r")}>Submit input</button><button onClick={() => onData("界".repeat(350000))}>Send oversized input</button></div>;
+        return <div data-testid={sessionId} style={{ display: isVisible ? undefined : "none" }}><button onClick={() => onData("test input")}>Send input</button><button onClick={() => onData("sudo -i\r")}>Elevate</button><button onClick={() => onData("\x1b[A")}>Send cursor key</button><button onClick={() => onData("\x01")}>Send control key</button><button onClick={() => onData("\r")}>Submit input</button><button onClick={() => onData("界".repeat(350000))}>Send oversized input</button><button onClick={() => onProtocolResponse("\x1b[3;4R")}>VT reply</button></div>;
     },
 }));
 
@@ -81,6 +81,22 @@ describe('TERM-R1 PTY lifecycle', () => {
     });
 
     afterEach(cleanup);
+
+    test('UR-FINAL-010 main VT replies bypass view freeze, never ordinary user writes', async () => {
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const view = await screen.findByTestId('pty-1');
+        emit('ssh-pty-window', { session_id: 'pty-1', phase: 'detaching', epoch: 1, label: 'terminal-pty-1-1' });
+        fireEvent.click(view.querySelector('button:nth-of-type(1)'));
+        fireEvent.click(view.querySelector('button:last-child'));
+        await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('ssh_write_pty_response', {
+            sessionId: 'pty-1', data: '\x1b[3;4R',
+        }));
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_write_pty', expect.anything());
+        emit('ssh-pty-window', { session_id: 'pty-1', phase: 'detached', epoch: 2, label: 'terminal-pty-1-1' });
+        fireEvent.click(view.querySelector('button:last-child'));
+        await waitFor(() => expect(mockInvoke.mock.calls.filter(([cmd]) => cmd === 'ssh_write_pty_response')).toHaveLength(2));
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_write_pty', expect.anything());
+    });
 
     test('hide and show preserves the PTY and terminal view; unmount closes it', async () => {
         const { rerender, unmount } = render(<Terminal isOpen={true} onToggle={vi.fn()} />);
@@ -771,5 +787,51 @@ describe('TERM-R1 PTY lifecycle', () => {
         await act(async () => resolve(false));
         expect(mockNavigation.load).toHaveBeenCalledTimes(1);
         expect(mockNavigation.navigate).not.toHaveBeenCalled();
+    });
+
+    test('R4 transfers only the view, blocks main input, and rejects stale ownership events', async () => {
+        mockInvoke.mockImplementation(async (command) => {
+            if (command === 'ssh_detach_pty') return { epoch: 1, phase: 'detaching', label: 'terminal-pty-1-1' };
+            return null;
+        });
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const view = await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name: 'Detach to Window' }));
+        await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('ssh_detach_pty', { sessionId: 'pty-1' }));
+        emit('ssh-pty-window', { session_id: 'pty-1', epoch: 2, phase: 'detached', label: 'terminal-pty-1-1' });
+        expect(view).not.toBeVisible();
+        const focus = await screen.findByRole('button', { name: 'Focus detached window' });
+        fireEvent.click(focus);
+        expect(mockInvoke).toHaveBeenCalledWith('ssh_focus_detached', { sessionId: 'pty-1' });
+        fireEvent.click(view.querySelector('button'));
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_write_pty', expect.anything());
+        emit('ssh-pty-window', { session_id: 'pty-1', epoch: 1, phase: 'attached' });
+        expect(view).not.toBeVisible();
+        emit('ssh-pty-window', { session_id: 'pty-1', epoch: 3, phase: 'attached', label: null });
+        await waitFor(() => expect(view).toBeVisible());
+        fireEvent.click(view.querySelector('button'));
+        await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('ssh_write_pty', {
+            sessionId: 'pty-1', ownerEpoch: 3, data: 'test input',
+        }));
+        expect(mockStart).toHaveBeenCalledTimes(1);
+        expect(mockInvoke).not.toHaveBeenCalledWith('ssh_close_pty', expect.anything());
+    });
+
+    test('R4 window creation failure restores main input without a new SSH session', async () => {
+        mockInvoke.mockImplementation(async (command) => {
+            if (command === 'ssh_detach_pty') throw new Error('window creation failed');
+            if (command === 'ssh_pty_view_status') return { epoch: 2, phase: 'attached', label: null };
+            return null;
+        });
+        render(<Terminal isOpen={true} onToggle={vi.fn()} />);
+        const view = await screen.findByTestId('pty-1');
+        fireEvent.click(screen.getByRole('button', { name: 'Detach to Window' }));
+        await waitFor(() => expect(showWarning).toHaveBeenCalledWith('Error: window creation failed'));
+        await waitFor(() => expect(view).toBeVisible());
+        fireEvent.click(view.querySelector('button'));
+        await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('ssh_write_pty', {
+            sessionId: 'pty-1', ownerEpoch: 2, data: 'test input',
+        }));
+        expect(mockStart).toHaveBeenCalledTimes(1);
     });
 });

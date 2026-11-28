@@ -1,4 +1,5 @@
 //! Bounded, per-PTY control state. Only the SSH worker consumes this queue.
+use super::pty_view::PtyView;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,6 +15,7 @@ pub(super) struct PtyControls {
     pub(super) write_blocked: bool,
     pub(super) resize: Option<(u32, u32)>,
     pub(super) closed: bool,
+    pub(super) view: PtyView,
 }
 
 impl PtyControls {
@@ -75,7 +77,7 @@ impl PtyControls {
     }
 }
 
-type Controls = Arc<Mutex<PtyControls>>;
+pub(super) type Controls = Arc<Mutex<PtyControls>>;
 static SESSIONS: OnceLock<Mutex<HashMap<String, Controls>>> = OnceLock::new();
 
 fn sessions() -> &'static Mutex<HashMap<String, Controls>> {
@@ -103,6 +105,49 @@ pub(super) fn close(id: &str) {
 }
 
 /// The worker owns registration, so every exit path removes the entry.
+/// Locate the view only by its actual backend-assigned window label.
+pub(super) fn lookup_window(label: &str) -> Result<(String, Controls), String> {
+    let id = label
+        .strip_prefix("terminal-")
+        .and_then(|s| s.rsplit_once('-'))
+        .map(|(id, _)| id)
+        .ok_or("Invalid PTY window label")?;
+    let controls = lookup(id)?;
+    let authorized = {
+        let control = controls.lock().unwrap_or_else(|e| e.into_inner());
+        !control.closed && control.view.matches_window(label)
+    };
+    if !authorized {
+        return Err("PTY view access denied".into());
+    }
+    Ok((id.to_string(), controls))
+}
+
+pub(super) fn close_owned(id: &str, label: &str, epoch: Option<u64>) -> Result<(), String> {
+    let Ok(controls) = lookup(id) else {
+        return Ok(());
+    };
+    {
+        let mut control = controls.lock().unwrap_or_else(|e| e.into_inner());
+        control.view.authorize(label, epoch)?;
+        control.close();
+    }
+    close(id);
+    Ok(())
+}
+
+pub(super) fn close_all() {
+    let ids: Vec<_> = sessions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    for id in ids {
+        close(&id);
+    }
+}
+
 /// IDs are allocated once by SSH_PTY_COUNTER, never reused.
 pub(super) struct Registration(String);
 

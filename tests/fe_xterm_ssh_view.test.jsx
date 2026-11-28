@@ -8,6 +8,10 @@ vi.mock('@xterm/xterm', () => ({
     Terminal: class {
         constructor() {
             mockTerm.instance = this;
+            this.dataListener = null;
+            this._core = { coreService: {
+                triggerDataEvent: (data) => this.dataListener?.(data),
+            } };
             this.queue = [];
             this.text = '';
             this.write = vi.fn((data, done) => this.queue.push({ data, done }));
@@ -15,7 +19,7 @@ vi.mock('@xterm/xterm', () => ({
         }
         loadAddon() {}
         open() {}
-        onData() { return { dispose() {} }; }
+        onData(listener) { this.dataListener = listener; return { dispose: () => { this.dataListener = null; } }; }
         attachCustomKeyEventHandler() {}
         dispose() {}
         drain() {
@@ -58,6 +62,37 @@ describe('UR-FINAL-005 xterm write barrier', () => {
         await vi.advanceTimersByTimeAsync(5000);
         await rejected;
         mockTerm.instance.drain();
+    });
+
+    test('UR-FINAL-010 main parser replies survive ownership freeze; user input stays gated', () => {
+        const onData = vi.fn();
+        const onProtocolResponse = vi.fn();
+        const { rerender } = render(<XtermSshView sessionId="pty-main" isVisible={false}
+            controlledGeometry inputEnabled={false} onData={onData} onProtocolResponse={onProtocolResponse} />);
+        const core = mockTerm.instance._core.coreService;
+        core.triggerDataEvent('\x1b[3;4R');
+        core.triggerDataEvent('\x1b[?1;2c', false);
+        core.triggerDataEvent('typed', true);
+        core.triggerDataEvent('\x1b[I', false);
+        expect(onProtocolResponse.mock.calls).toEqual([['\x1b[3;4R'], ['\x1b[?1;2c']]);
+        expect(onData).not.toHaveBeenCalled();
+        rerender(<XtermSshView sessionId="pty-main" isVisible={false}
+            controlledGeometry inputEnabled onData={onData} onProtocolResponse={onProtocolResponse} />);
+        core.triggerDataEvent('typed', true);
+        core.triggerDataEvent('\x1b[O', false);
+        expect(onData.mock.calls).toEqual([['typed'], ['\x1b[O']]);
+    });
+
+    test('UR-FINAL-010 detached replay never replies even after becoming interactive', () => {
+        const onData = vi.fn();
+        render(<XtermSshView sessionId="pty-detached" isVisible={false}
+            controlledGeometry inputEnabled onData={onData} />);
+        const core = mockTerm.instance._core.coreService;
+        core.triggerDataEvent('\x1b[7;8R', false);
+        core.triggerDataEvent('\x1b[?1;2c', false);
+        core.triggerDataEvent('\x1b[?1049;1$y', false);
+        core.triggerDataEvent('user', true);
+        expect(onData.mock.calls).toEqual([['user']]);
     });
 
     test('disposing the view cancels an outstanding flush', async () => {

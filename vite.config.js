@@ -6,6 +6,10 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vitejs.dev/config/
 export default defineConfig(async () => ({
   plugins: [react()],
+  // xterm 6.0.0 requestMode: esbuild 0.25.12's syntax minifier can
+  // remove the local enum variable while retaining its assignment.
+  // Keep identifier/whitespace minification; revalidate on toolchain upgrade.
+  esbuild: { minifySyntax: false },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
