@@ -1,4 +1,4 @@
-use super::pty_io;
+use super::{pty_io, pty_view::ViewFrame, terminal_window_commands};
 use crate::commands::sftp_file_system_operation_commands::{
     connect_authenticated_ssh_session, resolve_ssh_profile, SshAuthOptions, ZeroizingString,
 };
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
-use tauri::Emitter;
+use tauri::{Emitter, WebviewWindow};
 
 const MAX_SSH_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB cap per stream
 static SSH_PTY_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -24,7 +24,8 @@ pub struct SshCommandResponse {
 #[derive(Debug, Clone, Serialize)]
 struct SshPtyOutputPayload {
     session_id: String,
-    data: String,
+    #[serde(flatten)]
+    frame: ViewFrame,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -378,6 +379,14 @@ pub async fn ssh_start_pty(
 
         session.set_blocking(false);
         let (registration, controls) = pty_io::Registration::new(sid_clone.clone());
+        {
+            let mut control = controls.lock().unwrap_or_else(|e| e.into_inner());
+            control.view.record(
+                String::new(),
+                Some((cols.unwrap_or(100), rows.unwrap_or(30))),
+                false,
+            );
+        }
         if ready_tx.send(Ok(())).is_err() {
             return;
         }
@@ -434,13 +443,9 @@ pub async fn ssh_start_pty(
                     pending_utf8.extend_from_slice(&buf[..n]);
                     let text = drain_valid_utf8(&mut pending_utf8, false);
                     if !text.is_empty() {
-                        let _ = app.emit(
-                            "ssh-pty-output",
-                            SshPtyOutputPayload {
-                                session_id: sid_clone.clone(),
-                                data: text,
-                            },
-                        );
+                        let mut control = controls.lock().unwrap_or_else(|e| e.into_inner());
+                        let frame = control.view.record(text, None, false);
+                        emit_pty_frame(&app, &sid_clone, frame);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -464,23 +469,27 @@ pub async fn ssh_start_pty(
         // UTF-8 sequence instead of silently dropping already received bytes.
         let final_text = drain_valid_utf8(&mut pending_utf8, true);
         if !final_text.is_empty() {
-            let _ = app.emit(
-                "ssh-pty-output",
-                SshPtyOutputPayload {
-                    session_id: sid_clone.clone(),
-                    data: final_text,
-                },
-            );
+            let mut control = controls.lock().unwrap_or_else(|e| e.into_inner());
+            let frame = control.view.record(final_text, None, false);
+            emit_pty_frame(&app, &sid_clone, frame);
         }
+        let detached_label = controls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .view
+            .status()
+            .label;
         drop(registration);
         let _ = channel.close();
-        let _ = app.emit(
+        let _ = app.emit_to(
+            "main",
             "ssh-pty-exit",
             SshPtyExitPayload {
                 session_id: sid_clone,
                 reason: exit_reason,
             },
         );
+        terminal_window_commands::close_detached_view(&app, detached_label);
     });
 
     match tokio::task::spawn_blocking(move || ready_rx.recv())
@@ -493,8 +502,43 @@ pub async fn ssh_start_pty(
     }
 }
 
+fn emit_pty_frame(app: &tauri::AppHandle, id: &str, frame: ViewFrame) {
+    // Main is the trusted logical owner and keeps a passive shadow renderer
+    // for recovery. Detached views read only their own bounded journal.
+    let _ = app.emit_to(
+        "main",
+        "ssh-pty-output",
+        SshPtyOutputPayload {
+            session_id: id.into(),
+            frame,
+        },
+    );
+}
+
 #[tauri::command]
-pub fn ssh_write_pty(session_id: String, data: String) -> Result<(), String> {
+pub fn ssh_write_pty(
+    window: WebviewWindow,
+    session_id: String,
+    data: String,
+    owner_epoch: Option<u64>,
+) -> Result<(), String> {
+    let controls = pty_io::lookup(session_id.trim())?;
+    let mut control = controls.lock().unwrap_or_else(|e| e.into_inner());
+    control.view.authorize(window.label(), owner_epoch)?;
+    control.enqueue(data)
+}
+
+// Only the trusted main WebView maintains the authoritative VT parser.
+// The ordinary write command above always enforces the active owner/epoch.
+#[tauri::command]
+pub fn ssh_write_pty_response(
+    window: WebviewWindow,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("PTY protocol response access denied".into());
+    }
     let controls = pty_io::lookup(session_id.trim())?;
     let result = controls
         .lock()
@@ -504,8 +548,15 @@ pub fn ssh_write_pty(session_id: String, data: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn ssh_resize_pty(session_id: String, cols: u32, rows: u32) -> Result<(), String> {
-    if cols == 0 || rows == 0 {
+pub fn ssh_resize_pty(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    session_id: String,
+    cols: u32,
+    rows: u32,
+    owner_epoch: Option<u64>,
+) -> Result<(), String> {
+    if cols == 0 || rows == 0 || cols > 1000 || rows > 1000 {
         return Err("Invalid SSH PTY dimensions".to_string());
     }
     let controls = pty_io::lookup(session_id.trim())?;
@@ -513,14 +564,40 @@ pub fn ssh_resize_pty(session_id: String, cols: u32, rows: u32) -> Result<(), St
     if control.closed {
         return Err("SSH PTY session is closed".to_string());
     }
+    control.view.authorize(window.label(), owner_epoch)?;
     control.resize = Some((cols, rows));
+    let frame = control
+        .view
+        .record(String::new(), Some((cols, rows)), false);
+    emit_pty_frame(&app, &session_id, frame);
     Ok(())
 }
 
 #[tauri::command]
-pub fn ssh_close_pty(session_id: String) -> Result<(), String> {
-    pty_io::close(session_id.trim());
+pub fn ssh_clear_pty_view(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    session_id: String,
+    owner_epoch: Option<u64>,
+) -> Result<(), String> {
+    let controls = pty_io::lookup(session_id.trim())?;
+    let mut control = controls.lock().unwrap_or_else(|e| e.into_inner());
+    if control.closed {
+        return Err("SSH PTY session is closed".into());
+    }
+    control.view.authorize(window.label(), owner_epoch)?;
+    let frame = control.view.record(String::new(), None, true);
+    emit_pty_frame(&app, &session_id, frame);
     Ok(())
+}
+
+#[tauri::command]
+pub fn ssh_close_pty(
+    window: WebviewWindow,
+    session_id: String,
+    owner_epoch: Option<u64>,
+) -> Result<(), String> {
+    pty_io::close_owned(session_id.trim(), window.label(), owner_epoch)
 }
 
 fn drain_valid_utf8(pending: &mut Vec<u8>, eof: bool) -> String {

@@ -12,7 +12,8 @@ use crate::commands::{
     clipboard_commands, command_exec_commands, file_system_operation_commands, hash_commands,
     meta_data_commands, permission_commands, preview_commands, search_engine_commands,
     settings_commands, sftp_file_system_operation_commands, ssh_commands,
-    system_integration_commands, template_commands, volume_operations_commands, watcher_commands,
+    system_integration_commands, template_commands, terminal_window_commands,
+    volume_operations_commands, watcher_commands,
 };
 use std::path::{Component, Path, PathBuf};
 use tauri::ipc::Invoke;
@@ -114,8 +115,16 @@ fn all_commands() -> fn(Invoke) -> bool {
         ssh_commands::ssh_probe_zstd,
         ssh_commands::ssh_start_pty,
         ssh_commands::ssh_write_pty,
+        ssh_commands::ssh_write_pty_response,
         ssh_commands::ssh_resize_pty,
         ssh_commands::ssh_close_pty,
+        ssh_commands::ssh_clear_pty_view,
+        terminal_window_commands::ssh_detach_pty,
+        terminal_window_commands::ssh_detached_read,
+        terminal_window_commands::ssh_detached_ready,
+        terminal_window_commands::ssh_attach_pty,
+        terminal_window_commands::ssh_focus_detached,
+        terminal_window_commands::ssh_pty_view_status,
         ssh_commands::open_external_ssh_terminal,
         // Permission commands
         permission_commands::request_full_disk_access,
@@ -303,6 +312,7 @@ async fn main() {
             }
         }))
         .invoke_handler(all_commands())
+        .on_window_event(terminal_window_commands::handle_window_event)
         .setup(|app| {
             // Safely show/focus the main window if it exists
             if let Some(window) = app.get_webview_window("main") {

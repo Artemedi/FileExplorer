@@ -242,6 +242,16 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     const explorerSshTabsRef = useRef(new Map());
     const pendingPtyStartsRef = useRef(new Map());
     const ptyOwnersRef = useRef(new Map());
+    const ptyViewsRef = useRef(new Map());
+    const ptyViewPendingRef = useRef(new Set());
+    const ptyViewSequenceRef = useRef(new Map());
+    const ptyViewGapRef = useRef(new Set());
+    const isAttachedView = (sid) => !ptyViewPendingRef.current.has(sid) &&
+        (!ptyViewsRef.current.has(sid) || ptyViewsRef.current.get(sid).phase === 'attached');
+    const epochArgs = (sid) => {
+        const epoch = ptyViewsRef.current.get(sid)?.epoch;
+        return epoch ? { ownerEpoch: epoch } : {};
+    };
     const earlyPtyExitRef = useRef(new Map());
     const pendingPtyOutputRef = useRef(new Map());
     const finalizingPtyRef = useRef(new Map());
@@ -331,6 +341,10 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     const cleanupSessionTracking = (sessionId) => {
         if (!sessionId) return;
         pendingPtyOutputRef.current.delete(sessionId);
+        ptyViewsRef.current.delete(sessionId);
+        ptyViewPendingRef.current.delete(sessionId);
+        ptyViewSequenceRef.current.delete(sessionId);
+        ptyViewGapRef.current.delete(sessionId);
         explorerCdRef.current.delete(sessionId);
         failedPtyWritesRef.current.delete(sessionId);
         const queue = ptyInputQueuesRef.current.get(sessionId);
@@ -376,7 +390,11 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
             const item = queue.pending.shift();
             queue.active = item;
             try {
-                await invoke('ssh_write_pty', { sessionId, data: item.data });
+                if (item.protocolResponse) {
+                    await invoke('ssh_write_pty_response', { sessionId, data: item.data });
+                } else {
+                    await invoke('ssh_write_pty', { sessionId, data: item.data, ...epochArgs(sessionId) });
+                }
                 item.resolve(isCurrent());
             } catch (error) {
                 pausePtyInput(sessionId, queue, error);
@@ -391,9 +409,9 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     };
 
     // All sources of PTY input share one bounded, per-session FIFO.
-    const writePty = (sessionId, data, userInput = false) => {
+    const writePty = (sessionId, data, userInput = false, protocolResponse = false) => {
         const tabId = ptyOwnersRef.current.get(sessionId);
-        if (!tabId) return Promise.resolve(false);
+        if (!tabId || (!protocolResponse && !isAttachedView(sessionId))) return Promise.resolve(false);
         if (!data) return Promise.resolve(true);
         if (userInput) {
             // Even rejected input must invalidate a deferred hook request.
@@ -415,7 +433,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
         }
         if (userInput) trackPtyUserInput(sessionId, data);
         return new Promise(resolve => {
-            queue.pending.push({ data, bytes, resolve });
+            queue.pending.push({ data, bytes, resolve, protocolResponse });
             queue.bytes += bytes;
             drainPtyInput(sessionId, queue);
         });
@@ -424,7 +442,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
     // A FIFO preserves byte order, not the remote shell's input-line boundary.
     const canInjectShellInput = (sessionId) => {
         const queue = ptyInputQueuesRef.current.get(sessionId);
-        return Boolean(ptyOwnersRef.current.has(sessionId) &&
+        return Boolean(ptyOwnersRef.current.has(sessionId) && isAttachedView(sessionId) &&
             !failedPtyWritesRef.current.has(sessionId) &&
             !ptyInputPendingRef.current.has(sessionId) &&
             !queue?.active && !queue?.pending.length);
@@ -497,6 +515,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
         const scope = explorerScopeRef.current();
         const ownerId = ownerTab?.id;
         if (!ownerTab?.sshConnection || !ownerTab.sshFollowsExplorer ||
+            (ownerTab.ptySessionId && !isAttachedView(ownerTab.ptySessionId)) ||
             ownerTab.sshExplorerTabId !== (scope ? scope.tabId : 'legacy') ||
             scope?.switching || explorerHomeRef.current || ownerId !== activeTabIdRef.current || !targetDir ||
             explorerSshTabsRef.current.get(getExplorerSshKey(ownerTab.sshExplorerTabId, ownerTab.sshConnection)) !== ownerId) return;
@@ -524,6 +543,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                 live.sshExplorerTabId === ownerTab.sshExplorerTabId &&
                 explorerSshTabsRef.current.get(getExplorerSshKey(live.sshExplorerTabId, live.sshConnection)) === ownerId &&
                 live.ptySessionId === ownerTab.ptySessionId &&
+                (!ownerTab.ptySessionId || isAttachedView(ownerTab.ptySessionId)) &&
                 (!ownerTab.ptySessionId || ptyOwnersRef.current.get(ownerTab.ptySessionId) === ownerId));
         };
 
@@ -584,13 +604,100 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
         }
     };
 
+    const applyPtyViewStatus = (sessionId, status) => {
+        const tabId = ptyOwnersRef.current.get(sessionId);
+        if (!tabId || !status || typeof status.epoch !== 'number') return;
+        const previous = ptyViewsRef.current.get(sessionId);
+        if (previous && status.epoch < previous.epoch) return;
+        if (previous && status.epoch === previous.epoch && status.phase === previous.phase) return;
+        ptyViewsRef.current.set(sessionId, status);
+        // Keep the main xterm as a passive shadow while detached. On return
+        // drain its parser before allowing input/resize again.
+        if (status.phase === 'attached' && previous && previous.phase !== 'attached') {
+            ptyViewPendingRef.current.add(sessionId);
+            updateTab(tabId, { ptyView: status, ptyViewPending: true });
+            const controller = xtermControllersRef.current[sessionId];
+            Promise.resolve(controller?.flushBufferText?.(false)).catch(() => {
+                ptyViewGapRef.current.add(sessionId);
+                showWarning('Terminal view flush failed. Check the existing shell before entering commands.');
+            }).finally(() => {
+                if (ptyOwnersRef.current.get(sessionId) !== tabId ||
+                    ptyViewsRef.current.get(sessionId)?.epoch !== status.epoch) return;
+                ptyViewPendingRef.current.delete(sessionId);
+                updateTab(tabId, { ptyViewPending: false });
+            });
+        } else {
+            ptyViewPendingRef.current.delete(sessionId);
+            if (status.phase === 'detached') {
+                // Preserve the logical Explorer binding, but suspend both
+                // directions of automatic sync while this view is detached.
+                // Detached input is not observed by the main input FIFO.
+                // Force a fresh explicit Sync instead of assuming idle.
+                shellIdleRef.current.set(sessionId, false);
+                ptyInputPendingRef.current.add(sessionId);
+                manualHookRequestsRef.current.delete(sessionId);
+            }
+            updateTab(tabId, { ptyView: status, ptyViewPending: false });
+        }
+    };
+
+    const detachPtyView = async (tab) => {
+        const sessionId = tab?.ptySessionId;
+        if (!sessionId || !isAttachedView(sessionId) || !xtermControllersRef.current[sessionId]) return;
+        const queue = ptyInputQueuesRef.current.get(sessionId);
+        if ((queue?.active && !queue.active.protocolResponse) ||
+            queue?.pending.some(item => !item.protocolResponse) || failedPtyWritesRef.current.has(sessionId)) {
+            showWarning('Finish pending terminal input before detaching.');
+            return;
+        }
+        if (ptyViewGapRef.current.has(sessionId) || pendingPtyOutputRef.current.get(sessionId)?.truncated) {
+            showWarning('The terminal history is incomplete; detach is unavailable for this session.');
+            return;
+        }
+        const initialEpoch = ptyViewsRef.current.get(sessionId)?.epoch ?? 0;
+        ptyViewPendingRef.current.add(sessionId);
+        terminalNavigationRef.current.delete(tab.id);
+        const manual = manualHookRequestsRef.current.get(sessionId);
+        if (manual) manual.cancelled = true;
+        updateTab(tab.id, { ptyViewPending: true });
+        try {
+            await xtermControllersRef.current[sessionId].flushBufferText(false);
+            if (ptyOwnersRef.current.get(sessionId) !== tab.id) return;
+            const status = await invoke('ssh_detach_pty', { sessionId, ...epochArgs(sessionId) });
+            applyPtyViewStatus(sessionId, status);
+        } catch (error) {
+            showWarning(String(error));
+            try {
+                const status = await invoke('ssh_pty_view_status', { sessionId });
+                applyPtyViewStatus(sessionId, status);
+            } catch {
+                // A failed/closed session is handled by its exit event.
+            }
+        } finally {
+            // The backend event owns the freeze once its epoch advances.
+            if ((ptyViewsRef.current.get(sessionId)?.epoch ?? 0) === initialEpoch) {
+                ptyViewPendingRef.current.delete(sessionId);
+                updateTab(tab.id, { ptyViewPending: false });
+            }
+        }
+    };
+
     useEffect(() => {
+        let unlistenView = null;
         let unlistenOut = null;
         let unlistenExit = null;
         let active = true;
 
         (async () => {
             try {
+                unlistenView = await listen('ssh-pty-window', (event) => {
+                    const payload = event?.payload;
+                    if (active && payload?.session_id) applyPtyViewStatus(payload.session_id, payload);
+                }, { target: 'main' });
+                if (!active) {
+                    unlistenView?.();
+                    return;
+                }
                 unlistenOut = await listen('ssh-pty-output', (event) => {
                     const payload = event?.payload;
                     if (!active || !payload?.session_id) return;
@@ -600,10 +707,16 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                     if (finalizingPtyRef.current.has(sessionId) ||
                         (!owner && pendingPtyStartsRef.current.size === 0)) return;
 
+                    if (typeof payload.seq === 'number') {
+                        const previous = ptyViewSequenceRef.current.get(sessionId) ?? 1;
+                        if (payload.seq !== previous + 1) ptyViewGapRef.current.add(sessionId);
+                        ptyViewSequenceRef.current.set(sessionId, payload.seq);
+                    }
                     // Preserve initial VT output until the xterm controller mounts.
                     const ctrl = xtermControllersRef.current[sessionId];
                     if (ctrl) {
-                        ctrl.write(payload.data);
+                        if (ctrl.applyFrame) ctrl.applyFrame(payload);
+                        else if (payload.data) ctrl.write(payload.data);
                     } else {
                         const previous = pendingPtyOutputRef.current.get(sessionId);
                         const combined = (previous?.text || '') + payload.data;
@@ -613,7 +726,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                         if (truncated && /^[\uDC00-\uDFFF]/.test(text)) text = text.slice(1);
                         pendingPtyOutputRef.current.set(sessionId, { text, truncated });
                     }
-                    if (!owner) return;
+                    if (!owner || !payload.data) return;
 
                     // Buffer partial OSC / ESC sequences across PTY output chunks
                     const prevOscBuf = oscBufferRef.current.get(payload.session_id) || '';
@@ -649,12 +762,12 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                             }
                             return;
                         }
-                        if (!ownerTab.sshFollowsExplorer || ownerTab.id !== activeTabIdRef.current) return;
+                        if (!isAttachedView(sessionId) || !ownerTab.sshFollowsExplorer || ownerTab.id !== activeTabIdRef.current) return;
                         if (ownerTab.sshWorkingDir !== detectedDir || forceSync) {
                             syncExplorerToRemoteDirRef.current(ownerTab, detectedDir, forceSync);
                         }
                     }
-                });
+                }, { target: 'main' });
                 if (!active) {
                     if (typeof unlistenOut === 'function') unlistenOut();
                     return;
@@ -701,6 +814,8 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                         updateTab(tabId, (tab) => tab.ptySessionId !== sessionId ? tab : ({
                             ...tab,
                             ptySessionId: null,
+                            ptyView: null,
+                            ptyViewPending: false,
                             ptyStatus: 'disconnected',
                             history: [
                                 ...tab.history,
@@ -713,10 +828,11 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                         }));
                     };
                     void finishExit();
-                });
+                }, { target: 'main' });
                 if (active) setPtyListenersReady(true);
                 else if (typeof unlistenExit === 'function') unlistenExit();
             } catch {
+                if (typeof unlistenView === 'function') unlistenView();
                 if (typeof unlistenOut === 'function') unlistenOut();
                 unlistenOut = null;
                 // Non-Tauri test environments may not mock event listeners
@@ -725,6 +841,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
 
         return () => {
             active = false;
+            if (typeof unlistenView === 'function') unlistenView();
             if (typeof unlistenOut === 'function') unlistenOut();
             if (typeof unlistenExit === 'function') unlistenExit();
             unlistenOut = null;
@@ -734,8 +851,9 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
             pendingPtyStartsRef.current.clear();
             earlyPtyExitRef.current.clear();
             for (const sessionId of ptyOwnersRef.current.keys()) {
+                const args = { sessionId, ...epochArgs(sessionId) };
                 cleanupSessionTracking(sessionId);
-                invoke('ssh_close_pty', { sessionId }).catch(() => {});
+                invoke('ssh_close_pty', args).catch(() => {});
             }
             ptyOwnersRef.current.clear();
             finalizingPtyRef.current.clear();
@@ -935,7 +1053,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                 return;
             }
             ptyOwnersRef.current.set(sid, tabId);
-            updateTab(tabId, { ptySessionId: sid, ptyStatus: 'connected' });
+            updateTab(tabId, { ptySessionId: sid, ptyStatus: 'connected', ptyView: null, ptyViewPending: false });
             setupPtySessionHooks(tabId, tab.sshConnection, sid);
         } catch (e) {
             if (pendingPtyStartsRef.current.get(tabId) !== attempt) return;
@@ -967,9 +1085,10 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
         }
         for (const [sessionId, owner] of ptyOwnersRef.current) {
             if (owner !== tabId) continue;
+            const args = { sessionId, ...epochArgs(sessionId) };
             ptyOwnersRef.current.delete(sessionId);
             cleanupSessionTracking(sessionId);
-            invoke('ssh_close_pty', { sessionId }).catch(() => {});
+            invoke('ssh_close_pty', args).catch(() => {});
         }
     };
 
@@ -2070,7 +2189,8 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
 
     const handleClearTerminal = () => {
         if (ptySessionId && xtermControllersRef.current[ptySessionId]) {
-            xtermControllersRef.current[ptySessionId].clear();
+            if (!isAttachedView(ptySessionId)) return;
+            invoke('ssh_clear_pty_view', { sessionId: ptySessionId, ...epochArgs(ptySessionId) }).catch(error => showWarning(String(error)));
         }
         setCommandHistory([]);
     };
@@ -2134,8 +2254,8 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                                 }}
                                 title={tab.sshConnection ? `${tab.sshConnection.username || 'guest'}@${tab.sshConnection.host}:${tab.sshWorkingDir}` : 'Local shell'}
                             >
-                                <span>{tab.label}</span>
-                                {terminalTabs.length > 1 && (
+                                <span>{tab.label}{tab.ptyView?.phase === 'detached' ? ' ↗' : ''}</span>
+                                {terminalTabs.length > 1 && (!tab.ptySessionId || (!tab.ptyViewPending && (!tab.ptyView || tab.ptyView.phase === 'attached'))) && (
                                     <span
                                         onClick={(e) => {
                                             e.stopPropagation();
@@ -2201,7 +2321,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                     {activeSshConnection && (
                         <button
                             className="terminal-control"
-                            disabled={!ptyListenersReady || ['connecting', 'finishing'].includes(activeTab.ptyStatus)}
+                            disabled={!ptyListenersReady || ['connecting', 'finishing'].includes(activeTab.ptyStatus) || (ptySessionId && !isAttachedView(ptySessionId))}
                             onClick={() => {
                                 if (ptySessionId) {
                                     closeTabPty(activeTab.id);
@@ -2216,11 +2336,25 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                                 ['disconnected', 'error'].includes(activeTab.ptyStatus) ? 'Reconnect' : 'PTY'}
                         </button>
                     )}
+                    {activeSshConnection && ptySessionId && (
+                        activeTab.ptyView?.phase === 'detached' ? (
+                            <button type="button" className="terminal-control"
+                                onClick={() => invoke('ssh_focus_detached', { sessionId: ptySessionId }).catch(error => showWarning(String(error)))}>
+                                Focus detached window
+                            </button>
+                        ) : (
+                            <button type="button" className="terminal-control"
+                                disabled={activeTab.ptyStatus !== 'connected' || !isAttachedView(ptySessionId)}
+                                onClick={() => void detachPtyView(activeTab)}>
+                                {activeTab.ptyViewPending || activeTab.ptyView?.phase === 'detaching' ? 'Detaching…' : 'Detach to Window'}
+                            </button>
+                        )
+                    )}
                     {activeSshConnection && explorerTabs && (
                         <button
                             type="button"
                             className="terminal-control"
-                            disabled={!activeTab.sshFollowsExplorer && !canAttachToExplorer(activeTab)}
+                            disabled={(ptySessionId && !isAttachedView(ptySessionId)) || (!activeTab.sshFollowsExplorer && !canAttachToExplorer(activeTab))}
                             onClick={() => changeBinding(activeTab, !activeTab.sshFollowsExplorer)}
                             title={activeTab.sshFollowsExplorer
                                 ? 'Unlink from Explorer without closing the shell'
@@ -2233,6 +2367,7 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                         <button
                             type="button"
                             className="terminal-control"
+                            disabled={!isAttachedView(ptySessionId)}
                             onClick={() => requestShellIntegration(activeTab)}
                             title={activeTab.sshFollowsExplorer
                                 ? 'Enable directory sync at an empty shell prompt (also after sudo/su)'
@@ -2319,20 +2454,30 @@ const Terminal = ({ isOpen, onToggle, explorerVisible = true }) => {
                     }}>Resume input</button>
                 </div>
             )}
+            {ptySessionId && !isAttachedView(ptySessionId) && (
+                <div className="terminal-detached-indicator" role="status">
+                    {activeTab.ptyView?.phase === 'detached' ? 'Terminal is open in a separate window. SSH session remains active.' : 'Transferring terminal view…'}
+                </div>
+            )}
             {terminalTabs
                 .filter((tab) => Boolean(tab.ptySessionId))
                 .map((tab) => (
                     <XtermSshView
                         key={tab.ptySessionId}
                         sessionId={tab.ptySessionId}
-                        isVisible={isOpen && tab.id === activeTab?.id}
+                        isVisible={isOpen && tab.id === activeTab?.id && isAttachedView(tab.ptySessionId)}
+                        controlledGeometry={true}
+                        inputEnabled={isAttachedView(tab.ptySessionId)}
                         isFullscreen={isFullscreen}
                         onData={(data) => {
                             return writePty(tab.ptySessionId, data, true);
                         }}
+                        onProtocolResponse={(data) => {
+                            return writePty(tab.ptySessionId, data, false, true);
+                        }}
                         onResize={(cols, rows) => {
-                            if (ptyOwnersRef.current.get(tab.ptySessionId) === tab.id) {
-                                invoke('ssh_resize_pty', { sessionId: tab.ptySessionId, cols, rows }).catch(() => {});
+                            if (ptyOwnersRef.current.get(tab.ptySessionId) === tab.id && isAttachedView(tab.ptySessionId)) {
+                                invoke('ssh_resize_pty', { sessionId: tab.ptySessionId, cols, rows, ...epochArgs(tab.ptySessionId) }).catch(() => {});
                             }
                         }}
                         registerController={(sid, ctrl) => {

@@ -14,16 +14,23 @@ const XtermSshView = ({
     isVisible,
     isFullscreen,
     onData,
+    onProtocolResponse,
     onResize,
     registerController,
+    controlledGeometry = false,
+    inputEnabled = true,
 }) => {
     const mountRef = useRef(null);
     const termRef = useRef(null);
     const fitAddonRef = useRef(null);
     const onDataRef = useRef(onData);
+    const onProtocolResponseRef = useRef(onProtocolResponse);
     const onResizeRef = useRef(onResize);
     onDataRef.current = onData;
+    onProtocolResponseRef.current = onProtocolResponse;
     onResizeRef.current = onResize;
+    const inputEnabledRef = useRef(inputEnabled);
+    inputEnabledRef.current = inputEnabled;
 
     useEffect(() => {
         const mountEl = mountRef.current;
@@ -36,9 +43,11 @@ const XtermSshView = ({
         let lastCols = 0;
         let lastRows = 0;
         let cancelFlush = null;
+        let restoreDataRouting = null;
 
         try {
             term = new XTerm({
+                ...(controlledGeometry ? { cols: 100, rows: 30 } : {}),
                 cursorBlink: true,
                 convertEol: false,
                 customGlyphs: true,
@@ -77,11 +86,12 @@ const XtermSshView = ({
             fitAddonRef.current = fitAddon;
 
             const safeFit = () => {
-                if (!fitAddonRef.current || !termRef.current || !mountRef.current) return;
+                if (!inputEnabledRef.current || !fitAddonRef.current || !termRef.current || !mountRef.current) return;
                 if (mountRef.current.clientWidth < 20 || mountRef.current.clientHeight < 20) return;
                 try {
-                    fitAddonRef.current.fit();
-                    const { cols, rows } = termRef.current;
+                    const dimensions = controlledGeometry ? fitAddonRef.current.proposeDimensions() : (fitAddonRef.current.fit(), termRef.current);
+                    if (!dimensions) return;
+                    const { cols, rows } = dimensions;
                     if (cols > 0 && rows > 0 && (cols !== lastCols || rows !== lastRows)) {
                         lastCols = cols;
                         lastRows = rows;
@@ -97,9 +107,28 @@ const XtermSshView = ({
                 setTimeout(safeFit, 80);
             });
 
+            // xterm 6.0.0 (lockfile) merges parser replies and human input in
+            // public onData. Preserve its internal origin bit before that
+            // merge. Focus reports are view-local, not replayable replies.
+            // Main is the single reply source; detached replay never replies.
+            if (controlledGeometry) {
+                const core = term._core?.coreService;
+                if (typeof core?.triggerDataEvent !== 'function') {
+                    throw new Error('Unsupported xterm protocol response routing');
+                }
+                const trigger = core.triggerDataEvent;
+                core.triggerDataEvent = function (data, wasUserInput = false) {
+                    if (wasUserInput || data === '\x1b[I' || data === '\x1b[O') {
+                        return trigger.call(this, data, wasUserInput);
+                    }
+                    onProtocolResponseRef.current?.(data);
+                };
+                restoreDataRouting = () => { core.triggerDataEvent = trigger; };
+            }
+
             // The terminal owner bounds and serializes all PTY input.
             dataDisposable = term.onData((data) => {
-                onDataRef.current?.(data);
+                if (inputEnabledRef.current) onDataRef.current?.(data);
             });
 
             term.attachCustomKeyEventHandler((ev) => {
@@ -141,7 +170,21 @@ const XtermSshView = ({
                 return lines.join('\n');
             };
 
+            const applyFrame = (frame) => {
+                if (termRef.current !== term) return;
+                if (frame.cols && frame.rows) {
+                    const { cols, rows } = frame;
+                    term.write('', () => {
+                        if (termRef.current === term && (term.cols !== cols || term.rows !== rows)) term.resize(cols, rows);
+                    });
+                } else if (frame.clear) {
+                    term.write('', () => { if (termRef.current === term) term.clear(); });
+                } else if (frame.data) {
+                    term.write(frame.data);
+                }
+            };
             registerController?.(sessionId, {
+                applyFrame,
                 write: (chunk) => {
                     termRef.current?.write(chunk);
                 },
@@ -151,9 +194,10 @@ const XtermSshView = ({
                 clear: () => {
                     termRef.current?.clear();
                 },
-                fit: safeFit,
+                fit: () => { lastCols = 0; lastRows = 0; safeFit(); },
                 getBufferText,
-                flushBufferText: () => new Promise((resolve, reject) => {
+                flushBufferText: (collectText = true) => new Promise((resolve, reject) => {
+                    if (cancelFlush) { reject(new Error("Terminal flush already pending")); return; }
                     // xterm.write callbacks run after parsing, not on enqueue.
                     // Bound the wait and cancel it if the view is disposed.
                     const finish = (error) => {
@@ -163,7 +207,7 @@ const XtermSshView = ({
                         if (error) reject(error);
                         else {
                             try {
-                                resolve(getBufferText());
+                                resolve(collectText ? getBufferText() : undefined);
                             } catch (e) {
                                 reject(e);
                             }
@@ -188,6 +232,7 @@ const XtermSshView = ({
             registerController?.(sessionId, null);
             if (resizeObserver) resizeObserver.disconnect();
             if (dataDisposable) dataDisposable.dispose();
+            restoreDataRouting?.();
             if (term) term.dispose();
             termRef.current = null;
             fitAddonRef.current = null;
@@ -195,12 +240,12 @@ const XtermSshView = ({
     }, [sessionId]);
 
     useEffect(() => {
-        if (!isVisible) return undefined;
+        if (!isVisible || !inputEnabled) return undefined;
         const fitNow = () => {
             try {
-                fitAddonRef.current?.fit();
-                if (termRef.current && termRef.current.cols > 0 && termRef.current.rows > 0) {
-                    onResizeRef.current?.(termRef.current.cols, termRef.current.rows);
+                const dimensions = controlledGeometry ? fitAddonRef.current?.proposeDimensions() : (fitAddonRef.current?.fit(), termRef.current);
+                if (dimensions && dimensions.cols > 0 && dimensions.rows > 0) {
+                    onResizeRef.current?.(dimensions.cols, dimensions.rows);
                 }
                 termRef.current?.focus();
             } catch {
@@ -213,7 +258,7 @@ const XtermSshView = ({
             cancelAnimationFrame(id);
             clearTimeout(t);
         };
-    }, [isVisible, isFullscreen]);
+    }, [isVisible, isFullscreen, inputEnabled, controlledGeometry]);
 
     return (
         <div
